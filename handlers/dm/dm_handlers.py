@@ -170,7 +170,13 @@ async def _send_worker(task_id: int, client: TelegramClient) -> None:
         # Отправка
         try:
             if t["photo_url"]:
-                await client.send_file(target_id, t["photo_url"], caption=t["post_text"])
+                # Telegram ограничивает caption до 1024 символов
+                if len(t["post_text"]) <= 1024:
+                    await client.send_file(target_id, t["photo_url"], caption=t["post_text"])
+                else:
+                    # Текст слишком длинный — фото и текст отдельно
+                    await client.send_file(target_id, t["photo_url"])
+                    await client.send_message(target_id, t["post_text"])
             else:
                 await client.send_message(target_id, t["post_text"])
 
