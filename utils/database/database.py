@@ -2,11 +2,6 @@ from config import conn
 
 
 def create_table() -> None:
-    """
-    Создает таблицы SQL если их нет
-    :return:
-        None
-    """
     start_cursor = conn.cursor()
     start_cursor.execute("""
         CREATE TABLE IF NOT EXISTS pre_groups (
@@ -34,6 +29,7 @@ def create_table() -> None:
             is_active BOOLEAN,
             error_reason TEXT,
             photo_url TEXT)""")
+
     start_cursor.execute("""
         CREATE TABLE IF NOT EXISTS send_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -43,14 +39,12 @@ def create_table() -> None:
             sent_at TEXT,
             message_text TEXT);""")
 
-    # Миграция: добавляем столбец error_reason, если он не существует
     try:
         start_cursor.execute("ALTER TABLE broadcasts ADD COLUMN error_reason TEXT")
         conn.commit()
     except:
         pass
 
-    # Миграция: добавляем столбец photo_url, если он не существует
     try:
         start_cursor.execute("ALTER TABLE broadcasts ADD COLUMN photo_url TEXT")
         conn.commit()
@@ -62,26 +56,17 @@ def create_table() -> None:
 
 
 def delete_table() -> None:
-    """
-    После остановки бота меняет статус активных рассылок на неактивный,
-    сохраняя при этом тексты и интервалы рассылок
-    :return:
-        None
-    """
     end_cursor = conn.cursor()
-    # Вместо удаления всех записей, просто меняем статус на неактивный
     end_cursor.execute("""UPDATE broadcasts SET is_active = ? WHERE is_active = ?""", (False, True))
     conn.commit()
     end_cursor.close()
 
 
 def create_dm_tables() -> None:
-    """
-    Создает таблицы для функции автопостера в ЛС
-    """
+    """Создает таблицы для DM-автопостера"""
     cursor = conn.cursor()
 
-    # Таблица задач DM-постера
+    # Задачи
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS dm_tasks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -92,21 +77,38 @@ def create_dm_tables() -> None:
             photo_url TEXT,
             interval_minutes INTEGER NOT NULL,
             is_active BOOLEAN DEFAULT 1,
-            created_at TEXT
+            created_at TEXT,
+            delay_min INTEGER DEFAULT 30,
+            delay_max INTEGER DEFAULT 90
         )
     """)
 
-    # Таблица отслеженных пользователей: кому уже отправляли и когда
+    # Миграции для существующих БД
+    for col, default in [("delay_min", 30), ("delay_max", 90)]:
+        try:
+            cursor.execute(f"ALTER TABLE dm_tasks ADD COLUMN {col} INTEGER DEFAULT {default}")
+            conn.commit()
+        except Exception:
+            pass
+
+    # Лог отправок
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS dm_sent_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             dm_task_id INTEGER NOT NULL,
             target_user_id INTEGER NOT NULL,
-            sent_at TEXT NOT NULL
+            sent_at TEXT NOT NULL,
+            status TEXT DEFAULT 'sent'
         )
     """)
 
-    # Таблица мониторинга чатов: какие чаты слушаем для DM-задачи
+    try:
+        cursor.execute("ALTER TABLE dm_sent_log ADD COLUMN status TEXT DEFAULT 'sent'")
+        conn.commit()
+    except Exception:
+        pass
+
+    # Мониторируемые чаты
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS dm_watched_chats (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
