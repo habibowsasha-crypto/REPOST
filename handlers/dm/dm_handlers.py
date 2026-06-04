@@ -3,13 +3,11 @@ DM Autoposter — автопостер в личные сообщения.
 
 Логика:
   1. Пользователь выбирает Telethon-аккаунт из своих сессий.
-  2. Выбирает чаты/группы для мониторинга (из таблицы groups этого аккаунта).
+  2. Выбирает чаты/группы для мониторинга.
   3. Вводит текст поста (+ опционально фото).
-  4. Вводит интервал (минуты) — минимальная пауза между двумя DM одному и тому же человеку.
-  5. Бот запускает Telethon-клиент, который слушает новые сообщения в выбранных чатах.
-  6. При появлении нового сообщения от пользователя (не бота) — проверяет, не писали ли ему
-     уже в рамках этой задачи за последние interval_minutes.  Если нет — ставит в очередь ЛС.
-  7. Все активные DM-задачи восстанавливаются при перезапуске бота (вызов restore_dm_tasks).
+  4. Вводит интервал (минуты) — пауза между двумя ЛС одному и тому же человеку.
+  5. Telethon-клиент слушает новые сообщения в выбранных чатах.
+  6. При новом сообщении от участника — проверяет интервал и отправляет ЛС.
 """
 
 import asyncio
@@ -23,8 +21,10 @@ from telethon.errors import (
     FloodWaitError,
     InputUserDeactivatedError,
     UserIsBlockedError,
+    ChatAdminRequiredError,
 )
 from telethon.sessions import StringSession
+from telethon.tl.custom import Button
 from telethon.tl.types import User
 
 from config import (
@@ -37,11 +37,11 @@ from config import (
 from utils.database.database import create_dm_tables
 
 # ─── состояние диалога настройки ──────────────────────────────────────────────
-dm_setup_state: dict = {}   # admin_id → {step, user_id, session_string, chat_ids, ...}
+dm_setup_state: dict = {}
 
 # ─── активные Telethon-клиенты мониторинга ────────────────────────────────────
-# dm_task_id → TelegramClient
-dm_monitor_clients: dict = {}
+dm_monitor_clients: dict = {}   # task_id → TelegramClient
+dm_monitor_tasks: dict = {}     # task_id → asyncio.Task
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -58,8 +58,6 @@ def _minutes_since(iso_ts: str) -> float:
 
 
 def _already_sent_recently(task_id: int, target_user_id: int, interval_minutes: int) -> bool:
-    """Возвращает True, если в рамках этой задачи уже писали этому пользователю
-    менее interval_minutes назад."""
     cursor = conn.cursor()
     cursor.execute(
         """SELECT sent_at FROM dm_sent_log
@@ -110,11 +108,11 @@ def _get_watched_chats(task_id: int) -> list:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Ядро мониторинга: запуск Telethon-клиента
+# Ядро мониторинга
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def _start_monitor(task_id: int) -> None:
-    """Запускает Telethon-клиент для задачи task_id, навешивает хендлер новых сообщений."""
+async def _monitor_loop(task_id: int) -> None:
+    """Запускает Telethon-клиент и держит его живым пока задача активна."""
     task = _get_task(task_id)
     if not task or not task["is_active"]:
         return
@@ -124,71 +122,99 @@ async def _start_monitor(task_id: int) -> None:
         logger.warning(f"[DM task {task_id}] нет чатов для мониторинга")
         return
 
+    logger.info(f"[DM task {task_id}] запуск мониторинга, чаты: {watched_chats}")
+
     client = TelegramClient(StringSession(task["session_string"]), API_ID, API_HASH)
-    await client.connect()
 
-    if not await client.is_user_authorized():
-        logger.error(f"[DM task {task_id}] сессия не авторизована")
-        await client.disconnect()
-        return
-
-    dm_monitor_clients[task_id] = client
-    logger.info(f"[DM task {task_id}] мониторинг запущен, чаты: {watched_chats}")
-
-    @client.on(events.NewMessage(chats=watched_chats))
-    async def on_chat_message(event):
-        # Игнорируем: сервисные сообщения, каналы, самого себя
-        sender = await event.get_sender()
-        if not isinstance(sender, User):
-            return
-        if sender.bot or sender.is_self:
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            logger.error(f"[DM task {task_id}] сессия не авторизована")
             return
 
-        target_id = sender.id
+        dm_monitor_clients[task_id] = client
 
-        # Получаем свежие данные задачи (текст/интервал могут меняться)
-        t = _get_task(task_id)
-        if not t or not t["is_active"]:
-            client.remove_event_handler(on_chat_message)
-            return
+        @client.on(events.NewMessage(chats=watched_chats, incoming=True))
+        async def on_chat_message(event):
+            # Игнорируем личку и каналы без участников
+            if not event.is_group and not event.is_channel:
+                return
 
-        if _already_sent_recently(task_id, target_id, t["interval_minutes"]):
-            logger.debug(f"[DM task {task_id}] пропуск {target_id} — недавно отправляли")
-            return
+            try:
+                sender = await event.get_sender()
+            except Exception:
+                return
 
-        # Пишем в ЛС
+            if not isinstance(sender, User):
+                return
+            if sender.bot or sender.is_self:
+                return
+
+            target_id = sender.id
+
+            # Свежие данные задачи
+            t = _get_task(task_id)
+            if not t or not t["is_active"]:
+                client.remove_event_handler(on_chat_message)
+                return
+
+            if _already_sent_recently(task_id, target_id, t["interval_minutes"]):
+                logger.debug(f"[DM task {task_id}] пропуск {target_id} — недавно отправляли")
+                return
+
+            # Отправка в ЛС
+            try:
+                if t["photo_url"]:
+                    await client.send_file(target_id, t["photo_url"], caption=t["post_text"])
+                else:
+                    await client.send_message(target_id, t["post_text"])
+                _log_sent(task_id, target_id)
+                logger.info(f"[DM task {task_id}] ЛС → {target_id} (@{getattr(sender, 'username', '?')})")
+            except UserPrivacyRestrictedError:
+                logger.debug(f"[DM task {task_id}] {target_id} закрыл ЛС")
+            except (InputUserDeactivatedError, UserIsBlockedError):
+                logger.debug(f"[DM task {task_id}] {target_id} недоступен")
+            except FloodWaitError as e:
+                logger.warning(f"[DM task {task_id}] FloodWait {e.seconds}s")
+                await asyncio.sleep(e.seconds)
+            except Exception as exc:
+                logger.error(f"[DM task {task_id}] ошибка отправки {target_id}: {exc}")
+
+        # Держим клиент живым
+        while True:
+            t = _get_task(task_id)
+            if not t or not t["is_active"]:
+                logger.info(f"[DM task {task_id}] задача остановлена")
+                break
+            if not client.is_connected():
+                logger.warning(f"[DM task {task_id}] реконнект...")
+                await client.connect()
+            await asyncio.sleep(15)
+
+    except asyncio.CancelledError:
+        logger.info(f"[DM task {task_id}] задача отменена")
+    except Exception as e:
+        logger.error(f"[DM task {task_id}] критическая ошибка: {e}")
+    finally:
         try:
-            if t["photo_url"]:
-                await client.send_file(target_id, t["photo_url"], caption=t["post_text"])
-            else:
-                await client.send_message(target_id, t["post_text"])
-            _log_sent(task_id, target_id)
-            logger.info(f"[DM task {task_id}] ЛС отправлено → {target_id}")
-        except UserPrivacyRestrictedError:
-            logger.debug(f"[DM task {task_id}] {target_id} закрыл ЛС (privacy)")
-        except (InputUserDeactivatedError, UserIsBlockedError):
-            logger.debug(f"[DM task {task_id}] {target_id} недоступен")
-        except FloodWaitError as e:
-            logger.warning(f"[DM task {task_id}] FloodWait {e.seconds}s")
-            await asyncio.sleep(e.seconds)
-        except Exception as exc:
-            logger.error(f"[DM task {task_id}] ошибка отправки: {exc}")
-
-    # Держим клиент живым, пока задача активна
-    while True:
-        await asyncio.sleep(30)
-        t = _get_task(task_id)
-        if not t or not t["is_active"]:
-            logger.info(f"[DM task {task_id}] задача остановлена, отключаю клиент")
             await client.disconnect()
-            dm_monitor_clients.pop(task_id, None)
-            return
-        if not client.is_connected():
-            await client.connect()
+        except Exception:
+            pass
+        dm_monitor_clients.pop(task_id, None)
+        dm_monitor_tasks.pop(task_id, None)
+        logger.info(f"[DM task {task_id}] клиент отключён")
+
+
+def _launch_monitor(task_id: int) -> None:
+    """Запускает _monitor_loop как задачу в текущем event loop."""
+    loop = bot.loop
+    task = loop.create_task(_monitor_loop(task_id))
+    dm_monitor_tasks[task_id] = task
+    logger.info(f"[DM task {task_id}] задача создана в loop")
 
 
 async def restore_dm_tasks() -> None:
-    """Вызывается при старте бота — восстанавливает все активные DM-задачи."""
+    """Восстанавливает активные DM-задачи при старте бота."""
     create_dm_tables()
     cursor = conn.cursor()
     cursor.execute("SELECT id FROM dm_tasks WHERE is_active = 1")
@@ -196,31 +222,25 @@ async def restore_dm_tasks() -> None:
     cursor.close()
     logger.info(f"[DM restore] активных задач: {len(rows)}")
     for (task_id,) in rows:
-        asyncio.ensure_future(_start_monitor(task_id))
+        _launch_monitor(task_id)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Telegram-бот: UI настройки задачи
 # ══════════════════════════════════════════════════════════════════════════════
 
-from telethon.tl.custom import Button  # noqa: E402
-
-
-# ── /dm_post — точка входа ────────────────────────────────────────────────────
-
 @bot.on(New_Message(pattern=r"/dm_post"))
 async def cmd_dm_post(event: callback_message) -> None:
     if event.sender_id not in ADMIN_ID_LIST:
         return
 
-    # Получаем все сессии этого админа
     cursor = conn.cursor()
     cursor.execute("SELECT user_id FROM sessions")
     sessions = cursor.fetchall()
     cursor.close()
 
     if not sessions:
-        await event.respond("⚠ Нет добавленных аккаунтов. Сначала добавьте аккаунт через /start.")
+        await event.respond("⚠ Нет добавленных аккаунтов. Сначала добавьте через /start.")
         return
 
     buttons = [
@@ -230,18 +250,14 @@ async def cmd_dm_post(event: callback_message) -> None:
     await event.respond("📩 **DM Автопостер**\n\nВыберите аккаунт для рассылки в ЛС:", buttons=buttons)
 
 
-# ── Выбор аккаунта ────────────────────────────────────────────────────────────
-
 @bot.on(Query(data=lambda d: d.decode().startswith("dm_acc_")))
 async def dm_pick_account(event: callback_query) -> None:
     admin_id = event.sender_id
     user_id = int(event.data.decode().split("_")[2])
 
-    # Подгружаем session_string
     cursor = conn.cursor()
     cursor.execute("SELECT session_string FROM sessions WHERE user_id = ?", (user_id,))
     row = cursor.fetchone()
-    # Получаем список групп этого аккаунта
     cursor.execute("SELECT group_id, group_username FROM groups WHERE user_id = ?", (user_id,))
     groups = cursor.fetchall()
     cursor.close()
@@ -250,7 +266,7 @@ async def dm_pick_account(event: callback_query) -> None:
         await event.respond("⚠ Сессия не найдена.")
         return
     if not groups:
-        await event.respond("⚠ У этого аккаунта нет добавленных групп. Сначала добавьте группы.")
+        await event.respond("⚠ У этого аккаунта нет групп. Добавьте группы через меню.")
         return
 
     dm_setup_state[admin_id] = {
@@ -258,28 +274,35 @@ async def dm_pick_account(event: callback_query) -> None:
         "user_id": user_id,
         "session_string": row[0],
         "selected_chats": [],
-        "all_groups": groups,  # [(group_id, username), ...]
+        "all_groups": groups,
     }
 
-    buttons = [
-        [Button.inline(f"{'✅' if False else '☐'} {uname or gid}", f"dm_tog_{gid}".encode())]
-        for gid, uname in groups
-    ]
-    buttons.append([Button.inline("✅ Готово — выбрать эти чаты", b"dm_chats_done")])
+    buttons = _build_chat_buttons(groups, [])
     await event.respond(
-        "📋 **Выберите чаты для мониторинга**\n(нажмите для переключения, затем «Готово»):",
+        "📋 **Выберите чаты для мониторинга**\n(нажмите чтобы отметить, затем «Готово»):",
         buttons=buttons,
     )
+    await event.answer()
 
 
-# ── Переключение выбора чата ──────────────────────────────────────────────────
+def _build_chat_buttons(groups: list, selected: list) -> list:
+    buttons = [
+        [Button.inline(
+            f"{'✅' if gid in selected else '☐'} {uname or str(gid)}",
+            f"dm_tog_{gid}".encode(),
+        )]
+        for gid, uname in groups
+    ]
+    buttons.append([Button.inline("▶️ Готово", b"dm_chats_done")])
+    return buttons
+
 
 @bot.on(Query(data=lambda d: d.decode().startswith("dm_tog_")))
 async def dm_toggle_chat(event: callback_query) -> None:
     admin_id = event.sender_id
     st = dm_setup_state.get(admin_id)
     if not st or st["step"] != "pick_chats":
-        await event.answer("Сначала начните настройку через /dm_post")
+        await event.answer("Начните заново через /dm_post")
         return
 
     chat_id = int(event.data.decode().split("_")[2])
@@ -289,23 +312,13 @@ async def dm_toggle_chat(event: callback_query) -> None:
     else:
         sel.append(chat_id)
 
-    # Перерисовываем кнопки
-    buttons = [
-        [Button.inline(
-            f"{'✅' if gid in sel else '☐'} {uname or gid}",
-            f"dm_tog_{gid}".encode(),
-        )]
-        for gid, uname in st["all_groups"]
-    ]
-    buttons.append([Button.inline("✅ Готово — выбрать эти чаты", b"dm_chats_done")])
+    buttons = _build_chat_buttons(st["all_groups"], sel)
     await event.edit(
-        "📋 **Выберите чаты для мониторинга**\n(нажмите для переключения, затем «Готово»):",
+        "📋 **Выберите чаты для мониторинга**\n(нажмите чтобы отметить, затем «Готово»):",
         buttons=buttons,
     )
     await event.answer()
 
-
-# ── Подтверждение выбора чатов ────────────────────────────────────────────────
 
 @bot.on(Query(data=b"dm_chats_done"))
 async def dm_chats_done(event: callback_query) -> None:
@@ -322,12 +335,10 @@ async def dm_chats_done(event: callback_query) -> None:
     st["step"] = "text"
     await event.respond(
         f"✅ Выбрано чатов: {len(st['selected_chats'])}\n\n"
-        "📝 Введите текст поста, который будет отправляться в ЛС:"
+        "📝 Введите текст сообщения, которое будет отправляться в ЛС:"
     )
     await event.answer()
 
-
-# ── Диалог: текст → интервал → фото ──────────────────────────────────────────
 
 @bot.on(New_Message(func=lambda e: e.sender_id in dm_setup_state and
                                    dm_setup_state[e.sender_id].get("step") in
@@ -340,8 +351,8 @@ async def dm_dialog(event: callback_message) -> None:
         st["post_text"] = event.raw_text.strip()
         st["step"] = "interval"
         await event.respond(
-            "⏱ Введите **интервал в минутах** — минимальная пауза перед повторной отправкой "
-            "одному и тому же пользователю:"
+            "⏱ Введите **интервал в минутах** — пауза перед повторной отправкой "
+            "одному и тому же пользователю\n(например: `60` = раз в час):"
         )
         return
 
@@ -359,7 +370,7 @@ async def dm_dialog(event: callback_message) -> None:
             [Button.inline("📸 Прикрепить фото", b"dm_photo_yes")],
             [Button.inline("❌ Без фото", b"dm_photo_no")],
         ]
-        await event.respond("Хотите прикрепить фото к посту?", buttons=buttons)
+        await event.respond("Хотите прикрепить фото к сообщению?", buttons=buttons)
         return
 
     if st["step"] == "photo":
@@ -393,10 +404,7 @@ async def dm_photo_no(event: callback_query) -> None:
     await event.answer()
 
 
-# ── Сохранение задачи и запуск мониторинга ────────────────────────────────────
-
 async def _save_and_launch(event, admin_id: int, st: dict) -> None:
-    """Записывает задачу в БД и запускает Telethon-мониторинг."""
     cursor = conn.cursor()
     cursor.execute(
         """INSERT INTO dm_tasks
@@ -423,21 +431,17 @@ async def _save_and_launch(event, admin_id: int, st: dict) -> None:
     cursor.close()
 
     dm_setup_state.pop(admin_id, None)
-
-    # Запускаем мониторинг в фоне
-    asyncio.ensure_future(_start_monitor(task_id))
+    _launch_monitor(task_id)
 
     await event.respond(
         f"🚀 **DM-задача #{task_id} запущена!**\n\n"
         f"👥 Чатов для мониторинга: {len(st['selected_chats'])}\n"
         f"⏱ Интервал: {st['interval_minutes']} мин\n"
         f"📸 Фото: {'да' if st.get('photo_url') else 'нет'}\n\n"
-        f"Бот будет писать в ЛС всем, кто напишет в выбранных чатах.\n"
-        f"Управление: /dm_list — список задач, /dm_stop <id> — остановить."
+        f"Бот пишет в ЛС всем, кто напишет в выбранных чатах.\n"
+        f"/dm_list — список задач | /dm_stop {task_id} — остановить"
     )
 
-
-# ── /dm_list — список активных задач ─────────────────────────────────────────
 
 @bot.on(New_Message(pattern=r"/dm_list"))
 async def cmd_dm_list(event: callback_message) -> None:
@@ -460,16 +464,15 @@ async def cmd_dm_list(event: callback_message) -> None:
 
     lines = ["📋 **DM-задачи:**\n"]
     for tid, uid, interval, active, created, chats, sent in rows:
-        status = "🟢 активна" if active else "🔴 остановлена"
+        running = tid in dm_monitor_tasks and not dm_monitor_tasks[tid].done()
+        status = "🟢 активна" if active and running else ("🟡 в БД активна, клиент не запущен" if active else "🔴 остановлена")
         lines.append(
-            f"• **Задача #{tid}** | акк: {uid} | {status}\n"
+            f"**Задача #{tid}** | акк: {uid} | {status}\n"
             f"  Чатов: {chats} | ЛС отправлено: {sent} | интервал: {interval} мин\n"
-            f"  Создана: {created[:16] if created else '—'}"
+            f"  Создана: {(created or '')[:16]}"
         )
-    await event.respond("\n".join(lines))
+    await event.respond("\n\n".join(lines))
 
-
-# ── /dm_stop <id> — остановить задачу ────────────────────────────────────────
 
 @bot.on(New_Message(pattern=r"/dm_stop(?:\s+(\d+))?"))
 async def cmd_dm_stop(event: callback_message) -> None:
@@ -478,7 +481,7 @@ async def cmd_dm_stop(event: callback_message) -> None:
 
     match = event.pattern_match.group(1)
     if not match:
-        await event.respond("Использование: /dm_stop <id задачи>\nСписок: /dm_list")
+        await event.respond("Использование: /dm_stop <id>\nСписок: /dm_list")
         return
 
     task_id = int(match)
@@ -492,5 +495,9 @@ async def cmd_dm_stop(event: callback_message) -> None:
         await event.respond(f"⚠ Задача #{task_id} не найдена.")
         return
 
-    # Клиент остановится сам через цикл в _start_monitor
+    # Отменяем asyncio task если запущена
+    t = dm_monitor_tasks.get(task_id)
+    if t and not t.done():
+        t.cancel()
+
     await event.respond(f"⛔ Задача #{task_id} остановлена.")
