@@ -12,6 +12,7 @@ import random
 import sqlite3
 from dataclasses import dataclass
 from typing import Any, Optional
+from weakref import WeakValueDictionary
 
 from decouple import config
 from loguru import logger
@@ -101,12 +102,13 @@ def _daily_dialog_limit_reached() -> bool:
         cursor.close()
 
 
-async def _safe_send_message(client: TelegramClient, user_id: int, text: str, context: str) -> bool:
+async def _safe_send_message(client: TelegramClient, target: User, text: str, context: str) -> bool:
+    target_id = int(getattr(target, "id", 0) or 0)
     try:
-        await client.send_message(user_id, text)
+        await client.send_message(target, text)
         return True
     except Exception as exc:
-        logger.error(f"[AI DM] send failed ({context}) user={user_id}: {exc}")
+        logger.error(f"[AI DM] send failed ({context}) user={target_id}: {exc}")
         return False
 
 
@@ -115,7 +117,7 @@ HUMAN_WORDS_DEFAULT = "админ,оператор,человек,менедже
 
 # Per-user async locks protect against duplicate/parallel AI replies when several
 # DM tasks for the same account receive the same private message.
-_dialog_locks: dict[tuple[int, int], asyncio.Lock] = {}
+_dialog_locks: WeakValueDictionary[tuple[int, int], asyncio.Lock] = WeakValueDictionary()
 
 
 def _get_dialog_lock(account_user_id: int, target_user_id: int) -> asyncio.Lock:
@@ -183,6 +185,47 @@ def create_ai_tables() -> None:
             PRIMARY KEY (account_user_id, target_user_id, telegram_message_id)
         )
     """)
+    # Older installations may have been created before the UNIQUE constraint.
+    # Merge duplicate dialog rows without losing their message history.
+    duplicates = cursor.execute(
+        """
+        SELECT account_user_id, target_user_id, MAX(id) AS keep_id
+        FROM ai_dialogs
+        GROUP BY account_user_id, target_user_id
+        HAVING COUNT(*) > 1
+        """
+    ).fetchall()
+    for account_user_id, target_user_id, keep_id in duplicates:
+        duplicate_ids = [
+            int(row[0])
+            for row in cursor.execute(
+                """
+                SELECT id FROM ai_dialogs
+                WHERE account_user_id = ? AND target_user_id = ? AND id <> ?
+                """,
+                (account_user_id, target_user_id, keep_id),
+            ).fetchall()
+        ]
+        for duplicate_id in duplicate_ids:
+            cursor.execute(
+                "UPDATE ai_messages SET dialog_id = ? WHERE dialog_id = ?",
+                (keep_id, duplicate_id),
+            )
+            cursor.execute("DELETE FROM ai_dialogs WHERE id = ?", (duplicate_id,))
+
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_dialogs_account_target "
+        "ON ai_dialogs(account_user_id, target_user_id)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ai_dialogs_status_updated ON ai_dialogs(status, updated_at)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ai_messages_dialog_id ON ai_messages(dialog_id, id)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ai_processed_at ON ai_processed_messages(processed_at)"
+    )
 
     # Лёгкие миграции для старых БД.
     for table, col, ddl in [
@@ -537,9 +580,20 @@ async def handle_private_incoming(
             reply = config("AI_STOP_REPLY", default="Понял, больше писать не буду 🙌").strip()
             if ai_dry_run():
                 logger.info(f"[AI DM DRY RUN stop] user={sender.id}: {reply}")
-            else:
-                await _safe_send_message(client, sender.id, reply, "stop_reply")
+                _save_message(
+                    dialog.id,
+                    "system",
+                    f"[DRY RUN stop draft] {reply}",
+                    provider="dry_run",
+                    model="stop_reply",
+                )
+                return
+            sent = await _safe_send_message(client, sender, reply, "stop_reply")
+            if not sent:
+                _set_dialog_status(dialog.id, "send_error", "telegram_send_failed")
+                return
             _save_message(dialog.id, "outgoing", reply, provider="local", model="stop_reply")
+            _mark_outgoing(dialog.id)
             _set_dialog_status(dialog.id, "closed_negative", "stop_word", stage="closed_negative")
             logger.info(f"[AI DM] stop-word: dialog={dialog.id}, user={sender.id}")
             return
@@ -548,9 +602,20 @@ async def handle_private_incoming(
             reply = config("AI_HUMAN_TAKEOVER_REPLY", default="Понял, лучше передам человеку, чтобы ответили точнее 🙌").strip()
             if ai_dry_run():
                 logger.info(f"[AI DM DRY RUN human] user={sender.id}: {reply}")
-            else:
-                await _safe_send_message(client, sender.id, reply, "human_takeover")
+                _save_message(
+                    dialog.id,
+                    "system",
+                    f"[DRY RUN human draft] {reply}",
+                    provider="dry_run",
+                    model="human_takeover",
+                )
+                return
+            sent = await _safe_send_message(client, sender, reply, "human_takeover")
+            if not sent:
+                _set_dialog_status(dialog.id, "send_error", "telegram_send_failed")
+                return
             _save_message(dialog.id, "outgoing", reply, provider="local", model="human_takeover")
+            _mark_outgoing(dialog.id)
             _set_dialog_status(dialog.id, "human_needed", "human_takeover", stage="human_needed")
             logger.info(f"[AI DM] human takeover: dialog={dialog.id}, user={sender.id}")
             return
@@ -591,11 +656,20 @@ async def handle_private_incoming(
 
         if ai_dry_run():
             logger.info(f"[AI DM DRY RUN] user={sender.id}: {reply}")
-        else:
-            sent = await _safe_send_message(client, sender.id, reply, "ai_reply")
-            if not sent:
-                _set_dialog_status(dialog.id, "send_error", "telegram_send_failed")
-                return
+            _save_message(
+                dialog.id,
+                "system",
+                f"[DRY RUN draft] {reply}",
+                provider="dry_run",
+                model=model,
+                tokens_used=tokens,
+            )
+            return
+
+        sent = await _safe_send_message(client, sender, reply, "ai_reply")
+        if not sent:
+            _set_dialog_status(dialog.id, "send_error", "telegram_send_failed")
+            return
 
         _save_message(
             dialog.id,

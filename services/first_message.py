@@ -101,7 +101,10 @@ def _builtin_templates(category: str) -> list[str]:
         return list(BUILTIN_BY_CATEGORY[category])
 
     # category=all: мягкие + трейдинг + VIP с настраиваемой долей VIP.
-    vip_weight = int(config("FIRST_DM_VIP_WEIGHT_PERCENT", default="30"))
+    try:
+        vip_weight = int(config("FIRST_DM_VIP_WEIGHT_PERCENT", default="30"))
+    except (TypeError, ValueError):
+        vip_weight = 30
     vip_weight = max(0, min(100, vip_weight))
     if random.randint(1, 100) <= vip_weight:
         return list(VIP_TEMPLATES)

@@ -3,7 +3,6 @@
 """
 from loguru import logger
 from telethon.events import NewMessage, CallbackQuery
-from telethon.tl.types import User, Chat, Channel
 
 
 def format_user_info(user) -> str:
@@ -128,7 +127,7 @@ def log_error_with_context(error: Exception, context: str = "") -> None:
         error: Объект ошибки
         context: Контекст где произошла ошибка
     """
-    message = f"❌ Ошибка"
+    message = "❌ Ошибка"
     if context:
         message += f" в {context}"
     message += f": {str(error)}"

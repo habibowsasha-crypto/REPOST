@@ -1,3 +1,5 @@
+from services.menu_ui import render_menu
+from services.admin_state import clear_admin_interaction_state, is_command_event
 """
 DM Autoposter — автопостер в личные сообщения.
 
@@ -25,7 +27,7 @@ from telethon.errors import (
 )
 from telethon.sessions import StringSession
 from telethon.tl.custom import Button
-from telethon.tl.types import User
+from telethon.tl.types import InputPeerChannel, InputPeerChat, PeerChannel, PeerChat, User
 
 from config import (
     API_ID, API_HASH,
@@ -35,6 +37,7 @@ from config import (
     ADMIN_ID_LIST, MEDIA_DIR,
 )
 from utils.database.database import create_dm_tables
+from utils.telegram import gid_key
 from services.first_message import choose_first_dm_text
 from services.ai_dialog_service import handle_private_incoming, record_first_dm
 
@@ -59,8 +62,17 @@ def _now_iso() -> str:
 
 
 def _minutes_since(iso_ts: str) -> float:
-    dt = datetime.datetime.fromisoformat(iso_ts)
-    return (datetime.datetime.utcnow() - dt).total_seconds() / 60
+    try:
+        dt = datetime.datetime.fromisoformat(iso_ts)
+    except (TypeError, ValueError):
+        logger.warning(f"Некорректная дата в DM-логе: {iso_ts!r}")
+        return float("inf")
+    if dt.tzinfo is not None:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        dt = dt.astimezone(datetime.timezone.utc)
+    else:
+        now = datetime.datetime.utcnow()
+    return max(0.0, (now - dt).total_seconds() / 60)
 
 
 def _already_sent_recently(task_id: int, target_user_id: int, interval_minutes: int) -> bool:
@@ -132,6 +144,84 @@ def _get_watched_chats(task_id: int) -> list:
     return [r[0] for r in rows]
 
 
+async def _resolve_watched_chats(
+    client: TelegramClient, user_id: int, chat_ids: list[int]
+) -> list:
+    """Resolve every available working group, including ordinary memberships.
+
+    New databases use saved access_hash values. Older rows are resolved through
+    the connected account session so tasks created before this patch keep working.
+    """
+    if not chat_ids:
+        return []
+
+    placeholders = ",".join("?" for _ in chat_ids)
+    cursor = conn.cursor()
+    try:
+        discovered_rows = cursor.execute(
+            f"""
+            SELECT group_id, access_hash, peer_type, is_available
+            FROM discovered_groups
+            WHERE user_id = ? AND group_id IN ({placeholders})
+            """,
+            (user_id, *chat_ids),
+        ).fetchall()
+        legacy_rows = cursor.execute(
+            f"""
+            SELECT group_id, group_username
+            FROM groups
+            WHERE user_id = ? AND group_id IN ({placeholders})
+            """,
+            (user_id, *chat_ids),
+        ).fetchall()
+    finally:
+        cursor.close()
+
+    discovered = {int(row[0]): row[1:] for row in discovered_rows}
+    identifiers = {int(group_id): identifier for group_id, identifier in legacy_rows}
+    resolved = []
+    seen_ids: set[int] = set()
+
+    for raw_group_id in chat_ids:
+        group_id = gid_key(raw_group_id)
+        row = discovered.get(group_id)
+        peer = None
+        if row is not None:
+            access_hash, peer_type, is_available = row
+            if not is_available:
+                logger.warning(f"Пропускаю недоступную группу {group_id}")
+                continue
+            if peer_type == "channel" and access_hash is not None:
+                peer = InputPeerChannel(group_id, int(access_hash))
+            elif peer_type == "chat":
+                peer = InputPeerChat(group_id)
+
+        if peer is None:
+            identifier = identifiers.get(group_id)
+            candidates = []
+            if identifier:
+                candidates.append(identifier)
+            candidates.extend((PeerChannel(group_id), PeerChat(group_id)))
+            for candidate in candidates:
+                try:
+                    peer = await client.get_input_entity(candidate)
+                    break
+                except Exception:
+                    continue
+
+        if peer is None:
+            logger.warning(f"Не удалось восстановить Telegram peer для группы {group_id}")
+            continue
+
+        peer_key = int(getattr(peer, "channel_id", getattr(peer, "chat_id", group_id)))
+        if peer_key in seen_ids:
+            continue
+        seen_ids.add(peer_key)
+        resolved.append(peer)
+
+    return resolved
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Воркер отправки (рандомная очередь + интервал)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -175,22 +265,27 @@ async def _send_worker(task_id: int, client: TelegramClient) -> None:
             if t["photo_url"]:
                 # Telegram ограничивает caption до 1024 символов
                 if outgoing_text and len(outgoing_text) <= 1024:
-                    await client.send_file(target_id, t["photo_url"], caption=outgoing_text)
+                    await client.send_file(sender, t["photo_url"], caption=outgoing_text)
                 else:
                     # Текст слишком длинный — фото и текст отдельно
-                    await client.send_file(target_id, t["photo_url"])
+                    await client.send_file(sender, t["photo_url"])
                     if outgoing_text:
-                        await client.send_message(target_id, outgoing_text)
+                        await client.send_message(sender, outgoing_text)
             else:
-                await client.send_message(target_id, outgoing_text)
+                await client.send_message(sender, outgoing_text)
 
             _log_event(task_id, target_id, "sent")
-            record_first_dm(
-                dm_task_id=task_id,
-                account_user_id=t["user_id"],
-                target=sender,
-                text=outgoing_text,
-            )
+            try:
+                record_first_dm(
+                    dm_task_id=task_id,
+                    account_user_id=t["user_id"],
+                    target=sender,
+                    text=outgoing_text,
+                )
+            except Exception as exc:
+                # The Telegram message was already delivered. AI history failure must
+                # not turn a successful send into a false delivery error.
+                logger.error(f"[DM {task_id}] не удалось сохранить AI-диалог {target_id}: {exc}")
             uname = getattr(sender, "username", None)
             logger.info(f"[DM {task_id}] ✅ ЛС → {target_id} (@{uname or '?'})")
 
@@ -219,9 +314,12 @@ async def _send_worker(task_id: int, client: TelegramClient) -> None:
             logger.error(f"[DM {task_id}] ❌ ошибка отправки {target_id}: {exc}")
 
         # Случайная задержка между отправками
-        delay_min = t.get("delay_min") or 30
-        delay_max = t.get("delay_max") or 90
-        delay = random.randint(int(delay_min), int(delay_max))
+        try:
+            delay_min = max(0, int(t.get("delay_min") or 30))
+            delay_max = max(delay_min, int(t.get("delay_max") or 90))
+        except (TypeError, ValueError):
+            delay_min, delay_max = 30, 90
+        delay = random.randint(delay_min, delay_max)
         logger.debug(f"[DM {task_id}] пауза {delay}s перед следующей отправкой")
         await asyncio.sleep(delay)
 
@@ -235,14 +333,8 @@ async def _monitor_loop(task_id: int) -> None:
     if not task or not task["is_active"]:
         return
 
-    watched_chats = _get_watched_chats(task_id)
-    if not watched_chats:
-        logger.warning(f"[DM task {task_id}] нет чатов для мониторинга")
-        return
-
-    logger.info(f"[DM task {task_id}] запуск мониторинга, чаты: {watched_chats}")
-
     client = TelegramClient(StringSession(task["session_string"]), API_ID, API_HASH)
+    worker: Optional[asyncio.Task] = None
 
     try:
         await client.connect()
@@ -250,11 +342,19 @@ async def _monitor_loop(task_id: int) -> None:
             logger.error(f"[DM task {task_id}] сессия не авторизована")
             return
 
+        watched_chat_ids = _get_watched_chats(task_id)
+        watched_chats = await _resolve_watched_chats(client, task["user_id"], watched_chat_ids)
+        if not watched_chats:
+            logger.warning(f"[DM task {task_id}] нет доступных групп для мониторинга")
+            return
+
+        logger.info(f"[DM task {task_id}] запуск мониторинга, групп: {len(watched_chats)}")
+
         dm_monitor_clients[task_id] = client
         dm_send_queues[task_id] = deque()
 
         # Запускаем воркер отправки
-        worker = asyncio.ensure_future(_send_worker(task_id, client))
+        worker = asyncio.create_task(_send_worker(task_id, client), name=f"dm-send-{task_id}")
 
         @client.on(events.NewMessage(incoming=True))
         async def on_private_message(event):
@@ -315,7 +415,8 @@ async def _monitor_loop(task_id: int) -> None:
             t = _get_task(task_id)
             if not t or not t["is_active"]:
                 logger.info(f"[DM task {task_id}] задача остановлена")
-                worker.cancel()
+                if worker and not worker.done():
+                    worker.cancel()
                 break
             if not client.is_connected():
                 logger.warning(f"[DM task {task_id}] реконнект...")
@@ -327,18 +428,31 @@ async def _monitor_loop(task_id: int) -> None:
     except Exception as e:
         logger.error(f"[DM task {task_id}] критическая ошибка: {e}")
     finally:
+        if worker and not worker.done():
+            worker.cancel()
+            try:
+                await worker
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.debug(f"[DM task {task_id}] ошибка завершения worker: {exc}")
         try:
             await client.disconnect()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(f"[DM task {task_id}] ошибка отключения клиента: {exc}")
         dm_monitor_clients.pop(task_id, None)
-        dm_monitor_tasks.pop(task_id, None)
+        current = dm_monitor_tasks.get(task_id)
+        if current is asyncio.current_task():
+            dm_monitor_tasks.pop(task_id, None)
         dm_send_queues.pop(task_id, None)
 
 
 def _launch_monitor(task_id: int) -> None:
-    loop = bot.loop
-    task = loop.create_task(_monitor_loop(task_id))
+    existing = dm_monitor_tasks.get(task_id)
+    if existing and not existing.done():
+        logger.debug(f"[DM task {task_id}] монитор уже запущен")
+        return
+    task = bot.loop.create_task(_monitor_loop(task_id), name=f"dm-monitor-{task_id}")
     dm_monitor_tasks[task_id] = task
 
 
@@ -366,13 +480,14 @@ async def cmd_dm_post(event: callback_message) -> None:
     sessions = cursor.fetchall()
     cursor.close()
     if not sessions:
-        await event.respond("⚠ Нет добавленных аккаунтов. Сначала добавьте через /start.")
+        await render_menu(event, "⚠ Нет добавленных аккаунтов. Сначала добавьте через /start.", buttons=[[Button.inline("🏠 Главное меню", b"menu_home")]])
         return
     buttons = [
         [Button.inline(f"👤 Аккаунт #{uid}", f"dm_acc_{uid}".encode())]
         for (uid,) in sessions
     ]
-    await event.respond("📩 **DM Автопостер**\n\nВыберите аккаунт:", buttons=buttons)
+    buttons.append([Button.inline("🏠 Главное меню", b"menu_home")])
+    await render_menu(event, "📩 **DM Автопостер**\n\nВыберите аккаунт:", buttons=buttons)
 
 
 @bot.on(Query(data=lambda d: d.decode().startswith("dm_acc_")))
@@ -380,18 +495,32 @@ async def dm_pick_account(event: callback_query) -> None:
     if event.sender_id not in ADMIN_ID_LIST:
         return
     admin_id = event.sender_id
+    await clear_admin_interaction_state(admin_id)
     user_id = int(event.data.decode().split("_")[2])
     cursor = conn.cursor()
     cursor.execute("SELECT session_string FROM sessions WHERE user_id = ?", (user_id,))
     row = cursor.fetchone()
-    cursor.execute("SELECT group_id, group_username FROM groups WHERE user_id = ?", (user_id,))
+    cursor.execute(
+        """
+        SELECT
+            g.group_id,
+            COALESCE(d.title, d.username, g.group_username, CAST(g.group_id AS TEXT))
+        FROM groups AS g
+        LEFT JOIN discovered_groups AS d
+          ON d.user_id = g.user_id AND d.group_id = g.group_id
+        WHERE g.user_id = ?
+          AND COALESCE(d.is_available, 1) = 1
+        ORDER BY lower(COALESCE(d.title, d.username, g.group_username, CAST(g.group_id AS TEXT)))
+        """,
+        (user_id,),
+    )
     groups = cursor.fetchall()
     cursor.close()
     if not row:
-        await event.respond("⚠ Сессия не найдена.")
+        await render_menu(event, "⚠ Сессия не найдена.")
         return
     if not groups:
-        await event.respond("⚠ Нет групп. Добавьте группы через меню.")
+        await render_menu(event, "⚠ Нет доступных групп. Откройте аккаунт и нажмите «Найти группы аккаунта».", buttons=[[Button.inline("🔎 Найти группы", f"sync_groups_{user_id}".encode()), Button.inline("🏠 Меню", b"menu_home")]])
         return
     dm_setup_state[admin_id] = {
         "step": "pick_chats",
@@ -400,7 +529,7 @@ async def dm_pick_account(event: callback_query) -> None:
         "selected_chats": [],
         "all_groups": groups,
     }
-    await event.respond(
+    await render_menu(event, 
         "📋 **Выберите чаты для мониторинга:**",
         buttons=_build_chat_buttons(groups, []),
     )
@@ -452,7 +581,7 @@ async def dm_chats_done(event: callback_query) -> None:
         await event.answer("⚠ Выберите хотя бы один чат!", alert=True)
         return
     st["step"] = "text"
-    await event.respond(
+    await render_menu(event, 
         f"✅ Выбрано чатов: {len(st['selected_chats'])}\n\n"
         "📝 Введите текст сообщения для ЛС:"
     )
@@ -460,7 +589,7 @@ async def dm_chats_done(event: callback_query) -> None:
 
 
 @bot.on(New_Message(func=lambda e: e.sender_id in dm_setup_state and
-                    not (e.raw_text or "").lstrip().startswith("/") and
+                    not is_command_event(e) and
                     dm_setup_state[e.sender_id].get("step") in
                     ("text", "interval", "delay_min", "delay_max", "photo")))
 async def dm_dialog(event: callback_message) -> None:
@@ -543,7 +672,7 @@ async def dm_photo_yes(event: callback_query) -> None:
     if not st:
         return
     st["step"] = "photo"
-    await event.respond("📸 Отправьте фото:")
+    await render_menu(event, "📸 Отправьте фото:")
     await event.answer()
 
 
@@ -577,7 +706,7 @@ async def _save_and_launch(event, admin_id: int, st: dict) -> None:
     task_id = cursor.lastrowid
     for chat_id in st["selected_chats"]:
         cursor.execute(
-            "INSERT INTO dm_watched_chats (dm_task_id, chat_id) VALUES (?,?)",
+            "INSERT OR IGNORE INTO dm_watched_chats (dm_task_id, chat_id) VALUES (?,?)",
             (task_id, chat_id),
         )
     conn.commit()
@@ -585,7 +714,7 @@ async def _save_and_launch(event, admin_id: int, st: dict) -> None:
     dm_setup_state.pop(admin_id, None)
     _launch_monitor(task_id)
 
-    await event.respond(
+    await render_menu(event, 
         f"🚀 **DM-задача #{task_id} запущена!**\n\n"
         f"👥 Чатов: {len(st['selected_chats'])}\n"
         f"⏱ Интервал повтора: {st['interval_minutes']} мин\n"
@@ -611,7 +740,7 @@ async def cmd_dm_list(event: callback_message) -> None:
     rows = cursor.fetchall()
     cursor.close()
     if not rows:
-        await event.respond("📭 Нет DM-задач.")
+        await render_menu(event, "📭 Нет DM-задач.", buttons=[[Button.inline("🏠 Главное меню", b"menu_home")]])
         return
     lines = ["📋 **DM-задачи:**\n"]
     for tid, uid, interval, active, created, dmin, dmax, chats, sent, blocked in rows:
@@ -625,7 +754,7 @@ async def cmd_dm_list(event: callback_message) -> None:
             f"  В очереди сейчас: {queue_size} чел.\n"
             f"  Создана: {(created or '')[:16]}"
         )
-    await event.respond("\n\n".join(lines))
+    await render_menu(event, "\n\n".join(lines), buttons=[[Button.inline("🏠 Главное меню", b"menu_home")]])
 
 
 @bot.on(New_Message(pattern=r"^/dm_stop(?:@\w+)?(?:\s+(\d+))?$"))
@@ -690,7 +819,7 @@ async def menu_dm_stop(event: callback_query) -> None:
     cursor.close()
 
     if not rows:
-        await event.respond("📭 Активных DM-задач нет.")
+        await render_menu(event, "📭 Активных DM-задач нет.", buttons=[[Button.inline("🏠 Главное меню", b"menu_home")]])
         await event.answer()
         return
 
@@ -698,7 +827,8 @@ async def menu_dm_stop(event: callback_query) -> None:
         [Button.inline(f"⛔ Остановить #{task_id} | аккаунт {user_id}", f"menu_dm_stop_{task_id}".encode())]
         for task_id, user_id in rows
     ]
-    await event.respond("🛑 Выберите DM-задачу для остановки:", buttons=buttons)
+    buttons.append([Button.inline("🏠 Главное меню", b"menu_home")])
+    await render_menu(event, "🛑 Выберите DM-задачу для остановки:", buttons=buttons)
     await event.answer()
 
 
@@ -728,5 +858,5 @@ async def menu_dm_stop_selected(event: callback_query) -> None:
     if running_task and not running_task.done():
         running_task.cancel()
 
-    await event.respond(f"⛔ DM-задача #{task_id} остановлена.")
+    await render_menu(event, f"⛔ DM-задача #{task_id} остановлена.", buttons=[[Button.inline("🏠 Главное меню", b"menu_home")]])
     await event.answer("Остановлено")

@@ -1,143 +1,148 @@
-from loguru import logger
+from __future__ import annotations
 
+from loguru import logger
 from telethon import Button, TelegramClient
 from telethon.sessions import StringSession
 
-from config import callback_query, API_ID, API_HASH, Query, bot, conn, processed_callbacks
-from utils.telegram import get_active_broadcast_groups, broadcast_status_emoji, get_entity_by_id
+from config import API_HASH, API_ID, Query, bot, callback_query, conn
+from services.menu_ui import render_menu
+from utils.telegram import broadcast_status_emoji, get_active_broadcast_groups
 
 
 @bot.on(Query(data=b"my_accounts"))
 async def my_accounts(event: callback_query) -> None:
-    """
-    Выводит список аккаунтов
-    """
+    cursor = conn.cursor()
     try:
-        cursor = conn.cursor()
-        buttons = []
-        accounts_found = False
-
-        for user_id, session_string in cursor.execute("SELECT user_id, session_string FROM sessions"):
-            accounts_found = True
-            client = None
-            try:
-                client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
-                await client.connect()
-                me = await client.get_me()
-                username = me.first_name if me.first_name else "Без ника"
-                buttons.append([Button.inline(f"👤 {username}", f"account_info_{user_id}")])
-            except Exception:
-                buttons.append([Button.inline("⚠ Ошибка при загрузке аккаунта", f"error_{user_id}")])
-            finally:
-                if client:
-                    await client.disconnect()
-
+        sessions = cursor.execute(
+            "SELECT user_id, session_string FROM sessions ORDER BY user_id"
+        ).fetchall()
+    finally:
         cursor.close()
 
-        if not accounts_found:
-            await event.respond("❌ У вас нет добавленных аккаунтов")
-            return
+    if not sessions:
+        await render_menu(
+            event,
+            "❌ У вас нет добавленных аккаунтов",
+            buttons=[
+                [Button.inline("➕ Добавить аккаунт", b"add_account")],
+                [Button.inline("🏠 Главное меню", b"menu_home")],
+            ],
+        )
+        return
 
-        await event.respond("📱 **Список ваших аккаунтов:**", buttons=buttons)
+    buttons = []
+    for user_id, session_string in sessions:
+        client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+        label = f"Аккаунт {user_id}"
+        try:
+            await client.connect()
+            me = await client.get_me()
+            label = me.first_name or me.username or label
+        except Exception as exc:
+            logger.warning(f"Не удалось загрузить аккаунт {user_id}: {exc}")
+            label = f"⚠ Аккаунт {user_id}"
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+        buttons.append([Button.inline(f"👤 {label}", f"account_info_{user_id}".encode())])
 
-    except Exception as e:
-        logger.error(f"Error in my_accounts: {e}")
-        await event.respond("⚠ Произошла ошибка при получении списка аккаунтов")
+    buttons.append([Button.inline("🏠 Главное меню", b"menu_home")])
+    await render_menu(event, "📱 **Список ваших аккаунтов:**", buttons=buttons)
 
 
 @bot.on(Query(data=lambda data: data.decode().startswith("account_info_")))
 async def handle_account_button(event: callback_query) -> None:
-    # Получаем уникальный идентификатор для этого callback
-    callback_id = f"{event.sender_id}:{event.query.msg_id}"
-    
-    # Проверяем, был ли уже обработан этот callback
-    if callback_id in processed_callbacks:
-        # Этот callback уже был обработан, просто возвращаемся без ответа
-        return
-        
-    # Отмечаем callback как обработанный
-    processed_callbacks[callback_id] = True
-        
-    user_id = int(event.data.decode().split("_")[2])
-    cursor = conn.cursor()
-    row = cursor.execute(
-        "SELECT session_string FROM sessions WHERE user_id = ?", (user_id,)
-    ).fetchone()
-    if not row:
-        await event.respond("⚠ Не удалось найти аккаунт.")
-        return
-
-    session_string = row[0]
-    client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
-    await client.connect()
     try:
+        user_id = int(event.data.decode().rsplit("_", 1)[1])
+    except (ValueError, IndexError):
+        await event.answer("Некорректный ID аккаунта", alert=True)
+        return
+
+    cursor = conn.cursor()
+    try:
+        row = cursor.execute(
+            "SELECT session_string FROM sessions WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        group_rows = cursor.execute(
+            """
+            SELECT g.group_id, COALESCE(d.title, g.group_username), COALESCE(d.is_available, 1)
+            FROM groups AS g
+            LEFT JOIN discovered_groups AS d
+              ON d.user_id = g.user_id AND d.group_id = g.group_id
+            WHERE g.user_id = ?
+            ORDER BY lower(COALESCE(d.title, g.group_username))
+            """,
+            (user_id,),
+        ).fetchall()
+    finally:
+        cursor.close()
+
+    if not row:
+        await render_menu(
+            event,
+            "⚠ Не удалось найти аккаунт.",
+            buttons=[[Button.inline("🏠 Главное меню", b"menu_home")]],
+        )
+        return
+
+    client = TelegramClient(StringSession(row[0]), API_ID, API_HASH)
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            await render_menu(
+                event,
+                "⚠ Сессия аккаунта больше не авторизована.",
+                buttons=[
+                    [Button.inline("❌ Удалить аккаунт", f"delete_account_{user_id}".encode())],
+                    [Button.inline("🏠 Главное меню", b"menu_home")],
+                ],
+            )
+            return
+
         me = await client.get_me()
-        username = me.first_name or "Без имени"
+        name = me.first_name or me.username or "Без имени"
         phone = me.phone or "Не указан"
-        groups = cursor.execute("SELECT group_id, group_username FROM groups WHERE user_id = ?", (user_id,))
+        active_gids = set(get_active_broadcast_groups(user_id))
 
-        active_gids = get_active_broadcast_groups(user_id)
         lines = []
-        
-        # Получаем информацию о группах с их названиями
-        for group_id, group_username in groups:
-            try:
-                # Пытаемся получить entity группы
-                try:
-                    # Проверяем, является ли group_username числом (ID группы) или именем пользователя
-                    if group_username.startswith('@'):
-                        # Это username группы
-                        entity = await client.get_entity(group_username)
-                    else:
-                        # Пробуем получить entity по ID
-                        try:
-                            group_id_int = int(group_username)
-                            entity = await get_entity_by_id(client, group_id_int)
-                            if not entity:
-                                # Если не удалось получить entity, используем ID как название
-                                display_name = f"Группа с ID {group_id}"
-                                lines.append(f"{broadcast_status_emoji(user_id, int(group_id))} {display_name}")
-                                continue
-                        except ValueError:
-                            # Если не можем преобразовать в число, пробуем использовать как есть
-                            entity = await client.get_entity(group_username)
-                except Exception as entity_error:
-                    # Если не удалось получить entity, используем username или ID как название
-                    logger.error(f"Ошибка при получении entity для группы {group_username}: {entity_error}")
-                    lines.append(f"{broadcast_status_emoji(user_id, int(group_id))} {group_username}")
-                    continue
-                
-                # Получаем название группы
-                group_title = getattr(entity, 'title', group_username)
-                lines.append(f"{broadcast_status_emoji(user_id, int(group_id))} {group_title}")
-                
-            except Exception as e:
-                logger.error(f"Ошибка при обработке группы {group_id}: {e}")
-                lines.append(f"{broadcast_status_emoji(user_id, int(group_id))} {group_username}")
-        
-        group_list = "\n".join(lines)
-        if not group_list:
-            group_list = "У пользователя нет групп."
-
+        for group_id, title, available in group_rows:
+            icon = broadcast_status_emoji(user_id, int(group_id))
+            suffix = " ⚠ недоступна" if not available else ""
+            lines.append(f"{icon} {title}{suffix}")
+        group_list = "\n".join(lines) if lines else "Рабочих групп пока нет."
         mass_active = "🟢 ВКЛ" if active_gids else "🔴 ВЫКЛ"
-        buttons = [
-            [
-                Button.inline("📋 Список групп", f"listOfgroups_{user_id}")
-            ],
-            [Button.inline("🚀 Начать рассылку во все чаты", f"broadcastAll_{user_id}"),
-             Button.inline("❌ Остановить общую рассылку", f"StopBroadcastAll_{user_id}")],
-            [Button.inline("✔ Обновить информацию о группах", f"add_all_groups_{user_id}", )],
-            [Button.inline("❌ Удалить этот аккаунт", f"delete_account_{user_id}")]
-        ]
 
-        await event.respond(
-            f"📢 **Меню для аккаунта {username}:**\n"
+        buttons = [
+            [Button.inline("🔎 Найти группы аккаунта", f"sync_groups_{user_id}".encode())],
+            [Button.inline("📋 Найденные группы", f"discovered_groups_{user_id}_0".encode())],
+            [Button.inline("📋 Рабочий список групп", f"groups_{user_id}".encode())],
+            [
+                Button.inline("🚀 Начать рассылку во все чаты", f"broadcastAll_{user_id}".encode()),
+                Button.inline("❌ Остановить общую рассылку", f"StopBroadcastAll_{user_id}".encode()),
+            ],
+            [Button.inline("❌ Удалить этот аккаунт", f"delete_account_{user_id}".encode())],
+            [Button.inline("🏠 Главное меню", b"menu_home")],
+        ]
+        await render_menu(
+            event,
+            f"📢 **Меню аккаунта {name}:**\n"
             f"🚀 **Массовая рассылка:** {mass_active}\n\n"
-            f"📌 **Имя:** {username}\n"
+            f"📌 **Имя:** {name}\n"
             f"📞 **Номер:** `+{phone}`\n\n"
-            f"📝 **Список групп:**\n{group_list}",
-            buttons=buttons
+            f"📝 **Рабочие группы:**\n{group_list}",
+            buttons=buttons,
+        )
+    except Exception as exc:
+        logger.exception(f"Ошибка открытия аккаунта {user_id}: {exc}")
+        await render_menu(
+            event,
+            f"⚠ Не удалось открыть аккаунт: {exc}",
+            buttons=[[Button.inline("🏠 Главное меню", b"menu_home")]],
         )
     finally:
-        await client.disconnect()
-        cursor.close()
+        try:
+            await client.disconnect()
+        except Exception:
+            pass

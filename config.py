@@ -1,6 +1,6 @@
 import os
 import sqlite3
-from typing import Dict, Tuple, List, Optional
+from typing import Dict, List
 
 import telethon.events
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -46,14 +46,12 @@ Query = telethon.events.CallbackQuery
 callback_query = Query.Event
 callback_message = New_Message.Event
 __Dict_int_str = Dict[int, str]
-__Dict_all_str = Dict[str, str]
 __Dict_int_dict = Dict[int, dict]
 
 
 phone_waiting: Dict[int, bool] = {}  # Список пользователей ожидающие подтверждения телефона
 
 code_waiting: __Dict_int_str = {}
-broadcast_all_text: __Dict_int_str = {}
 user_states: __Dict_int_str = {}
 
 password_waiting: __Dict_int_dict = {}
@@ -62,32 +60,7 @@ broadcast_solo_state: __Dict_int_dict = {}
 broadcast_all_state_account: __Dict_int_dict = {}
 user_sessions: __Dict_int_dict = {}
 
-user_sessions_deleting: Dict[int, __Dict_all_str] = {}
-user_sessions_phone: Dict[Tuple[int, int], __Dict_all_str] = {}
+user_sessions_deleting: Dict[int, Dict[str, str]] = {}
 
 user_clients: Dict[int, TelegramClient] = {}
 scheduler: AsyncIOScheduler = AsyncIOScheduler()
-
-# Словарь для отслеживания обработанных callback-запросов
-processed_callbacks: Dict[str, bool] = {}
-
-
-async def safe_callback_answer(event: callback_query, text: str = "") -> None:
-    """
-    Безопасно отвечает на callback query, обрабатывая возможные ошибки.
-    """
-    try:
-        await event.answer(text)
-    except Exception as e:
-        # Игнорируем ошибки QueryIdInvalid и другие ошибки ответа на callback
-        from loguru import logger
-        logger.debug(f"Ошибка при ответе на callback: {e}")
-        pass
-
-
-def cleanup_processed_callbacks() -> None:
-    """
-    Очищает словарь processed_callbacks для предотвращения утечек памяти.
-    Вызывается периодически через scheduler.
-    """
-    processed_callbacks.clear()

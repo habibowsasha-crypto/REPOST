@@ -7,7 +7,6 @@ from loguru import logger
 from config import (
     broadcast_all_state,
     broadcast_all_state_account,
-    broadcast_all_text,
     broadcast_solo_state,
     code_waiting,
     password_waiting,
@@ -20,9 +19,10 @@ from config import (
 
 
 def is_command_event(event: Any) -> bool:
-    """Return True when an incoming admin message is a slash command."""
+    """Return True for slash commands and the text command «Меню»."""
     text = getattr(event, "raw_text", None) or getattr(event, "text", None) or ""
-    return text.lstrip().startswith("/")
+    normalized = text.strip().casefold()
+    return normalized.startswith("/") or normalized == "меню"
 
 
 async def clear_admin_interaction_state(admin_id: int) -> int:
@@ -37,8 +37,7 @@ async def clear_admin_interaction_state(admin_id: int) -> int:
         phone_waiting,
         code_waiting,
         password_waiting,
-        broadcast_all_text,
-        broadcast_all_state,
+            broadcast_all_state,
         broadcast_solo_state,
         broadcast_all_state_account,
         user_sessions,

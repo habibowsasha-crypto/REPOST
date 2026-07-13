@@ -1,6 +1,5 @@
+from services.menu_ui import render_menu
 from config import callback_query, Query, bot, conn
-from telethon import events
-import datetime
 import os.path
 
 
@@ -19,7 +18,7 @@ async def show_history(event: callback_query) -> None:
     rows = cursor.fetchall()
     cursor.close()
     if not rows:
-        await event.respond("❌ История рассылки пуста.")
+        await render_menu(event, "❌ История рассылки пуста.")
         return
     
     
@@ -61,4 +60,4 @@ async def show_history(event: callback_query) -> None:
     
     
     for msg in messages:
-        await event.respond(msg)
+        await render_menu(event, msg)

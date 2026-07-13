@@ -1,0 +1,59 @@
+АУДИТ TgBlaster DM + AI Dialog v1.0.5
+Дата сборки: 2026-07-14
+
+ОБЪЕКТ ПРОВЕРКИ
+- Python runtime-код
+- Telethon callback/NewMessage registration
+- SQLite schema и миграции
+- группы/закрытые супергруппы/access_hash
+- DM monitor/worker/restart path
+- AI dialog/dedup/dry-run
+- ordinary broadcast scheduler
+- menu/FSM cleanup
+- Railway paths и чистота архива
+
+КЛЮЧЕВАЯ ЛОГИКА ГРУПП
+- Права администратора и владельца сохраняются только как справочные метаданные.
+- Они не используются как условие добавления или работы группы.
+- Обычного участия достаточно, когда аккаунт видит сообщения группы.
+- Broadcast-каналы без режима megagroup/gigagroup исключаются, поскольку это не групповые чаты.
+
+ИСПРАВЛЕННЫЕ ДЕФЕКТЫ
+- несовпадающие ID -100... и Telethon positive ID;
+- потеря приватного entity после Railway restart;
+- разные таблицы каталога и рабочего списка;
+- дубли account/group, watched chats, broadcasts и AI dialogs;
+- конфликт одиночной и массовой scheduler-задачи одной группы;
+- неправильный min/max jitter;
+- photo-only resume false-negative;
+- ложный success при нуле групп;
+- один ошибочный аккаунт прерывал multi-account scheduling;
+- сохранение session_string в истории удалённого аккаунта;
+- ложные AI dry-run counters/status transitions;
+- duplicate AI reply при нескольких DM-задачах одного аккаунта;
+- невалидный VIP weight env ломал worker;
+- лишний callback cache и неиспользуемые состояния.
+
+ПРОВЕРКИ
+- AST parse всех Python-файлов;
+- compileall;
+- pyflakes (ожидаемые предупреждения только для wildcard-import регистрации handlers);
+- импорт main с dummy Variables и подсчёт зарегистрированных Telethon handlers;
+- миграция старой SQLite схемы;
+- синхронизация публичных/закрытых групп обычного участника;
+- сохранение ручного удаления при повторной синхронизации;
+- отказ Telegram get_dialogs без очистки старой БД;
+- восстановление private InputPeerChannel по access_hash;
+- DM resolver;
+- worklist reconciliation;
+- AI dry-run/live/dedup;
+- broadcast runtime и история отправки;
+- menu command/render-in-place;
+- проверка first-message modes;
+- поиск секретов и лишних runtime-файлов в ZIP.
+
+ЧЕСТНОЕ ОГРАНИЧЕНИЕ АУДИТА
+Live-проверка с реальными Telegram-аккаунтами, Telegram API, OpenAI API и Railway сетью в среде сборки не выполнялась. Runtime-пути проверены статически и тестовыми fake-клиентами.
+
+НОВЫЕ ОГРАНИЧЕНИЯ
+Не добавлены.
