@@ -134,8 +134,8 @@ def _get_watched_chats(task_id: int) -> list:
     return [r[0] for r in rows]
 
 
-def _resolve_managed_watched_chats(user_id: int, chat_ids: list[int]) -> list:
-    """Resolve persisted managed groups to concrete Telegram input peers."""
+def _resolve_working_watched_chats(user_id: int, chat_ids: list[int]) -> list:
+    """Resolve verified working groups to concrete Telegram input peers."""
     if not chat_ids:
         return []
 
@@ -272,15 +272,15 @@ async def _monitor_loop(task_id: int) -> None:
         return
 
     watched_chat_ids = _get_watched_chats(task_id)
-    watched_chats = _resolve_managed_watched_chats(task["user_id"], watched_chat_ids)
+    watched_chats = _resolve_working_watched_chats(task["user_id"], watched_chat_ids)
     if not watched_chats:
         logger.warning(
-            f"[DM task {task_id}] нет доступных управляемых групп для мониторинга"
+            f"[DM task {task_id}] нет доступных рабочих групп для мониторинга"
         )
         return
 
     logger.info(
-        f"[DM task {task_id}] запуск мониторинга, управляемых групп: {len(watched_chats)}"
+        f"[DM task {task_id}] запуск мониторинга, рабочих групп: {len(watched_chats)}"
     )
 
     client = TelegramClient(StringSession(task["session_string"]), API_ID, API_HASH)
@@ -445,7 +445,7 @@ async def dm_pick_account(event: callback_query) -> None:
         await render_menu(event, "⚠ Сессия не найдена.")
         return
     if not groups:
-        await render_menu(event, "⚠ Нет доступных управляемых групп. Сначала откройте аккаунт и нажмите «Найти группы аккаунта».", buttons=[[Button.inline("🔎 Найти группы", f"sync_groups_{user_id}".encode()), Button.inline("🏠 Меню", b"menu_home")]])
+        await render_menu(event, "⚠ Нет доступных рабочих групп. Откройте аккаунт → «Найти группы аккаунта» и выберите группу, которой аккаунт управляет.", buttons=[[Button.inline("🔎 Найти группы", f"sync_groups_{user_id}".encode()), Button.inline("🏠 Меню", b"menu_home")]])
         return
     dm_setup_state[admin_id] = {
         "step": "pick_chats",

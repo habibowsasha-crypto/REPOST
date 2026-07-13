@@ -33,6 +33,22 @@ def create_table() -> None:
             last_seen_at TEXT,
             PRIMARY KEY (user_id, group_id))""")
 
+    # Удаляем возможные старые дубли перед созданием уникального индекса.
+    start_cursor.execute("""
+        DELETE FROM groups
+        WHERE rowid NOT IN (
+            SELECT MIN(rowid) FROM groups GROUP BY user_id, group_id
+        )
+    """)
+    start_cursor.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_groups_user_group
+        ON groups(user_id, group_id)
+    """)
+    start_cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_discovered_groups_user_available
+        ON discovered_groups(user_id, is_available)
+    """)
+
     start_cursor.execute("""
         CREATE TABLE IF NOT EXISTS broadcasts ( 
             user_id INTEGER, 

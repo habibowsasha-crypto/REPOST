@@ -1,11 +1,7 @@
 from services.menu_ui import render_menu
 from loguru import logger
-from typing import List, Optional, Union
-
 from telethon import Button, TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl.functions.channels import JoinChannelRequest
-from telethon.tl.types import Channel, Chat, DialogFilter
 
 from config import callback_query, API_ID, API_HASH, Query, bot, conn, processed_callbacks
 from utils.telegram import broadcast_status_emoji, gid_key, get_entity_by_id
@@ -64,87 +60,63 @@ async def account_menu(event: callback_query) -> None:
     ]
     
     # Отправляем меню аккаунта
-    await render_menu(event, f"📱 **Меню аккаунта**\n\nВыберите действие:", buttons=buttons)
+    await render_menu(event, "📱 **Меню аккаунта**\n\nВыберите действие:", buttons=buttons)
 
 
 @bot.on(Query(data=b"my_groups"))
 async def my_groups(event: callback_query) -> None:
-    # Получаем уникальный идентификатор для этого callback
-    callback_id = f"{event.sender_id}:{getattr(event.query, 'query_id', event.query.msg_id)}"
-    
-    # Проверяем, был ли уже обработан этот callback
-    if callback_id in processed_callbacks:
-        # Этот callback уже был обработан, просто возвращаемся без ответа
-        return
-        
-    # Отмечаем callback как обработанный
-    processed_callbacks[callback_id] = True
-    
     cursor = conn.cursor()
-    cursor.execute("SELECT group_id, group_username FROM groups")
-    groups = cursor.fetchall()
-    cursor.close()
-    message = "❌ У вас нет добавленных групп."
+    try:
+        catalog = cursor.execute(
+            "SELECT group_id, group_username FROM pre_groups ORDER BY lower(group_username)"
+        ).fetchall()
+        working_count = cursor.execute("SELECT COUNT(*) FROM groups").fetchone()[0]
+    finally:
+        cursor.close()
+
     buttons = []
-    if groups:
-        message = "📑 **Список добавленных групп:**\n"
-        buttons.append([Button.inline("➕ Добавить все аккаунты в эти группы", b"add_all_accounts_to_groups")])
-        buttons.append([Button.inline("❌ Удалить группу", b"delete_group")])
-        for group in groups:
-            message += f"{group[1]}\n"
-    buttons.append([Button.inline("🏠 Главное меню", b"menu_home")])
+    if not catalog:
+        message = (
+            "📭 **Общий каталог групп пуст.**\n\n"
+            "Добавьте публичную группу по @username/ID либо найдите группы через карточку аккаунта."
+        )
+    else:
+        lines = ["👥 **Общий каталог групп:**", ""]
+        for group_id, group_username in catalog:
+            lines.append(f"• {group_username} (`{group_id}`)")
+        lines.extend([
+            "",
+            f"Записей в каталоге: {len(catalog)}",
+            f"Рабочих привязок к аккаунтам: {working_count}",
+            "",
+            "Каталог и рабочий список аккаунта - разные сущности. "
+            "Рабочие группы выбираются в карточке конкретного аккаунта.",
+        ])
+        message = "\n".join(lines)
+        buttons.append([Button.inline("❌ Удалить из каталога", b"delete_group")])
+
+    buttons.extend([
+        [Button.inline("➕ Добавить в каталог", b"add_groups")],
+        [Button.inline("👤 Открыть аккаунты", b"my_accounts")],
+        [Button.inline("🏠 Главное меню", b"menu_home")],
+    ])
     await render_menu(event, message, buttons=buttons)
 
 
 @bot.on(Query(data=b"add_all_accounts_to_groups"))
 async def add_all_accounts_to_groups(event: callback_query) -> None:
-    # Получаем уникальный идентификатор для этого callback
-    callback_id = f"{event.sender_id}:{getattr(event.query, 'query_id', event.query.msg_id)}"
-    
-    # Проверяем, был ли уже обработан этот callback
-    if callback_id in processed_callbacks:
-        # Этот callback уже был обработан, просто возвращаемся без ответа
-        return
-        
-    # Отмечаем callback как обработанный
-    processed_callbacks[callback_id] = True
-    
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id, session_string FROM sessions")
-    accounts = cursor.fetchall()
-
-    cursor.execute("SELECT group_id, group_username FROM groups")
-    groups = cursor.fetchall()
-    if not accounts:
-        await render_menu(event, "❌ Нет добавленных аккаунтов.")
-        return
-
-    if not groups:
-        await render_menu(event, "❌ Нет добавленных групп.")
-        return
-
-    for account in accounts:
-        session = StringSession(account[1])
-        client = TelegramClient(session, API_ID, API_HASH)
-        await client.connect()
-        try:
-            for group in groups:
-                try:
-                    await client(JoinChannelRequest(group[1]))
-                except Exception as e:
-                    logger.error(f"Ошибка {e}")
-                cursor.execute("""INSERT OR IGNORE INTO groups 
-                                        (user_id, group_id, group_username) 
-                                        VALUES (?, ?, ?)""", (account[0], group[0], group[1]))
-                logger.info(f"Добавляем в базу данных группу ({account[0], group[0], group[1]})")
-        except Exception as e:
-            await render_menu(event, f"⚠ Ошибка при добавлении аккаунта: {e}")
-        finally:
-            await client.disconnect()
-    group_list = "\n".join([f"📌 {group[1]}" for group in groups])
-    await render_menu(event, f"✅ Аккаунты успешно добавлены в следующие группы:\n{group_list}")
-    conn.commit()
-    cursor.close()
+    # Старый callback оставлен для совместимости со старыми сообщениями бота.
+    # Массовая автоматическая привязка каталога ко всем аккаунтам отключена:
+    # права и доступность проверяются отдельно для каждого аккаунта.
+    await render_menu(
+        event,
+        "ℹ️ Автоматическая привязка общего каталога ко всем аккаунтам отключена.\n\n"
+        "Откройте нужный аккаунт → «Найти группы аккаунта» и выберите доступную рабочую группу.",
+        buttons=[
+            [Button.inline("👤 Мои аккаунты", b"my_accounts")],
+            [Button.inline("🏠 Главное меню", b"menu_home")],
+        ],
+    )
 
 
 @bot.on(Query(data=lambda event: event.decode().startswith("add_all_groups_")))

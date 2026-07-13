@@ -76,7 +76,21 @@ async def handle_account_button(event: callback_query) -> None:
         me = await client.get_me()
         username = me.first_name or "Без имени"
         phone = me.phone or "Не указан"
-        groups = cursor.execute("SELECT group_id, group_username FROM groups WHERE user_id = ?", (user_id,))
+        groups = cursor.execute(
+            "SELECT group_id, group_username FROM groups WHERE user_id = ? ORDER BY group_id",
+            (user_id,),
+        ).fetchall()
+        discovered_total = cursor.execute(
+            "SELECT COUNT(*) FROM discovered_groups WHERE user_id = ? AND is_available = 1",
+            (user_id,),
+        ).fetchone()[0]
+        discovered_view_only = cursor.execute(
+            """
+            SELECT COUNT(*) FROM discovered_groups
+            WHERE user_id = ? AND is_available = 1 AND is_admin = 0 AND is_creator = 0
+            """,
+            (user_id,),
+        ).fetchone()[0]
 
         active_gids = get_active_broadcast_groups(user_id)
         lines = []
@@ -119,7 +133,7 @@ async def handle_account_button(event: callback_query) -> None:
         
         group_list = "\n".join(lines)
         if not group_list:
-            group_list = "У пользователя нет групп."
+            group_list = "Рабочих групп нет."
 
         mass_active = "🟢 ВКЛ" if active_gids else "🔴 ВЫКЛ"
         buttons = [
@@ -137,7 +151,9 @@ async def handle_account_button(event: callback_query) -> None:
             f"🚀 **Массовая рассылка:** {mass_active}\n\n"
             f"📌 **Имя:** {username}\n"
             f"📞 **Номер:** `+{phone}`\n\n"
-            f"📝 **Список групп:**\n{group_list}",
+            f"📝 **Рабочие группы:**\n{group_list}\n\n"
+            f"🔎 Найдено доступных групп: {discovered_total}\n"
+            f"👁 Только просмотр: {discovered_view_only}",
             buttons=buttons
         )
     finally:
