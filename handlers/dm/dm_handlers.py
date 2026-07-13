@@ -357,7 +357,7 @@ async def restore_dm_tasks() -> None:
 # UI настройки
 # ══════════════════════════════════════════════════════════════════════════════
 
-@bot.on(New_Message(pattern=r"/dm_post"))
+@bot.on(New_Message(pattern=r"^/dm_post(?:@\w+)?$"))
 async def cmd_dm_post(event: callback_message) -> None:
     if event.sender_id not in ADMIN_ID_LIST:
         return
@@ -460,6 +460,7 @@ async def dm_chats_done(event: callback_query) -> None:
 
 
 @bot.on(New_Message(func=lambda e: e.sender_id in dm_setup_state and
+                    not (e.raw_text or "").lstrip().startswith("/") and
                     dm_setup_state[e.sender_id].get("step") in
                     ("text", "interval", "delay_min", "delay_max", "photo")))
 async def dm_dialog(event: callback_message) -> None:
@@ -595,7 +596,7 @@ async def _save_and_launch(event, admin_id: int, st: dict) -> None:
     )
 
 
-@bot.on(New_Message(pattern=r"/dm_list"))
+@bot.on(New_Message(pattern=r"^/dm_list(?:@\w+)?$"))
 async def cmd_dm_list(event: callback_message) -> None:
     if event.sender_id not in ADMIN_ID_LIST:
         return
@@ -627,7 +628,7 @@ async def cmd_dm_list(event: callback_message) -> None:
     await event.respond("\n\n".join(lines))
 
 
-@bot.on(New_Message(pattern=r"/dm_stop(?:\s+(\d+))?"))
+@bot.on(New_Message(pattern=r"^/dm_stop(?:@\w+)?(?:\s+(\d+))?$"))
 async def cmd_dm_stop(event: callback_message) -> None:
     if event.sender_id not in ADMIN_ID_LIST:
         return
@@ -648,3 +649,84 @@ async def cmd_dm_stop(event: callback_message) -> None:
     if t and not t.done():
         t.cancel()
     await event.respond(f"⛔ Задача #{task_id} остановлена.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Главное меню — callback-обёртки над DM-командами
+# ══════════════════════════════════════════════════════════════════════════════
+
+@bot.on(Query(data=b"menu_dm_post"))
+async def menu_dm_post(event: callback_query) -> None:
+    if event.sender_id not in ADMIN_ID_LIST:
+        await event.answer("Недоступно", alert=True)
+        return
+    from services.admin_state import clear_admin_interaction_state
+
+    await clear_admin_interaction_state(event.sender_id)
+    await cmd_dm_post(event)
+    await event.answer()
+
+
+@bot.on(Query(data=b"menu_dm_list"))
+async def menu_dm_list(event: callback_query) -> None:
+    if event.sender_id not in ADMIN_ID_LIST:
+        await event.answer("Недоступно", alert=True)
+        return
+    await cmd_dm_list(event)
+    await event.answer()
+
+
+@bot.on(Query(data=b"menu_dm_stop"))
+async def menu_dm_stop(event: callback_query) -> None:
+    if event.sender_id not in ADMIN_ID_LIST:
+        await event.answer("Недоступно", alert=True)
+        return
+
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, user_id FROM dm_tasks WHERE is_active = 1 ORDER BY id DESC LIMIT 50"
+    )
+    rows = cursor.fetchall()
+    cursor.close()
+
+    if not rows:
+        await event.respond("📭 Активных DM-задач нет.")
+        await event.answer()
+        return
+
+    buttons = [
+        [Button.inline(f"⛔ Остановить #{task_id} | аккаунт {user_id}", f"menu_dm_stop_{task_id}".encode())]
+        for task_id, user_id in rows
+    ]
+    await event.respond("🛑 Выберите DM-задачу для остановки:", buttons=buttons)
+    await event.answer()
+
+
+@bot.on(Query(data=lambda d: d.decode().startswith("menu_dm_stop_")))
+async def menu_dm_stop_selected(event: callback_query) -> None:
+    if event.sender_id not in ADMIN_ID_LIST:
+        await event.answer("Недоступно", alert=True)
+        return
+
+    try:
+        task_id = int(event.data.decode().rsplit("_", 1)[1])
+    except (ValueError, IndexError):
+        await event.answer("Некорректный ID задачи", alert=True)
+        return
+
+    cursor = conn.cursor()
+    cursor.execute("UPDATE dm_tasks SET is_active = 0 WHERE id = ? AND is_active = 1", (task_id,))
+    affected = cursor.rowcount
+    conn.commit()
+    cursor.close()
+
+    if not affected:
+        await event.answer("Задача уже остановлена или не найдена", alert=True)
+        return
+
+    running_task = dm_monitor_tasks.get(task_id)
+    if running_task and not running_task.done():
+        running_task.cancel()
+
+    await event.respond(f"⛔ DM-задача #{task_id} остановлена.")
+    await event.answer("Остановлено")

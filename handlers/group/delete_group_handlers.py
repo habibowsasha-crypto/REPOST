@@ -19,9 +19,11 @@ async def handle_delete_group(event: callback_query) -> None:
 
 
 def is_awaiting_group_deletion(event):
-    """Проверяет, ожидает ли пользователь ввода группы для удаления"""
+    """Проверяет, ожидает ли пользователь ввода группы для удаления."""
+    if (event.raw_text or "").lstrip().startswith("/"):
+        return False
     user_state = user_sessions_deleting.get(event.sender_id)
-    return user_state and user_state.get("step") == "awaiting_group_username"
+    return bool(user_state and user_state.get("step") == "awaiting_group_username")
 
 
 @bot.on(New_Message(func=is_awaiting_group_deletion))

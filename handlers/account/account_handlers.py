@@ -102,7 +102,9 @@ async def get_code(event: callback_message) -> None:
 
 
 @bot.on(New_Message(func=lambda
-        e: e.sender_id in password_waiting and e.sender_id not in user_states and e.sender_id not in broadcast_all_state))
+        e: e.sender_id in password_waiting and
+        not (e.raw_text or "").lstrip().startswith("/") and
+        e.sender_id not in user_states and e.sender_id not in broadcast_all_state))
 async def get_password(event: callback_message) -> None:
     user_id = event.sender_id
     if password_waiting[user_id]["waiting"] and event.message.id > password_waiting[user_id]["last_message_id"]:

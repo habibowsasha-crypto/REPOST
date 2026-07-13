@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import tempfile
 
-from config import ADMIN_ID_LIST, New_Message, bot, callback_message
+from config import ADMIN_ID_LIST, New_Message, Query, bot, callback_message
 from services.ai_dialog_service import (
     ai_stats,
     export_dialogs_text,
@@ -14,7 +14,7 @@ from services.ai_dialog_service import (
 from services.first_message import get_templates_preview, reload_first_dm_templates_cache
 
 
-@bot.on(New_Message(pattern=r"/ai_status"))
+@bot.on(New_Message(pattern=r"^/ai_status(?:@\w+)?$"))
 async def cmd_ai_status(event: callback_message) -> None:
     if event.sender_id not in ADMIN_ID_LIST:
         return
@@ -34,7 +34,7 @@ async def cmd_ai_status(event: callback_message) -> None:
     )
 
 
-@bot.on(New_Message(pattern=r"/ai_dialogs(?:\s+(\d+))?"))
+@bot.on(New_Message(pattern=r"^/ai_dialogs(?:@\w+)?(?:\s+(\d+))?$"))
 async def cmd_ai_dialogs(event: callback_message) -> None:
     if event.sender_id not in ADMIN_ID_LIST:
         return
@@ -55,7 +55,7 @@ async def cmd_ai_dialogs(event: callback_message) -> None:
     await event.respond("\n\n".join(lines))
 
 
-@bot.on(New_Message(pattern=r"/ai_stop(?:\s+(\d+))?"))
+@bot.on(New_Message(pattern=r"^/ai_stop(?:@\w+)?(?:\s+(\d+))?$"))
 async def cmd_ai_stop(event: callback_message) -> None:
     if event.sender_id not in ADMIN_ID_LIST:
         return
@@ -67,7 +67,7 @@ async def cmd_ai_stop(event: callback_message) -> None:
     await event.respond("⛔ AI остановлен для пользователя." if ok else "⚠ Активный диалог не найден.")
 
 
-@bot.on(New_Message(pattern=r"/ai_resume(?:\s+(\d+))?"))
+@bot.on(New_Message(pattern=r"^/ai_resume(?:@\w+)?(?:\s+(\d+))?$"))
 async def cmd_ai_resume(event: callback_message) -> None:
     if event.sender_id not in ADMIN_ID_LIST:
         return
@@ -79,7 +79,7 @@ async def cmd_ai_resume(event: callback_message) -> None:
     await event.respond("✅ AI снова активен для пользователя." if ok else "⚠ Диалог не найден.")
 
 
-@bot.on(New_Message(pattern=r"/ai_export"))
+@bot.on(New_Message(pattern=r"^/ai_export(?:@\w+)?$"))
 async def cmd_ai_export(event: callback_message) -> None:
     if event.sender_id not in ADMIN_ID_LIST:
         return
@@ -96,7 +96,7 @@ async def cmd_ai_export(event: callback_message) -> None:
             pass
 
 
-@bot.on(New_Message(pattern=r"/first_dm_templates"))
+@bot.on(New_Message(pattern=r"^/first_dm_templates(?:@\w+)?$"))
 async def cmd_first_dm_templates(event: callback_message) -> None:
     if event.sender_id not in ADMIN_ID_LIST:
         return
@@ -109,3 +109,54 @@ async def cmd_first_dm_templates(event: callback_message) -> None:
     for i, item in enumerate(templates, start=1):
         lines.append(f"{i}. {item}")
     await event.respond("\n".join(lines))
+
+
+# Главное меню — callback-обёртки над AI-командами.
+@bot.on(Query(data=b"menu_ai_status"))
+async def menu_ai_status(event):
+    if event.sender_id not in ADMIN_ID_LIST:
+        await event.answer("Недоступно", alert=True)
+        return
+    await cmd_ai_status(event)
+    await event.answer()
+
+
+@bot.on(Query(data=b"menu_ai_dialogs"))
+async def menu_ai_dialogs(event):
+    if event.sender_id not in ADMIN_ID_LIST:
+        await event.answer("Недоступно", alert=True)
+        return
+    rows = recent_dialogs(limit=10)
+    if not rows:
+        await event.respond("📭 AI-диалогов пока нет.")
+        await event.answer()
+        return
+
+    lines = ["📋 **Последние AI-диалоги:**\n"]
+    for uid, username, first_name, stage, status, count, updated in rows:
+        who = f"@{username}" if username else (first_name or str(uid))
+        lines.append(
+            f"`{uid}` | {who}\n"
+            f"стадия: `{stage}` | статус: `{status}` | AI-ответов: {count}\n"
+            f"обновлён: {(updated or '')[:19]}"
+        )
+    await event.respond("\n\n".join(lines))
+    await event.answer()
+
+
+@bot.on(Query(data=b"menu_first_dm_templates"))
+async def menu_first_dm_templates(event):
+    if event.sender_id not in ADMIN_ID_LIST:
+        await event.answer("Недоступно", alert=True)
+        return
+    reload_first_dm_templates_cache()
+    templates = get_templates_preview(limit=30)
+    if not templates:
+        await event.respond("⚠ Шаблоны первых сообщений не найдены.")
+        await event.answer()
+        return
+    lines = ["💬 **Первые DM-шаблоны:**\n"]
+    for i, item in enumerate(templates, start=1):
+        lines.append(f"{i}. {item}")
+    await event.respond("\n".join(lines))
+    await event.answer()
