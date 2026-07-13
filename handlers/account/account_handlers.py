@@ -10,16 +10,6 @@ from config import (callback_query, callback_message, phone_waiting, code_waitin
                     API_HASH, broadcast_all_state, user_states, New_Message, Query, bot, conn)
 
 
-async def _drop_client(user_id: int) -> None:
-    """Отключает userbot-клиент перед удалением из user_clients, чтобы не текли TCP-соединения."""
-    client = user_clients.pop(user_id, None)
-    if client is not None:
-        try:
-            await client.disconnect()
-        except Exception as e:
-            logger.debug(f"Ошибка при отключении клиента {user_id}: {e}")
-
-
 @bot.on(Query(data=b"add_account"))
 async def add_account(event: callback_query) -> None:
     """
@@ -60,7 +50,7 @@ async def send_code_for_phone(event: callback_message) -> None:
             logger.error(message)
         else:
             phone_waiting.pop(user_id, None)
-            await _drop_client(user_id)
+            user_clients.pop(user_id, None)
             logger.error(f"⚠ Произошла ошибка: {e}")
             await event.respond(f"⚠ Произошла ошибка: {e}\nПопробуйте снова, нажав 'Добавить аккаунт'.")
 
@@ -86,14 +76,14 @@ async def get_code(event: callback_message) -> None:
         else:
             await event.respond("❌ Такой аккаунт уже есть")
         del code_waiting[user_id]
-        await _drop_client(user_id)
+        del user_clients[user_id]
     except SessionPasswordNeededError:
         password_waiting[user_id] = {"waiting": True, "last_message_id": event.message.id}
         await event.respond("⚠ Этот аккаунт защищен паролем. Отправьте пароль:")
     except PhoneCodeExpiredError as e:
         logger.error(f"Код истек: {e}")
         del code_waiting[user_id]
-        await _drop_client(user_id)
+        user_clients.pop(user_id, None)
         await event.respond(f"⏰ Код подтверждения истек!\n\n"
                           f"Коды Telegram действуют только 5-10 минут.\n"
                           f"Нажмите 'Добавить аккаунт' чтобы получить новый код.")
@@ -104,7 +94,7 @@ async def get_code(event: callback_message) -> None:
                           f"Если проблема повторяется, нажмите 'Добавить аккаунт' для нового кода.")
     except Exception as e:
         del code_waiting[user_id]
-        await _drop_client(user_id)
+        user_clients.pop(user_id, None)
         logger.error(f"Ошибка: {e}, Неверный код")
         await event.respond(f"❌ Неверный код или ошибка: {e}\nПопробуйте снова, нажав 'Добавить аккаунт'.")
     finally:
@@ -112,7 +102,9 @@ async def get_code(event: callback_message) -> None:
 
 
 @bot.on(New_Message(func=lambda
-        e: e.sender_id in password_waiting and e.sender_id not in user_states and e.sender_id not in broadcast_all_state))
+        e: e.sender_id in password_waiting and
+        not (e.raw_text or "").lstrip().startswith("/") and
+        e.sender_id not in user_states and e.sender_id not in broadcast_all_state))
 async def get_password(event: callback_message) -> None:
     user_id = event.sender_id
     if password_waiting[user_id]["waiting"] and event.message.id > password_waiting[user_id]["last_message_id"]:
@@ -127,7 +119,7 @@ async def get_password(event: callback_message) -> None:
             conn.commit()
 
             del password_waiting[user_id]
-            await _drop_client(user_id)
+            del user_clients[user_id]
             await event.respond("✅ Авторизация с паролем прошла успешно!")
         except Exception as e:
             await event.respond(f"⚠ Ошибка при вводе пароля: {e}\nПопробуйте снова, нажав 'Добавить аккаунт'.")

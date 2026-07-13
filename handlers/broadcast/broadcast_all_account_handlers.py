@@ -41,7 +41,7 @@ async def diff_interval_start(event: callback_query) -> None:
 
 
 # ---------- мастер-диалог (текст → интервалы) ----------
-@bot.on(New_Message(func=lambda e: e.sender_id in broadcast_all_state_account))
+@bot.on(New_Message(func=lambda e: e.sender_id in broadcast_all_state_account and not (e.raw_text or "").lstrip().startswith("/")))
 async def broadcast_all_dialog(event: callback_message) -> None:
     st = broadcast_all_state_account[event.sender_id]
     log_message_event(event, "обработка диалога рассылки по аккаунтам")
@@ -218,6 +218,7 @@ async def stop_broadcast_all(event: callback_query) -> None:
                 
                 async with TelegramClient(StringSession(session_string), API_ID, API_HASH) as client:
                     try:
+                        await client.connect()
                         account = await client.get_me()
                         username = getattr(account, 'username', 'без username')
                         account_name = account.first_name if hasattr(account, 'first_name') and account.first_name else username
@@ -486,7 +487,9 @@ async def schedule_all_accounts_broadcast(text: str,
                                (text, user_id))
 
                 async with TelegramClient(StringSession(session_string), API_ID, API_HASH) as client:
-                    groups = cursor.execute("""SELECT group_username, group_id FROM groups
+                    await client.connect()
+
+                    groups = cursor.execute("""SELECT group_username, group_id FROM groups 
                                             WHERE user_id = ?""", (user_id,)).fetchall()
 
                     ok_entities: list[Channel | Chat] = []

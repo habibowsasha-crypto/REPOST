@@ -5,7 +5,8 @@ python-decouple==3.8
 rsa==4.9
 Telethon==1.39.0
 tzdata==2025.2
-tzlocal==5.2
-cryptg==0.5.0.post0
-pillow==11.1.0
-loguru==0.7.3
+tzlocal
+cryptg
+pillow
+loguru
+openai>=2.0.0

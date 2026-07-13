@@ -1,0 +1,84 @@
+TgBlaster DM AI Dialog Patch v1
+================================
+
+Base archive:
+- TgBlaster-dm.zip
+- SHA-256: e90099c5bcf8620bc1d28b578042a624520b3ac63b10a81d7cdd9989a1cfe016
+
+What was changed:
+1. Added random first DM messages:
+   - services/first_message.py
+   - DM_FIRST_MESSAGE_RANDOM / FIRST_DM_MODE=random
+   - FIRST_DM_CATEGORY=soft|trading|vip|all
+   - FIRST_DM_VIP_WEIGHT_PERCENT
+   - FIRST_DM_TEMPLATES and FIRST_DM_TEMPLATES_FILE
+   - first_dm_templates.example.txt
+
+2. Added AI follow-up dialog layer:
+   - services/ai_dialog_service.py
+   - handlers/ai_dialog/ai_admin_handlers.py
+   - AI replies only to incoming private messages after a first DM was sent and an active dialog exists.
+   - AI_DM_ENABLED is false by default.
+   - AI_DM_DRY_RUN available.
+   - Stop words, human-takeover words, max replies per user, reply delay.
+
+3. Added AI database tables:
+   - ai_dialogs
+   - ai_messages
+
+4. Added admin commands:
+   - /ai_status
+   - /ai_dialogs
+   - /ai_stop USER_ID
+   - /ai_resume USER_ID
+   - /ai_export
+   - /first_dm_templates
+
+5. Added Railway-ready basics:
+   - DB_PATH env support in config.py
+   - railway.json
+   - Procfile
+
+6. Added OpenAI dependency:
+   - openai>=2.0.0
+
+Important behavior:
+- The old /dm_post module remains the entry point.
+- Random first DM changes only the message text, not the recipient selection logic.
+- AI does not start a dialog by itself. It answers only after the user replies in private, unless AI_REPLY_ONLY_KNOWN_DIALOGS is explicitly disabled.
+- If OPENAI_API_KEY is missing, AI logs the error and can use fallback reply if AI_FALLBACK_REPLY_ENABLED=true.
+
+Suggested Railway variables:
+DB_PATH=/data/sessions.db
+DM_FIRST_MESSAGE_RANDOM=true
+FIRST_DM_MODE=random
+FIRST_DM_CATEGORY=all
+FIRST_DM_VIP_WEIGHT_PERCENT=30
+AI_DM_ENABLED=true
+AI_DM_DRY_RUN=true
+OPENAI_API_KEY=...
+AI_MODEL=gpt-4o-mini
+AI_MAX_MESSAGES_PER_USER=8
+AI_REPLY_DELAY_MIN_SECONDS=15
+AI_REPLY_DELAY_MAX_SECONDS=60
+VIP_PROJECT_NAME=PomoGalor VIP
+VIP_CHANNEL_LINK=https://t.me/your_vip_channel
+VIP_DESCRIPTION=закрытый канал с торговыми идеями, разбором рынка и сопровождением
+
+Verification performed:
+- Python compileall: OK
+
+
+## v1.0.1 audit hardening
+
+Fixed/cleaned after full local audit:
+- Removed no files from the release because no cache/db/session artifacts were present.
+- Added `BOT_SESSION_PATH` and `MEDIA_DIR` support for Railway `/data` persistence.
+- SQLite now uses `check_same_thread=False`, `busy_timeout`, and best-effort WAL.
+- Added incoming-private-message de-duplication table `ai_processed_messages`.
+- Added per-user async lock to avoid parallel duplicate AI replies.
+- Added `AI_DAILY_DIALOG_LIMIT` support. `0` means unlimited.
+- OpenAI Responses API call now uses `instructions=` for the system prompt.
+- Added safe integer parsing for AI limits/delays.
+- AI send failures now close the dialog as `send_error` instead of crashing the monitor.
+- `/ai_status` now displays the optional daily dialog limit.

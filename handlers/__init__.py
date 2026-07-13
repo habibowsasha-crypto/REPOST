@@ -13,3 +13,6 @@ from .account import *
 from .group import *
 from .broadcast import *
 from .admin import *
+from .dm import *
+
+from .ai_dialog import *

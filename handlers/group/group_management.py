@@ -213,16 +213,16 @@ async def add_all_groups_to_account(event: callback_query) -> None:
         # Определяем username или ID для сохранения
         if isinstance(ent, Channel) and ent.username:
             group_username = f"@{ent.username}"
-            cursor.execute(f"""INSERT OR IGNORE INTO groups
-                            (group_id, group_username, user_id)
+            cursor.execute(f"""INSERT INTO groups 
+                            (group_id, group_username, user_id) 
                             VALUES (?, ?, ?)""", (ent.id, group_username, user_id))
             msg.append(f"№{num} **{group.name}** - {group_username}")
         else:
             # Для групп без username используем ID
             # Сохраняем ID как строку для приватных групп
             group_id_str = str(ent.id)
-            cursor.execute(f"""INSERT OR IGNORE INTO groups
-                            (group_id, group_username, user_id)
+            cursor.execute(f"""INSERT INTO groups 
+                            (group_id, group_username, user_id) 
                             VALUES (?, ?, ?)""", (ent.id, group_id_str, user_id))
             msg.append(f"№{num} **{group.name}** (приватна група, ID: {group_id_str})")
             

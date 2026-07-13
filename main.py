@@ -4,10 +4,14 @@ import sys
 from handlers import *
 from config import (BOT_TOKEN, conn, bot, API_ID, API_HASH, user_clients, scheduler, cleanup_processed_callbacks)
 from utils.database import create_table, delete_table
+from utils.database.database import create_dm_tables
+from services.ai_dialog_service import create_ai_tables
+from handlers.dm.dm_handlers import restore_dm_tasks
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 # Настройка loguru для красивого отображения логов
+os.makedirs("logs", exist_ok=True)
 logger.remove()  # Удаляем стандартный обработчик
 
 # Добавляем красивый форматированный лог
@@ -75,23 +79,27 @@ async def setup_scheduler():
     logger.info("📅 Планировщик запущен с задачей очистки callback'ов")
 
 
-async def main() -> None:
-    """Единая точка входа: старт бота, загрузка сессий, планировщик, основной цикл."""
-    await bot.start(bot_token=BOT_TOKEN)
-    await load_sessions()
-    await setup_scheduler()
-    logger.info("🚀 Бот запущен...")
-    await bot.run_until_disconnected()
-
-
 if __name__ == "__main__":
     logger.info("🤖 Инициализация бота...")
     create_table()
+    create_dm_tables()
+    create_ai_tables()
     delete_table()
     logger.info("📱 Запуск бота...")
-    try:
-        bot.loop.run_until_complete(main())
-    finally:
-        # Гасим активные рассылки и закрываем соединение при любом завершении
-        delete_table()
-        conn.close()
+    bot.start(bot_token=BOT_TOKEN)
+    
+    # Загружаем сессии при запуске бота
+    bot.loop.run_until_complete(load_sessions())
+    
+    # Запускаем планировщик после старта бота
+    bot.loop.run_until_complete(setup_scheduler())
+    
+    # Восстанавливаем активные DM-задачи
+    bot.loop.run_until_complete(restore_dm_tasks())
+    
+    # Используем только один способ вывода сообщения о запуске
+    logger.info("🚀 Бот запущен...")
+    
+    bot.run_until_disconnected()
+    delete_table()
+    conn.close()

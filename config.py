@@ -1,3 +1,4 @@
+import os
 import sqlite3
 from typing import Dict, Tuple, List, Optional
 
@@ -10,14 +11,34 @@ from telethon import TelegramClient
 API_ID: int = int(config("API_ID"))
 API_HASH: str = config("API_HASH")
 BOT_TOKEN: str = config("BOT_TOKEN")
-ADMIN_ID_LIST: List[int] = list(map(int, map(str.strip, config("ADMIN_ID_LIST").split(","))))  # <-- Вставить ID разрешенных телеграмм аккаунтов через запятую
-bot: TelegramClient = TelegramClient("bot", API_ID, API_HASH)
-conn: sqlite3.Connection = sqlite3.connect("sessions.db", timeout=30.0, check_same_thread=False)
-# WAL + busy_timeout: устойчивость к конкурентному доступу из множества корутин и задач планировщика
-# (иначе при одновременных записях ловим "database is locked")
-conn.execute("PRAGMA journal_mode=WAL")
-conn.execute("PRAGMA synchronous=NORMAL")
-conn.execute("PRAGMA busy_timeout=30000")
+ADMIN_ID_LIST: List[int] = [
+    int(x.strip()) for x in config("ADMIN_ID_LIST").split(",") if x.strip()
+]  # <-- ID разрешенных Telegram-аккаунтов через запятую
+
+# Railway/Volume-ready paths
+DB_PATH: str = config("DB_PATH", default="sessions.db")
+_db_dir = os.path.dirname(DB_PATH)
+if _db_dir:
+    os.makedirs(_db_dir, exist_ok=True)
+
+BOT_SESSION_PATH: str = config(
+    "BOT_SESSION_PATH",
+    default=(os.path.join(_db_dir, "bot") if _db_dir else "bot"),
+)
+MEDIA_DIR: str = config(
+    "MEDIA_DIR",
+    default=(os.path.join(_db_dir, "media") if _db_dir else "media"),
+)
+os.makedirs(MEDIA_DIR, exist_ok=True)
+
+bot: TelegramClient = TelegramClient(BOT_SESSION_PATH, API_ID, API_HASH)
+conn: sqlite3.Connection = sqlite3.connect(DB_PATH, timeout=30.0, check_same_thread=False)
+conn.execute("PRAGMA busy_timeout = 30000")
+try:
+    conn.execute("PRAGMA journal_mode = WAL")
+except Exception:
+    # WAL может быть недоступен на некоторых FS; это не критично.
+    pass
 
 # Аннотирование
 New_Message = telethon.events.NewMessage
