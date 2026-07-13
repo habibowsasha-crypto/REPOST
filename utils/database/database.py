@@ -20,36 +20,6 @@ def create_table() -> None:
             session_string TEXT)""")
 
     start_cursor.execute("""
-        CREATE TABLE IF NOT EXISTS discovered_groups (
-            user_id INTEGER NOT NULL,
-            group_id INTEGER NOT NULL,
-            title TEXT NOT NULL,
-            username TEXT,
-            access_hash INTEGER,
-            peer_type TEXT NOT NULL,
-            is_admin INTEGER DEFAULT 0,
-            is_creator INTEGER DEFAULT 0,
-            is_available INTEGER DEFAULT 1,
-            last_seen_at TEXT,
-            PRIMARY KEY (user_id, group_id))""")
-
-    # Удаляем возможные старые дубли перед созданием уникального индекса.
-    start_cursor.execute("""
-        DELETE FROM groups
-        WHERE rowid NOT IN (
-            SELECT MIN(rowid) FROM groups GROUP BY user_id, group_id
-        )
-    """)
-    start_cursor.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_groups_user_group
-        ON groups(user_id, group_id)
-    """)
-    start_cursor.execute("""
-        CREATE INDEX IF NOT EXISTS idx_discovered_groups_user_available
-        ON discovered_groups(user_id, is_available)
-    """)
-
-    start_cursor.execute("""
         CREATE TABLE IF NOT EXISTS broadcasts ( 
             user_id INTEGER, 
             group_id INTEGER, 

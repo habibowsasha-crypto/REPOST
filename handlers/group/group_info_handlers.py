@@ -1,4 +1,3 @@
-from services.menu_ui import render_menu
 from loguru import logger
 import sqlite3
 import os
@@ -19,7 +18,7 @@ async def handle_groups_list(event: callback_query) -> None:
     cursor = conn.cursor()
     row = cursor.execute("SELECT session_string FROM sessions WHERE user_id = ?", (user_id,)).fetchone()
     if not row:
-        await render_menu(event, "⚠ Не удалось найти аккаунт.")
+        await event.respond("⚠ Не удалось найти аккаунт.")
         return
 
     session_string = row[0]
@@ -79,10 +78,10 @@ async def handle_groups_list(event: callback_query) -> None:
         
         cursor.close()
         if not buttons:
-            await render_menu(event, "У аккаунта нет групп.")
+            await event.respond("У аккаунта нет групп.")
             return
 
-        await render_menu(event, "📋 Список групп, в которых вы состоите:", buttons=buttons)
+        await event.respond("📋 Список групп, в которых вы состоите:", buttons=buttons)
     finally:
         await client.disconnect()
 
@@ -97,7 +96,7 @@ async def group_info(event: callback_query) -> None:
     # Проверяем наличие сессии
     session_row = cursor.execute("SELECT session_string FROM sessions WHERE user_id = ?", (user_id,)).fetchone()
     if not session_row:
-        await render_menu(event, "⚠ Ошибка: не найдена сессия для этого аккаунта.")
+        await event.respond("⚠ Ошибка: не найдена сессия для этого аккаунта.")
         cursor.close()
         return
         
@@ -109,7 +108,7 @@ async def group_info(event: callback_query) -> None:
     group_row = cursor.execute("SELECT group_username FROM groups WHERE user_id = ? AND group_id = ?", 
                              (user_id, group_id)).fetchone()
     if not group_row:
-        await render_menu(event, "⚠ Ошибка: не найдена группа.")
+        await event.respond("⚠ Ошибка: не найдена группа.")
         cursor.close()
         return
         
@@ -128,24 +127,24 @@ async def group_info(event: callback_query) -> None:
                         group_id_int = int(group_row[0])
                         ent = await get_entity_by_id(client, group_id_int)
                         if not ent:
-                            await render_menu(event, f"⚠ Ошибка: не удалось получить информацию о группе {group_username}.")
+                            await event.respond(f"⚠ Ошибка: не удалось получить информацию о группе {group_username}.")
                             await client.disconnect()
                             cursor.close()
                             return
                     except ValueError:
                         # Если username не является числом, сообщаем об ошибке
-                        await render_menu(event, f"⚠ Ошибка: не удалось получить информацию о группе {group_username}.")
+                        await event.respond(f"⚠ Ошибка: не удалось получить информацию о группе {group_username}.")
                         await client.disconnect()
                         cursor.close()
                         return
                 except Exception as alt_error:
                     logger.error(f"Ошибка при альтернативном получении Entity: {alt_error}")
-                    await render_menu(event, f"⚠ Ошибка: не удалось получить информацию о группе {group_username}.")
+                    await event.respond(f"⚠ Ошибка: не удалось получить информацию о группе {group_username}.")
                     await client.disconnect()
                     cursor.close()
                     return
             else:
-                await render_menu(event, f"⚠ Ошибка: не удалось получить информацию о группе {group_username}.")
+                await event.respond(f"⚠ Ошибка: не удалось получить информацию о группе {group_username}.")
                 await client.disconnect()
                 cursor.close()
                 return
@@ -218,11 +217,11 @@ async def group_info(event: callback_query) -> None:
             [Button.inline(f"◀️ Назад к списку групп", f"groups_{user_id}".encode())]
         ]
         
-        await render_menu(event, info_text, buttons=buttons)
+        await event.respond(info_text, buttons=buttons)
         
     except Exception as e:
         logger.error(f"Ошибка при получении информации о группе: {e}")
-        await render_menu(event, f"⚠ Ошибка при получении информации о группе: {str(e)}")
+        await event.respond(f"⚠ Ошибка при получении информации о группе: {str(e)}")
     finally:
         await client.disconnect()
         cursor.close()

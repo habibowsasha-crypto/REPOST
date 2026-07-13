@@ -1,5 +1,3 @@
-from services.admin_state import is_command_event
-from services.menu_ui import render_menu
 import asyncio
 import datetime
 from loguru import logger
@@ -161,11 +159,11 @@ async def same_interval_start(event: callback_query) -> None:
     data = event.data.decode()
     user_id, group_id = map(int, data.split("_")[1:])
     broadcast_solo_state[admin_id] = {"user_id": user_id, "mode": "same", "step": "text", "group_id": group_id}
-    await render_menu(event, "📝 Пришлите текст рассылки для **одной** группы этого аккаунта:")
+    await event.respond("📝 Пришлите текст рассылки для **одной** группы этого аккаунта:")
 
 
 # ---------- мастер-диалог (текст → интервалы) ----------
-@bot.on(New_Message(func=lambda e: e.sender_id in broadcast_solo_state and not is_command_event(e)))
+@bot.on(New_Message(func=lambda e: e.sender_id in broadcast_solo_state and not (e.raw_text or "").lstrip().startswith("/")))
 async def broadcast_all_dialog(event: callback_message) -> None:
     st = broadcast_solo_state[event.sender_id]
     log_message_event(event, "обработка диалога индивидуальной рассылки")
@@ -265,13 +263,13 @@ async def photo_yes_handler(event: callback_query) -> None:
     user_id = event.sender_id
     
     if user_id not in broadcast_solo_state:
-        await render_menu(event, "⚠ Сессия истекла. Пожалуйста, начните заново с команды /start")
+        await event.respond("⚠ Сессия истекла. Пожалуйста, начните заново с команды /start")
         return
         
     st = broadcast_solo_state[user_id]
     st["step"] = "photo"
     
-    await render_menu(event, "📤 Пожалуйста, отправьте фото, которое хотите прикрепить к сообщению:")
+    await event.respond("📤 Пожалуйста, отправьте фото, которое хотите прикрепить к сообщению:")
 
 
 @bot.on(Query(data=lambda d: d.decode() == "photo_only"))
@@ -279,14 +277,14 @@ async def photo_only_handler(event: callback_query) -> None:
     user_id = event.sender_id
     
     if user_id not in broadcast_solo_state:
-        await render_menu(event, "⚠ Сессия истекла. Пожалуйста, начните заново с команды /start")
+        await event.respond("⚠ Сессия истекла. Пожалуйста, начните заново с команды /start")
         return
         
     st = broadcast_solo_state[user_id]
     st["step"] = "photo_only"
     st["text"] = ""  # Пустой текст для отправки только фото
     
-    await render_menu(event, "📤 Пожалуйста, отправьте фото, которое хотите отправить без текста:")
+    await event.respond("📤 Пожалуйста, отправьте фото, которое хотите отправить без текста:")
 
 
 @bot.on(Query(data=lambda d: d.decode() == "photo_no"))
@@ -294,7 +292,7 @@ async def photo_no_handler(event: callback_query) -> None:
     user_id = event.sender_id
     
     if user_id not in broadcast_solo_state:
-        await render_menu(event, "⚠ Сессия истекла. Пожалуйста, начните заново с команды /start")
+        await event.respond("⚠ Сессия истекла. Пожалуйста, начните заново с команды /start")
         return
         
     st = broadcast_solo_state[user_id]
@@ -313,7 +311,7 @@ async def photo_no_handler(event: callback_query) -> None:
     cursor = conn.cursor()
     row = cursor.execute("SELECT session_string FROM sessions WHERE user_id = ?", (st["user_id"],)).fetchone()
     if not row:
-        await render_menu(event, "⚠ Не удалось найти сессию для этого аккаунта.")
+        await event.respond("⚠ Не удалось найти сессию для этого аккаунта.")
         broadcast_solo_state.pop(user_id, None)
         cursor.close()
         return
@@ -338,7 +336,7 @@ async def photo_no_handler(event: callback_query) -> None:
     if not scheduler.running:
         scheduler.start()
     
-    await render_menu(event, f"✅ Запустил: каждые {st['interval']} мин.")
+    await event.respond(f"✅ Запустил: каждые {st['interval']} мин.")
     broadcast_solo_state.pop(user_id, None)
 
 
@@ -348,21 +346,21 @@ async def start_resume_broadcast(event: callback_query) -> None:
     parts = data.split("_")
 
     if len(parts) < 3:
-        await render_menu(event, "⚠ Произошла ошибка при обработке данных. Попробуйте еще раз.")
+        await event.respond("⚠ Произошла ошибка при обработке данных. Попробуйте еще раз.")
         return
 
     try:
         user_id = int(parts[1])
         group_id = int(parts[2])
     except ValueError as e:
-        await render_menu(event, f"⚠ Ошибка при извлечении данных: {e}")
+        await event.respond(f"⚠ Ошибка при извлечении данных: {e}")
         return
     cursor = conn.cursor()
     job_id = f"broadcast_{user_id}_{gid_key(group_id)}"
     existing_job = scheduler.get_job(job_id)
 
     if existing_job:
-        await render_menu(event, "⚠ Рассылка уже активна для этой группы.")
+        await event.respond("⚠ Рассылка уже активна для этой группы.")
         cursor.close()
         return
 
@@ -376,7 +374,7 @@ async def start_resume_broadcast(event: callback_query) -> None:
 
     if not row:
         # Если данных нет, предлагаем настроить рассылку
-        await render_menu(event, "⚠ Рассылка еще не настроена для этой группы. Пожалуйста, настройте текст и интервал рассылки.")
+        await event.respond("⚠ Рассылка еще не настроена для этой группы. Пожалуйста, настройте текст и интервал рассылки.")
         cursor.close()
         return
     
@@ -385,7 +383,7 @@ async def start_resume_broadcast(event: callback_query) -> None:
     photo_url = row[2] if len(row) > 2 else None
     
     if not broadcast_text or not interval_minutes or interval_minutes <= 0:
-        await render_menu(event, "⚠ Пожалуйста, убедитесь, что текст рассылки и корректный интервал установлены.")
+        await event.respond("⚠ Пожалуйста, убедитесь, что текст рассылки и корректный интервал установлены.")
         cursor.close()
         return
     
@@ -393,7 +391,7 @@ async def start_resume_broadcast(event: callback_query) -> None:
     session_string_row = cursor.execute("SELECT session_string FROM sessions WHERE user_id = ?",
                                         (user_id,)).fetchone()
     if not session_string_row:
-        await render_menu(event, "⚠ Ошибка: не найден session_string для аккаунта.")
+        await event.respond("⚠ Ошибка: не найден session_string для аккаунта.")
         cursor.close()
         return
     
@@ -403,7 +401,7 @@ async def start_resume_broadcast(event: callback_query) -> None:
     group_row = cursor.execute("SELECT group_username FROM groups WHERE user_id = ? AND group_id = ?", 
                               (user_id, group_id)).fetchone()
     if not group_row:
-        await render_menu(event, f"⚠ Группа не найдена в базе данных для user_id={user_id}, group_id={group_id}.")
+        await event.respond(f"⚠ Группа не найдена в базе данных для user_id={user_id}, group_id={group_id}.")
         cursor.close()
         return
 
@@ -441,7 +439,7 @@ async def start_resume_broadcast(event: callback_query) -> None:
     if not scheduler.running:
         scheduler.start()
     
-    await render_menu(event, f"✅ Рассылка успешно запущена! Первое сообщение будет отправлено через 10 секунд, затем каждые {interval_minutes} минут.")
+    await event.respond(f"✅ Рассылка успешно запущена! Первое сообщение будет отправлено через 10 секунд, затем каждые {interval_minutes} минут.")
     cursor.close()
 
 
@@ -451,14 +449,14 @@ async def stop_broadcast(event: callback_query) -> None:
     try:
         user_id, group_id = map(int, data.split("_")[1:])
     except ValueError as e:
-        await render_menu(event, f"⚠ Ошибка при извлечении user_id и group_id: {e}")
+        await event.respond(f"⚠ Ошибка при извлечении user_id и group_id: {e}")
         return
     cursor = conn.cursor()
     
     # Проверяем наличие сессии
     session_row = cursor.execute("SELECT session_string FROM sessions WHERE user_id = ?", (user_id,)).fetchone()
     if not session_row:
-        await render_menu(event, "⚠ Ошибка: не найдена сессия для этого аккаунта.")
+        await event.respond("⚠ Ошибка: не найдена сессия для этого аккаунта.")
         cursor.close()
         return
         
@@ -470,7 +468,7 @@ async def stop_broadcast(event: callback_query) -> None:
     group_row = cursor.execute("SELECT group_username FROM groups WHERE user_id = ? AND group_id = ?", 
                              (user_id, group_id)).fetchone()
     if not group_row:
-        await render_menu(event, "⚠ Ошибка: не найдена группа.")
+        await event.respond("⚠ Ошибка: не найдена группа.")
         cursor.close()
         return
         
@@ -491,7 +489,7 @@ async def stop_broadcast(event: callback_query) -> None:
                     group_id_int = int(group_username)
                     group = await get_entity_by_id(client, group_id_int)
                     if not group:
-                        await render_menu(event, f"⚠ Ошибка: не удалось получить информацию о группе {group_username}.")
+                        await event.respond(f"⚠ Ошибка: не удалось получить информацию о группе {group_username}.")
                         await client.disconnect()
                         cursor.close()
                         return
@@ -518,7 +516,7 @@ async def stop_broadcast(event: callback_query) -> None:
                                 cursor.execute("UPDATE broadcasts SET is_active = ?, error_reason = ? WHERE user_id = ? AND group_id = ?",
                                                (False, "Администратор остановил рассылку", user_id, gid_key(group_id)))
                                 conn.commit()
-                                await render_menu(event, f"⛔ Рассылка в группу с ID {group_id} остановлена.")
+                                await event.respond(f"⛔ Рассылка в группу с ID {group_id} остановлена.")
                                 await client.disconnect()
                                 cursor.close()
                                 return
@@ -532,7 +530,7 @@ async def stop_broadcast(event: callback_query) -> None:
                     logger.error(f"[DEBUG] Ошибка при альтернативном получении Entity: {alt_error}")
                     return
             else:
-                await render_menu(event, f"⚠ Ошибка при получении информации о группе: {str(entity_error)}")
+                await event.respond(f"⚠ Ошибка при получении информации о группе: {str(entity_error)}")
                 await client.disconnect()
                 cursor.close()
                 return
@@ -546,9 +544,9 @@ async def stop_broadcast(event: callback_query) -> None:
             cursor.execute("UPDATE broadcasts SET is_active = ?, error_reason = ? WHERE user_id = ? AND group_id = ?",
                            (False, "Администратор остановил рассылку", user_id, gid_key(group_id)))
             conn.commit()
-            await render_menu(event, f"⛔ Рассылка в группу **{getattr(group, 'title', group_username)}** остановлена.")
+            await event.respond(f"⛔ Рассылка в группу **{getattr(group, 'title', group_username)}** остановлена.")
         else:
-            await render_menu(event, f"⚠ Рассылка в группу **{getattr(group, 'title', group_username)}** не была запущена.")
+            await event.respond(f"⚠ Рассылка в группу **{getattr(group, 'title', group_username)}** не была запущена.")
     except Exception as e:
         logger.error(f"Ошибка при остановке рассылки: {e}")
         
@@ -562,11 +560,11 @@ async def stop_broadcast(event: callback_query) -> None:
                 cursor.execute("UPDATE broadcasts SET is_active = ?, error_reason = ? WHERE user_id = ? AND group_id = ?",
                                (False, "Администратор остановил рассылку", user_id, gid_key(group_id)))
                 conn.commit()
-                await render_menu(event, f"⛔ Рассылка в группу с ID {group_id} остановлена (с ошибкой: {str(e)}).")
+                await event.respond(f"⛔ Рассылка в группу с ID {group_id} остановлена (с ошибкой: {str(e)}).")
             else:
-                await render_menu(event, f"⚠ Рассылка в группу с ID {group_id} не была запущена.")
+                await event.respond(f"⚠ Рассылка в группу с ID {group_id} не была запущена.")
         except Exception as stop_error:
-            await render_menu(event, f"⚠ Критическая ошибка при остановке рассылки: {str(stop_error)}")
+            await event.respond(f"⚠ Критическая ошибка при остановке рассылки: {str(stop_error)}")
     finally:
         await client.disconnect()
         cursor.close()

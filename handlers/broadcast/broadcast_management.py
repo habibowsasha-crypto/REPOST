@@ -1,5 +1,3 @@
-from services.admin_state import is_command_event
-from services.menu_ui import render_menu
 import asyncio
 import datetime
 from loguru import logger
@@ -29,7 +27,7 @@ async def broadcast_all_menu(event: callback_query) -> None:
         [Button.inline("⏲️ Интервал во все группы", f"sameIntervalAll_{target_user_id}")],
         [Button.inline("🎲 Разный интервал (25-35)", f"diffIntervalAll_{target_user_id}")]
     ]
-    await render_menu(event, "Выберите режим отправки:", buttons=keyboard)
+    await event.respond("Выберите режим отправки:", buttons=keyboard)
 
 
 # ---------- одинаковый интервал ----------
@@ -38,7 +36,7 @@ async def same_interval_start(event: callback_query) -> None:
     admin_id = event.sender_id
     uid = int(event.data.decode().split("_")[1])
     broadcast_all_state[admin_id] = {"user_id": uid, "mode": "same", "step": "text"}
-    await render_menu(event, "📝 Пришлите текст рассылки для **всех** групп этого аккаунта:")
+    await event.respond("📝 Пришлите текст рассылки для **всех** групп этого аккаунта:")
 
 
 # ---------- случайный интервал ----------
@@ -47,11 +45,11 @@ async def diff_interval_start(event: callback_query) -> None:
     admin_id = event.sender_id
     uid = int(event.data.decode().split("_")[1])
     broadcast_all_state[admin_id] = {"user_id": uid, "mode": "diff", "step": "text"}
-    await render_menu(event, "📝 Пришлите текст рассылки, потом спрошу границы интервала:")
+    await event.respond("📝 Пришлите текст рассылки, потом спрошу границы интервала:")
 
 
 # ---------- мастер-диалог (текст → интервалы) ----------
-@bot.on(New_Message(func=lambda e: e.sender_id in broadcast_all_state and not is_command_event(e)))
+@bot.on(New_Message(func=lambda e: e.sender_id in broadcast_all_state and not (e.raw_text or "").lstrip().startswith("/")))
 async def broadcast_all_dialog(event: callback_message) -> None:
     st = broadcast_all_state[event.sender_id]
     log_message_event(event, "обработка диалога рассылки")
@@ -164,13 +162,13 @@ async def photo_yes_all_handler(event: callback_query) -> None:
     user_id = event.sender_id
     
     if user_id not in broadcast_all_state:
-        await render_menu(event, "⚠ Сессия истекла. Пожалуйста, начните заново с команды /start")
+        await event.respond("⚠ Сессия истекла. Пожалуйста, начните заново с команды /start")
         return
         
     st = broadcast_all_state[user_id]
     st["step"] = "photo"
     
-    await render_menu(event, "📤 Пожалуйста, отправьте фото, которое хотите прикрепить к сообщению:")
+    await event.respond("📤 Пожалуйста, отправьте фото, которое хотите прикрепить к сообщению:")
 
 
 @bot.on(Query(data=lambda d: d.decode() == "photo_only_all"))
@@ -178,14 +176,14 @@ async def photo_only_all_handler(event: callback_query) -> None:
     user_id = event.sender_id
     
     if user_id not in broadcast_all_state:
-        await render_menu(event, "⚠ Сессия истекла. Пожалуйста, начните заново с команды /start")
+        await event.respond("⚠ Сессия истекла. Пожалуйста, начните заново с команды /start")
         return
         
     st = broadcast_all_state[user_id]
     st["step"] = "photo_only"
     st["text"] = ""  # Пустой текст для отправки только фото
     
-    await render_menu(event, "📤 Пожалуйста, отправьте фото, которое хотите отправить без текста:")
+    await event.respond("📤 Пожалуйста, отправьте фото, которое хотите отправить без текста:")
 
 
 @bot.on(Query(data=lambda d: d.decode() == "photo_no_all"))
@@ -193,7 +191,7 @@ async def photo_no_all_handler(event: callback_query) -> None:
     user_id = event.sender_id
     
     if user_id not in broadcast_all_state:
-        await render_menu(event, "⚠ Сессия истекла. Пожалуйста, начните заново с команды /start")
+        await event.respond("⚠ Сессия истекла. Пожалуйста, начните заново с команды /start")
         return
         
     st = broadcast_all_state[user_id]
@@ -201,10 +199,10 @@ async def photo_no_all_handler(event: callback_query) -> None:
     # Запускаем рассылку без фото
     if st["mode"] == "same":
         await schedule_account_broadcast(int(st["user_id"]), st["text"], st["min_time"], None)
-        await render_menu(event, f"✅ Запустил: каждые {st['min_time']} мин.")
+        await event.respond(f"✅ Запустил: каждые {st['min_time']} мин.")
     else:
         await schedule_account_broadcast(int(st["user_id"]), st["text"], st["min"], st["max_m"])
-        await render_menu(event, f"✅ Запустил: случайно каждые {st['min']}-{st['max_m']} мин.")
+        await event.respond(f"✅ Запустил: случайно каждые {st['min']}-{st['max_m']} мин.")
     
     broadcast_all_state.pop(user_id, None)
 
@@ -215,7 +213,7 @@ async def stop_broadcast_all(event: callback_query) -> None:
     try:
         user_id = int(data.split("_")[1])
     except ValueError as e:
-        await render_menu(event, f"⚠ Ошибка при извлечении user_id и group_id: {e}")
+        await event.respond(f"⚠ Ошибка при извлечении user_id и group_id: {e}")
         return
     
     cursor = conn.cursor()
@@ -235,7 +233,7 @@ async def stop_broadcast_all(event: callback_query) -> None:
     # Получаем клиента для получения названий групп
     session_string = cursor.execute("SELECT session_string FROM sessions WHERE user_id = ?", (user_id,)).fetchone()
     if not session_string:
-        await render_menu(event, "⚠ Не знайдено сесію для цього акаунта")
+        await event.respond("⚠ Не знайдено сесію для цього акаунта")
         cursor.close()
         return
     
@@ -457,7 +455,7 @@ async def stop_broadcast_all(event: callback_query) -> None:
     if not has_stopped:
         msg.append("Нет активных рассылок для остановки.")
     
-    await render_menu(event, "\n".join(msg))
+    await event.respond("\n".join(msg))
     cursor.close()
 
 

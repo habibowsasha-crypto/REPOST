@@ -1,4 +1,3 @@
-from services.menu_ui import render_menu
 from loguru import logger
 
 from telethon import Button, TelegramClient
@@ -36,21 +35,20 @@ async def my_accounts(event: callback_query) -> None:
         cursor.close()
 
         if not accounts_found:
-            await render_menu(event, "❌ У вас нет добавленных аккаунтов")
+            await event.respond("❌ У вас нет добавленных аккаунтов")
             return
 
-        buttons.append([Button.inline("🏠 Главное меню", b"menu_home")])
-        await render_menu(event, "📱 **Список ваших аккаунтов:**", buttons=buttons)
+        await event.respond("📱 **Список ваших аккаунтов:**", buttons=buttons)
 
     except Exception as e:
         logger.error(f"Error in my_accounts: {e}")
-        await render_menu(event, "⚠ Произошла ошибка при получении списка аккаунтов")
+        await event.respond("⚠ Произошла ошибка при получении списка аккаунтов")
 
 
 @bot.on(Query(data=lambda data: data.decode().startswith("account_info_")))
 async def handle_account_button(event: callback_query) -> None:
     # Получаем уникальный идентификатор для этого callback
-    callback_id = f"{event.sender_id}:{getattr(event.query, 'query_id', event.query.msg_id)}"
+    callback_id = f"{event.sender_id}:{event.query.msg_id}"
     
     # Проверяем, был ли уже обработан этот callback
     if callback_id in processed_callbacks:
@@ -66,7 +64,7 @@ async def handle_account_button(event: callback_query) -> None:
         "SELECT session_string FROM sessions WHERE user_id = ?", (user_id,)
     ).fetchone()
     if not row:
-        await render_menu(event, "⚠ Не удалось найти аккаунт.")
+        await event.respond("⚠ Не удалось найти аккаунт.")
         return
 
     session_string = row[0]
@@ -76,21 +74,7 @@ async def handle_account_button(event: callback_query) -> None:
         me = await client.get_me()
         username = me.first_name or "Без имени"
         phone = me.phone or "Не указан"
-        groups = cursor.execute(
-            "SELECT group_id, group_username FROM groups WHERE user_id = ? ORDER BY group_id",
-            (user_id,),
-        ).fetchall()
-        discovered_total = cursor.execute(
-            "SELECT COUNT(*) FROM discovered_groups WHERE user_id = ? AND is_available = 1",
-            (user_id,),
-        ).fetchone()[0]
-        discovered_view_only = cursor.execute(
-            """
-            SELECT COUNT(*) FROM discovered_groups
-            WHERE user_id = ? AND is_available = 1 AND is_admin = 0 AND is_creator = 0
-            """,
-            (user_id,),
-        ).fetchone()[0]
+        groups = cursor.execute("SELECT group_id, group_username FROM groups WHERE user_id = ?", (user_id,))
 
         active_gids = get_active_broadcast_groups(user_id)
         lines = []
@@ -133,27 +117,25 @@ async def handle_account_button(event: callback_query) -> None:
         
         group_list = "\n".join(lines)
         if not group_list:
-            group_list = "Рабочих групп нет."
+            group_list = "У пользователя нет групп."
 
         mass_active = "🟢 ВКЛ" if active_gids else "🔴 ВЫКЛ"
         buttons = [
-            [Button.inline("🔎 Найти группы аккаунта", f"sync_groups_{user_id}".encode())],
-            [Button.inline("📋 Найденные группы", f"discovered_groups_{user_id}_0".encode())],
-            [Button.inline("📋 Рабочий список групп", f"listOfgroups_{user_id}".encode())],
-            [Button.inline("🚀 Начать рассылку во все чаты", f"broadcastAll_{user_id}".encode()),
-             Button.inline("❌ Остановить общую рассылку", f"StopBroadcastAll_{user_id}".encode())],
-            [Button.inline("❌ Удалить этот аккаунт", f"delete_account_{user_id}".encode())],
-            [Button.inline("🏠 Главное меню", b"menu_home")],
+            [
+                Button.inline("📋 Список групп", f"listOfgroups_{user_id}")
+            ],
+            [Button.inline("🚀 Начать рассылку во все чаты", f"broadcastAll_{user_id}"),
+             Button.inline("❌ Остановить общую рассылку", f"StopBroadcastAll_{user_id}")],
+            [Button.inline("✔ Обновить информацию о группах", f"add_all_groups_{user_id}", )],
+            [Button.inline("❌ Удалить этот аккаунт", f"delete_account_{user_id}")]
         ]
 
-        await render_menu(event, 
+        await event.respond(
             f"📢 **Меню для аккаунта {username}:**\n"
             f"🚀 **Массовая рассылка:** {mass_active}\n\n"
             f"📌 **Имя:** {username}\n"
             f"📞 **Номер:** `+{phone}`\n\n"
-            f"📝 **Рабочие группы:**\n{group_list}\n\n"
-            f"🔎 Найдено доступных групп: {discovered_total}\n"
-            f"👁 Только просмотр: {discovered_view_only}",
+            f"📝 **Список групп:**\n{group_list}",
             buttons=buttons
         )
     finally:
