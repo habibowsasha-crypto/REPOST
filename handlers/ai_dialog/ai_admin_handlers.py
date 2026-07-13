@@ -22,7 +22,8 @@ async def cmd_ai_status(event: callback_message) -> None:
     if event.sender_id not in ADMIN_ID_LIST:
         return
     s = ai_stats()
-    await render_menu(event, 
+    await render_menu(
+        event,
         "🤖 **AI DM статус**\n\n"
         f"AI включён: {'да' if s['enabled'] else 'нет'}\n"
         f"Dry-run: {'да' if s['dry_run'] else 'нет'}\n"
@@ -32,8 +33,11 @@ async def cmd_ai_status(event: callback_message) -> None:
         f"Диалогов сегодня: {s['dialogs_today']}"
         + (f" / лимит {s['daily_dialog_limit']}" if s.get('daily_dialog_limit') else "")
         + "\n"
-        f"Сообщений сегодня: {s['messages_today']}\n\n"
-        "Команды: /ai_dialogs, /ai_stop USER_ID, /ai_resume USER_ID, /ai_export"
+        f"Сообщений сегодня: {s['messages_today']}\n"
+        "Режим: компактный — одно предложение со ссылкой\n"
+        "После ссылки: диалог закрывается\n"
+        "При отказе: максимум одно извинение\n\n"
+        "Команды: /ai_dialogs, /ai_stop USER_ID, /ai_resume USER_ID, /ai_export",
     )
 
 
@@ -132,7 +136,10 @@ async def menu_ai_status(event):
         f"Диалогов сегодня: {s['dialogs_today']}"
         + (f" / лимит {s['daily_dialog_limit']}" if s.get('daily_dialog_limit') else "")
         + "\n"
-        f"Сообщений сегодня: {s['messages_today']}",
+        f"Сообщений сегодня: {s['messages_today']}\n"
+        "Режим: компактный — одно предложение со ссылкой\n"
+        "После ссылки: диалог закрывается\n"
+        "При отказе: максимум одно извинение",
         buttons=[[Button.inline("🏠 Главное меню", b"menu_home")]],
     )
     await event.answer()
