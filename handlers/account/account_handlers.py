@@ -1,6 +1,8 @@
+from services.menu_ui import render_menu
+from services.admin_state import is_command_event
 from loguru import logger
 
-from telethon import TelegramClient
+from telethon import Button, TelegramClient
 from telethon.errors import FloodWaitError, SessionPasswordNeededError, PhoneCodeExpiredError, PhoneCodeInvalidError
 from telethon.sessions import StringSession
 from telethon.tl.functions.auth import SendCodeRequest, SignInRequest
@@ -18,7 +20,7 @@ async def add_account(event: callback_query) -> None:
     logger.info(f"Выбрана кнопка добавления аккаунта. подтверждение телефона и отправка кода")
     user_id: int = event.sender_id
     phone_waiting[user_id] = True
-    await event.respond("📲 Напишите номер телефона аккаунта в формате: `+xxxxxxxxxxx`")
+    await render_menu(event, "📲 Напишите номер телефона аккаунта в формате: `+xxxxxxxxxxx`")
 
 
 @bot.on(New_Message(func=lambda e: e.sender_id in phone_waiting and e.text.startswith("+") and e.text[1:].isdigit()))
@@ -72,7 +74,10 @@ async def get_code(event: callback_message) -> None:
         if not cursor.execute("SELECT session_string FROM sessions WHERE user_id = ?", (me.id, )).fetchall():
             cursor.execute("INSERT INTO sessions (user_id, session_string) VALUES (?, ?)", (me.id, session_string))
             conn.commit()
-            await event.respond("✅ Авторизация прошла успешно!")
+            await event.respond(
+                "✅ Авторизация прошла успешно!",
+                buttons=[[Button.inline("🔎 Найти группы аккаунта", f"sync_groups_{me.id}".encode())]],
+            )
         else:
             await event.respond("❌ Такой аккаунт уже есть")
         del code_waiting[user_id]
@@ -103,7 +108,7 @@ async def get_code(event: callback_message) -> None:
 
 @bot.on(New_Message(func=lambda
         e: e.sender_id in password_waiting and
-        not (e.raw_text or "").lstrip().startswith("/") and
+        not is_command_event(e) and
         e.sender_id not in user_states and e.sender_id not in broadcast_all_state))
 async def get_password(event: callback_message) -> None:
     user_id = event.sender_id
@@ -120,7 +125,10 @@ async def get_password(event: callback_message) -> None:
 
             del password_waiting[user_id]
             del user_clients[user_id]
-            await event.respond("✅ Авторизация с паролем прошла успешно!")
+            await event.respond(
+                "✅ Авторизация с паролем прошла успешно!",
+                buttons=[[Button.inline("🔎 Найти группы аккаунта", f"sync_groups_{me.id}".encode())]],
+            )
         except Exception as e:
             await event.respond(f"⚠ Ошибка при вводе пароля: {e}\nПопробуйте снова, нажав 'Добавить аккаунт'.")
         finally:

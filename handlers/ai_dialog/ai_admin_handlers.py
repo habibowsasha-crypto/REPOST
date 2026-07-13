@@ -1,7 +1,10 @@
 from __future__ import annotations
+from services.menu_ui import render_menu
 
 import os
 import tempfile
+
+from telethon import Button
 
 from config import ADMIN_ID_LIST, New_Message, Query, bot, callback_message
 from services.ai_dialog_service import (
@@ -19,7 +22,7 @@ async def cmd_ai_status(event: callback_message) -> None:
     if event.sender_id not in ADMIN_ID_LIST:
         return
     s = ai_stats()
-    await event.respond(
+    await render_menu(event, 
         "🤖 **AI DM статус**\n\n"
         f"AI включён: {'да' if s['enabled'] else 'нет'}\n"
         f"Dry-run: {'да' if s['dry_run'] else 'нет'}\n"
@@ -42,7 +45,7 @@ async def cmd_ai_dialogs(event: callback_message) -> None:
     limit = min(max(int(raw_limit or 10), 1), 30)
     rows = recent_dialogs(limit=limit)
     if not rows:
-        await event.respond("📭 AI-диалогов пока нет.")
+        await render_menu(event, "📭 AI-диалогов пока нет.")
         return
     lines = ["📋 **Последние AI-диалоги:**\n"]
     for uid, username, first_name, stage, status, count, updated in rows:
@@ -52,7 +55,7 @@ async def cmd_ai_dialogs(event: callback_message) -> None:
             f"стадия: `{stage}` | статус: `{status}` | AI-ответов: {count}\n"
             f"обновлён: {(updated or '')[:19]}"
         )
-    await event.respond("\n\n".join(lines))
+    await render_menu(event, "\n\n".join(lines))
 
 
 @bot.on(New_Message(pattern=r"^/ai_stop(?:@\w+)?(?:\s+(\d+))?$"))
@@ -117,7 +120,21 @@ async def menu_ai_status(event):
     if event.sender_id not in ADMIN_ID_LIST:
         await event.answer("Недоступно", alert=True)
         return
-    await cmd_ai_status(event)
+    s = ai_stats()
+    await render_menu(
+        event,
+        "🤖 **AI DM статус**\n\n"
+        f"AI включён: {'да' if s['enabled'] else 'нет'}\n"
+        f"Dry-run: {'да' if s['dry_run'] else 'нет'}\n"
+        f"Модель: `{s['model']}`\n"
+        f"Диалогов всего: {s['total_dialogs']}\n"
+        f"Активных диалогов: {s['active_dialogs']}\n"
+        f"Диалогов сегодня: {s['dialogs_today']}"
+        + (f" / лимит {s['daily_dialog_limit']}" if s.get('daily_dialog_limit') else "")
+        + "\n"
+        f"Сообщений сегодня: {s['messages_today']}",
+        buttons=[[Button.inline("🏠 Главное меню", b"menu_home")]],
+    )
     await event.answer()
 
 
@@ -128,7 +145,7 @@ async def menu_ai_dialogs(event):
         return
     rows = recent_dialogs(limit=10)
     if not rows:
-        await event.respond("📭 AI-диалогов пока нет.")
+        await render_menu(event, "📭 AI-диалогов пока нет.", buttons=[[Button.inline("🏠 Главное меню", b"menu_home")]])
         await event.answer()
         return
 
@@ -140,7 +157,7 @@ async def menu_ai_dialogs(event):
             f"стадия: `{stage}` | статус: `{status}` | AI-ответов: {count}\n"
             f"обновлён: {(updated or '')[:19]}"
         )
-    await event.respond("\n\n".join(lines))
+    await render_menu(event, "\n\n".join(lines), buttons=[[Button.inline("🏠 Главное меню", b"menu_home")]])
     await event.answer()
 
 
@@ -152,11 +169,11 @@ async def menu_first_dm_templates(event):
     reload_first_dm_templates_cache()
     templates = get_templates_preview(limit=30)
     if not templates:
-        await event.respond("⚠ Шаблоны первых сообщений не найдены.")
+        await render_menu(event, "⚠ Шаблоны первых сообщений не найдены.", buttons=[[Button.inline("🏠 Главное меню", b"menu_home")]])
         await event.answer()
         return
     lines = ["💬 **Первые DM-шаблоны:**\n"]
     for i, item in enumerate(templates, start=1):
         lines.append(f"{i}. {item}")
-    await event.respond("\n".join(lines))
+    await render_menu(event, "\n".join(lines), buttons=[[Button.inline("🏠 Главное меню", b"menu_home")]])
     await event.answer()

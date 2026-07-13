@@ -1,3 +1,5 @@
+from services.menu_ui import render_menu
+from services.admin_state import is_command_event
 from sqlite3 import IntegrityError
 
 from config import callback_query, callback_message, user_sessions, New_Message, Query, bot, conn
@@ -6,12 +8,11 @@ from config import callback_query, callback_message, user_sessions, New_Message,
 @bot.on(Query(data=b"add_groups"))
 async def manage_groups(event: callback_query) -> None:
     user_sessions[event.sender_id] = {"step": "awaiting_group_username"}
-    await event.respond("📲 Напишите @username группы или ID группы, чтобы добавить её в базу данных:")
+    await render_menu(event, "📲 Напишите @username группы или ID группы, чтобы добавить её в базу данных:")
 
 
 def _awaiting_group_input(event) -> bool:
-    text = (event.raw_text or "").lstrip()
-    if text.startswith("/"):
+    if is_command_event(event):
         return False
     state = user_sessions.get(event.sender_id)
     return bool(state and state.get("step") == "awaiting_group_username")

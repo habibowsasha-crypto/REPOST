@@ -1,3 +1,5 @@
+from services.admin_state import is_command_event
+from services.menu_ui import render_menu
 import asyncio
 import datetime
 from loguru import logger
@@ -21,7 +23,7 @@ async def broadcast_all_menu(event: callback_query) -> None:
         [Button.inline("⏲️ Интервал во все группы", f"same_IntervalAll_account")],
         [Button.inline("🎲 Разный интервал (25-35)", f"diff_IntervalAll_account")]
     ]
-    await event.respond("Выберите режим отправки:", buttons=keyboard)
+    await render_menu(event, "Выберите режим отправки:", buttons=keyboard)
 
 
 # ---------- одинаковый интервал ----------
@@ -29,7 +31,7 @@ async def broadcast_all_menu(event: callback_query) -> None:
 async def same_interval_start(event: callback_query) -> None:
     admin_id = event.sender_id
     broadcast_all_state_account[admin_id] = {"mode": "same", "step": "text"}
-    await event.respond("📝 Пришлите текст рассылки для **всех** групп этого аккаунта:")
+    await render_menu(event, "📝 Пришлите текст рассылки для **всех** групп этого аккаунта:")
 
 
 # ---------- случайный интервал ----------
@@ -37,11 +39,11 @@ async def same_interval_start(event: callback_query) -> None:
 async def diff_interval_start(event: callback_query) -> None:
     admin_id = event.sender_id
     broadcast_all_state_account[admin_id] = {"mode": "diff", "step": "text"}
-    await event.respond("📝 Пришлите текст рассылки, потом спрошу границы интервала:")
+    await render_menu(event, "📝 Пришлите текст рассылки, потом спрошу границы интервала:")
 
 
 # ---------- мастер-диалог (текст → интервалы) ----------
-@bot.on(New_Message(func=lambda e: e.sender_id in broadcast_all_state_account and not (e.raw_text or "").lstrip().startswith("/")))
+@bot.on(New_Message(func=lambda e: e.sender_id in broadcast_all_state_account and not is_command_event(e)))
 async def broadcast_all_dialog(event: callback_message) -> None:
     st = broadcast_all_state_account[event.sender_id]
     log_message_event(event, "обработка диалога рассылки по аккаунтам")
@@ -154,13 +156,13 @@ async def photo_yes_all_handler(event: callback_query) -> None:
     user_id = event.sender_id
     
     if user_id not in broadcast_all_state_account:
-        await event.respond("⚠ Сессия истекла. Пожалуйста, начните заново с команды /start")
+        await render_menu(event, "⚠ Сессия истекла. Пожалуйста, начните заново с команды /start")
         return
         
     st = broadcast_all_state_account[user_id]
     st["step"] = "photo"
     
-    await event.respond("📤 Пожалуйста, отправьте фото, которое хотите прикрепить к сообщению:")
+    await render_menu(event, "📤 Пожалуйста, отправьте фото, которое хотите прикрепить к сообщению:")
 
 
 @bot.on(Query(data=lambda d: d.decode() == "photo_only_all_account"))
@@ -168,14 +170,14 @@ async def photo_only_all_account_handler(event: callback_query) -> None:
     user_id = event.sender_id
     
     if user_id not in broadcast_all_state_account:
-        await event.respond("⚠ Сессия истекла. Пожалуйста, начните заново с команды /start")
+        await render_menu(event, "⚠ Сессия истекла. Пожалуйста, начните заново с команды /start")
         return
         
     st = broadcast_all_state_account[user_id]
     st["step"] = "photo_only"
     st["text"] = ""  # Пустой текст для отправки только фото
     
-    await event.respond("📤 Пожалуйста, отправьте фото, которое хотите отправить без текста:")
+    await render_menu(event, "📤 Пожалуйста, отправьте фото, которое хотите отправить без текста:")
 
 
 @bot.on(Query(data=lambda d: d.decode() == "photo_no_all_account"))
@@ -183,7 +185,7 @@ async def photo_no_all_handler(event: callback_query) -> None:
     user_id = event.sender_id
     
     if user_id not in broadcast_all_state_account:
-        await event.respond("⚠ Сессия истекла. Пожалуйста, начните заново с команды /start")
+        await render_menu(event, "⚠ Сессия истекла. Пожалуйста, начните заново с команды /start")
         return
         
     st = broadcast_all_state_account[user_id]
@@ -191,10 +193,10 @@ async def photo_no_all_handler(event: callback_query) -> None:
     # Запускаем рассылку без фото
     if st["mode"] == "same":
         await schedule_all_accounts_broadcast(st["text"], st["min_time"], None)
-        await event.respond(f"✅ Запустил: каждые {st['min_time']} мин.")
+        await render_menu(event, f"✅ Запустил: каждые {st['min_time']} мин.")
     else:
         await schedule_all_accounts_broadcast(st["text"], st["min"], st["max_m"])
-        await event.respond(f"✅ Запустил: случайно каждые {st['min']}-{st['max_m']} мин.")
+        await render_menu(event, f"✅ Запустил: случайно каждые {st['min']}-{st['max_m']} мин.")
     
     broadcast_all_state_account.pop(user_id, None)
 
@@ -464,7 +466,7 @@ async def stop_broadcast_all(event: callback_query) -> None:
             if len(msg_lines) == 1:  # Только заголовок
                 msg_lines.append("Нет активных рассылок для остановки.")
             
-            await event.respond("".join(msg_lines))
+            await render_menu(event, "".join(msg_lines))
 
         finally:
             cursor.close()

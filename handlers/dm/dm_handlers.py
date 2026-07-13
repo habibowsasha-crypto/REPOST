@@ -1,3 +1,5 @@
+from services.menu_ui import render_menu
+from services.admin_state import is_command_event
 """
 DM Autoposter — автопостер в личные сообщения.
 
@@ -25,7 +27,7 @@ from telethon.errors import (
 )
 from telethon.sessions import StringSession
 from telethon.tl.custom import Button
-from telethon.tl.types import User
+from telethon.tl.types import InputPeerChannel, InputPeerChat, User
 
 from config import (
     API_ID, API_HASH,
@@ -132,6 +134,40 @@ def _get_watched_chats(task_id: int) -> list:
     return [r[0] for r in rows]
 
 
+def _resolve_managed_watched_chats(user_id: int, chat_ids: list[int]) -> list:
+    """Resolve persisted managed groups to concrete Telegram input peers."""
+    if not chat_ids:
+        return []
+
+    placeholders = ",".join("?" for _ in chat_ids)
+    cursor = conn.cursor()
+    try:
+        rows = cursor.execute(
+            f"""
+            SELECT group_id, access_hash, peer_type, is_admin, is_creator, is_available
+            FROM discovered_groups
+            WHERE user_id = ? AND group_id IN ({placeholders})
+            """,
+            (user_id, *chat_ids),
+        ).fetchall()
+    finally:
+        cursor.close()
+
+    resolved = []
+    for group_id, access_hash, peer_type, is_admin, is_creator, is_available in rows:
+        if not is_available or not (is_admin or is_creator):
+            continue
+        if peer_type == "channel":
+            if access_hash is None:
+                logger.warning(f"Пропускаю группу {group_id}: отсутствует access_hash")
+                continue
+            resolved.append(InputPeerChannel(int(group_id), int(access_hash)))
+        elif peer_type == "chat":
+            resolved.append(InputPeerChat(int(group_id)))
+
+    return resolved
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Воркер отправки (рандомная очередь + интервал)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -235,12 +271,17 @@ async def _monitor_loop(task_id: int) -> None:
     if not task or not task["is_active"]:
         return
 
-    watched_chats = _get_watched_chats(task_id)
+    watched_chat_ids = _get_watched_chats(task_id)
+    watched_chats = _resolve_managed_watched_chats(task["user_id"], watched_chat_ids)
     if not watched_chats:
-        logger.warning(f"[DM task {task_id}] нет чатов для мониторинга")
+        logger.warning(
+            f"[DM task {task_id}] нет доступных управляемых групп для мониторинга"
+        )
         return
 
-    logger.info(f"[DM task {task_id}] запуск мониторинга, чаты: {watched_chats}")
+    logger.info(
+        f"[DM task {task_id}] запуск мониторинга, управляемых групп: {len(watched_chats)}"
+    )
 
     client = TelegramClient(StringSession(task["session_string"]), API_ID, API_HASH)
 
@@ -366,13 +407,14 @@ async def cmd_dm_post(event: callback_message) -> None:
     sessions = cursor.fetchall()
     cursor.close()
     if not sessions:
-        await event.respond("⚠ Нет добавленных аккаунтов. Сначала добавьте через /start.")
+        await render_menu(event, "⚠ Нет добавленных аккаунтов. Сначала добавьте через /start.", buttons=[[Button.inline("🏠 Главное меню", b"menu_home")]])
         return
     buttons = [
         [Button.inline(f"👤 Аккаунт #{uid}", f"dm_acc_{uid}".encode())]
         for (uid,) in sessions
     ]
-    await event.respond("📩 **DM Автопостер**\n\nВыберите аккаунт:", buttons=buttons)
+    buttons.append([Button.inline("🏠 Главное меню", b"menu_home")])
+    await render_menu(event, "📩 **DM Автопостер**\n\nВыберите аккаунт:", buttons=buttons)
 
 
 @bot.on(Query(data=lambda d: d.decode().startswith("dm_acc_")))
@@ -384,14 +426,26 @@ async def dm_pick_account(event: callback_query) -> None:
     cursor = conn.cursor()
     cursor.execute("SELECT session_string FROM sessions WHERE user_id = ?", (user_id,))
     row = cursor.fetchone()
-    cursor.execute("SELECT group_id, group_username FROM groups WHERE user_id = ?", (user_id,))
+    cursor.execute(
+        """
+        SELECT g.group_id, COALESCE(d.username, g.group_username)
+        FROM groups AS g
+        JOIN discovered_groups AS d
+          ON d.user_id = g.user_id AND d.group_id = g.group_id
+        WHERE g.user_id = ?
+          AND d.is_available = 1
+          AND (d.is_admin = 1 OR d.is_creator = 1)
+        ORDER BY lower(d.title)
+        """,
+        (user_id,),
+    )
     groups = cursor.fetchall()
     cursor.close()
     if not row:
-        await event.respond("⚠ Сессия не найдена.")
+        await render_menu(event, "⚠ Сессия не найдена.")
         return
     if not groups:
-        await event.respond("⚠ Нет групп. Добавьте группы через меню.")
+        await render_menu(event, "⚠ Нет доступных управляемых групп. Сначала откройте аккаунт и нажмите «Найти группы аккаунта».", buttons=[[Button.inline("🔎 Найти группы", f"sync_groups_{user_id}".encode()), Button.inline("🏠 Меню", b"menu_home")]])
         return
     dm_setup_state[admin_id] = {
         "step": "pick_chats",
@@ -400,7 +454,7 @@ async def dm_pick_account(event: callback_query) -> None:
         "selected_chats": [],
         "all_groups": groups,
     }
-    await event.respond(
+    await render_menu(event, 
         "📋 **Выберите чаты для мониторинга:**",
         buttons=_build_chat_buttons(groups, []),
     )
@@ -452,7 +506,7 @@ async def dm_chats_done(event: callback_query) -> None:
         await event.answer("⚠ Выберите хотя бы один чат!", alert=True)
         return
     st["step"] = "text"
-    await event.respond(
+    await render_menu(event, 
         f"✅ Выбрано чатов: {len(st['selected_chats'])}\n\n"
         "📝 Введите текст сообщения для ЛС:"
     )
@@ -460,7 +514,7 @@ async def dm_chats_done(event: callback_query) -> None:
 
 
 @bot.on(New_Message(func=lambda e: e.sender_id in dm_setup_state and
-                    not (e.raw_text or "").lstrip().startswith("/") and
+                    not is_command_event(e) and
                     dm_setup_state[e.sender_id].get("step") in
                     ("text", "interval", "delay_min", "delay_max", "photo")))
 async def dm_dialog(event: callback_message) -> None:
@@ -543,7 +597,7 @@ async def dm_photo_yes(event: callback_query) -> None:
     if not st:
         return
     st["step"] = "photo"
-    await event.respond("📸 Отправьте фото:")
+    await render_menu(event, "📸 Отправьте фото:")
     await event.answer()
 
 
@@ -585,7 +639,7 @@ async def _save_and_launch(event, admin_id: int, st: dict) -> None:
     dm_setup_state.pop(admin_id, None)
     _launch_monitor(task_id)
 
-    await event.respond(
+    await render_menu(event, 
         f"🚀 **DM-задача #{task_id} запущена!**\n\n"
         f"👥 Чатов: {len(st['selected_chats'])}\n"
         f"⏱ Интервал повтора: {st['interval_minutes']} мин\n"
@@ -611,7 +665,7 @@ async def cmd_dm_list(event: callback_message) -> None:
     rows = cursor.fetchall()
     cursor.close()
     if not rows:
-        await event.respond("📭 Нет DM-задач.")
+        await render_menu(event, "📭 Нет DM-задач.", buttons=[[Button.inline("🏠 Главное меню", b"menu_home")]])
         return
     lines = ["📋 **DM-задачи:**\n"]
     for tid, uid, interval, active, created, dmin, dmax, chats, sent, blocked in rows:
@@ -625,7 +679,7 @@ async def cmd_dm_list(event: callback_message) -> None:
             f"  В очереди сейчас: {queue_size} чел.\n"
             f"  Создана: {(created or '')[:16]}"
         )
-    await event.respond("\n\n".join(lines))
+    await render_menu(event, "\n\n".join(lines), buttons=[[Button.inline("🏠 Главное меню", b"menu_home")]])
 
 
 @bot.on(New_Message(pattern=r"^/dm_stop(?:@\w+)?(?:\s+(\d+))?$"))
@@ -690,7 +744,7 @@ async def menu_dm_stop(event: callback_query) -> None:
     cursor.close()
 
     if not rows:
-        await event.respond("📭 Активных DM-задач нет.")
+        await render_menu(event, "📭 Активных DM-задач нет.", buttons=[[Button.inline("🏠 Главное меню", b"menu_home")]])
         await event.answer()
         return
 
@@ -698,7 +752,8 @@ async def menu_dm_stop(event: callback_query) -> None:
         [Button.inline(f"⛔ Остановить #{task_id} | аккаунт {user_id}", f"menu_dm_stop_{task_id}".encode())]
         for task_id, user_id in rows
     ]
-    await event.respond("🛑 Выберите DM-задачу для остановки:", buttons=buttons)
+    buttons.append([Button.inline("🏠 Главное меню", b"menu_home")])
+    await render_menu(event, "🛑 Выберите DM-задачу для остановки:", buttons=buttons)
     await event.answer()
 
 
@@ -728,5 +783,5 @@ async def menu_dm_stop_selected(event: callback_query) -> None:
     if running_task and not running_task.done():
         running_task.cancel()
 
-    await event.respond(f"⛔ DM-задача #{task_id} остановлена.")
+    await render_menu(event, f"⛔ DM-задача #{task_id} остановлена.", buttons=[[Button.inline("🏠 Главное меню", b"menu_home")]])
     await event.answer("Остановлено")

@@ -20,9 +20,10 @@ from config import (
 
 
 def is_command_event(event: Any) -> bool:
-    """Return True when an incoming admin message is a slash command."""
+    """Return True for slash commands and the text command «Меню»."""
     text = getattr(event, "raw_text", None) or getattr(event, "text", None) or ""
-    return text.lstrip().startswith("/")
+    normalized = text.strip().casefold()
+    return normalized.startswith("/") or normalized == "меню"
 
 
 async def clear_admin_interaction_state(admin_id: int) -> int:

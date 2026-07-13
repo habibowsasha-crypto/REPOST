@@ -1,4 +1,6 @@
+from services.menu_ui import render_menu
 from loguru import logger
+import re
 
 from telethon import Button
 from config import callback_message, callback_query, ADMIN_ID_LIST, New_Message, Query, bot
@@ -15,6 +17,7 @@ def _main_menu_buttons():
             Button.inline("👤 Мои аккаунты", b"my_accounts"),
             Button.inline("👥 Мои группы", b"my_groups"),
         ],
+        [Button.inline("🔎 Группы аккаунтов", b"my_accounts")],
         [
             Button.inline("💬 Запустить DM", b"menu_dm_post"),
             Button.inline("📋 DM-задачи", b"menu_dm_list"),
@@ -45,6 +48,30 @@ async def reset_stale_state_before_command(event: callback_message) -> None:
         await clear_admin_interaction_state(event.sender_id)
 
 
+async def _show_main_menu(event: callback_message, *, edit: bool = False) -> None:
+    await clear_admin_interaction_state(event.sender_id)
+    if edit:
+        await render_menu(event, "👋 Добро пожаловать, Админ!", buttons=_main_menu_buttons())
+    else:
+        await event.respond("👋 Добро пожаловать, Админ!", buttons=_main_menu_buttons())
+
+
+@bot.on(New_Message(pattern=re.compile(r"^\s*(?:/menu(?:@\w+)?|меню)\s*$", re.IGNORECASE)))
+async def menu_command(event: callback_message) -> None:
+    if event.sender_id not in ADMIN_ID_LIST:
+        return
+    await _show_main_menu(event)
+
+
+@bot.on(Query(data=b"menu_home"))
+async def menu_home(event: callback_query) -> None:
+    if event.sender_id not in ADMIN_ID_LIST:
+        await event.answer("Недоступно", alert=True)
+        return
+    await _show_main_menu(event, edit=True)
+    await event.answer()
+
+
 @bot.on(New_Message(pattern=r"^/start(?:@\w+)?$"))
 async def start(event: callback_message) -> None:
     """Show the complete admin menu and reset unfinished setup dialogs."""
@@ -53,8 +80,7 @@ async def start(event: callback_message) -> None:
         await event.respond("⛔ Запрещено!")
         return
 
-    await clear_admin_interaction_state(event.sender_id)
-    await event.respond("👋 Добро пожаловать, Админ!", buttons=_main_menu_buttons())
+    await _show_main_menu(event)
 
 
 @bot.on(New_Message(pattern=r"^/cancel(?:@\w+)?$"))
@@ -75,5 +101,5 @@ async def cancel_flow_button(event: callback_query) -> None:
         return
     cleared = await clear_admin_interaction_state(event.sender_id)
     text = "✅ Текущий ввод отменён." if cleared else "ℹ️ Активного ввода не было."
-    await event.respond(text, buttons=_main_menu_buttons())
+    await render_menu(event, text, buttons=_main_menu_buttons())
     await event.answer()

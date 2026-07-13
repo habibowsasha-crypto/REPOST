@@ -20,6 +20,20 @@ def create_table() -> None:
             session_string TEXT)""")
 
     start_cursor.execute("""
+        CREATE TABLE IF NOT EXISTS discovered_groups (
+            user_id INTEGER NOT NULL,
+            group_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            username TEXT,
+            access_hash INTEGER,
+            peer_type TEXT NOT NULL,
+            is_admin INTEGER DEFAULT 0,
+            is_creator INTEGER DEFAULT 0,
+            is_available INTEGER DEFAULT 1,
+            last_seen_at TEXT,
+            PRIMARY KEY (user_id, group_id))""")
+
+    start_cursor.execute("""
         CREATE TABLE IF NOT EXISTS broadcasts ( 
             user_id INTEGER, 
             group_id INTEGER, 

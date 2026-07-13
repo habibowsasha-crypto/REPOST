@@ -1,10 +1,12 @@
+from services.menu_ui import render_menu
+from services.admin_state import is_command_event
 from config import user_sessions_deleting, callback_query, callback_message, Query, New_Message, bot, conn, processed_callbacks
 
 
 @bot.on(Query(data=b"delete_group"))
 async def handle_delete_group(event: callback_query) -> None:
     # Получаем уникальный идентификатор для этого callback
-    callback_id = f"{event.sender_id}:{event.query.msg_id}"
+    callback_id = f"{event.sender_id}:{getattr(event.query, 'query_id', event.query.msg_id)}"
     
     # Проверяем, был ли уже обработан этот callback
     if callback_id in processed_callbacks:
@@ -15,12 +17,12 @@ async def handle_delete_group(event: callback_query) -> None:
     processed_callbacks[callback_id] = True
     
     user_sessions_deleting[event.sender_id] = {"step": "awaiting_group_username"}
-    await event.respond("📲 Введите @username группы или ID группы, которую нужно удалить:\n\n🔹 Пример username: @mygroup\n🔹 Пример ID: -1001234567890")
+    await render_menu(event, "📲 Введите @username группы или ID группы, которую нужно удалить:\n\n🔹 Пример username: @mygroup\n🔹 Пример ID: -1001234567890")
 
 
 def is_awaiting_group_deletion(event):
     """Проверяет, ожидает ли пользователь ввода группы для удаления."""
-    if (event.raw_text or "").lstrip().startswith("/"):
+    if is_command_event(event):
         return False
     user_state = user_sessions_deleting.get(event.sender_id)
     return bool(user_state and user_state.get("step") == "awaiting_group_username")
