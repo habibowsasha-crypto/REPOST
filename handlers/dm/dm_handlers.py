@@ -773,26 +773,26 @@ async def cmd_dm_list(event: callback_message) -> None:
             f"  В очереди сейчас: {queue_size} чел.\n"
             f"  Создана: {(created or '')[:16]}"
         )
-    inactive_count = sum(1 for row in rows if not bool(row[3]))
-    buttons = []
-    if inactive_count:
-        buttons.append([
+    # Считаем напрямую из БД и всегда показываем кнопку очистки.
+    # Так кнопка не зависит от типа значения is_active в уже существующей базе
+    # и остаётся видимой даже когда неактуальных задач временно нет.
+    inactive_count = count_inactive_dm_tasks(conn)
+    lines.insert(1, f"🧹 Неактуальных задач: **{inactive_count}**")
+    buttons = [
+        [
             Button.inline(
                 f"🧹 Очистить неактуальные ({inactive_count})",
                 b"menu_dm_cleanup",
             )
-        ])
-    buttons.append([Button.inline("🏠 Главное меню", b"menu_home")])
+        ],
+        [Button.inline("🔄 Обновить список", b"menu_dm_list")],
+        [Button.inline("🏠 Главное меню", b"menu_home")],
+    ]
     await render_menu(event, "\n\n".join(lines), buttons=buttons)
 
 
-@bot.on(Query(data=b"menu_dm_cleanup"))
-async def menu_dm_cleanup(event: callback_query) -> None:
-    """Ask for confirmation before removing stopped DM tasks."""
-    if event.sender_id not in ADMIN_ID_LIST:
-        await event.answer("Недоступно", alert=True)
-        return
-
+async def _show_dm_cleanup_confirmation(event) -> None:
+    """Show the same cleanup confirmation for callback and slash command."""
     inactive_count = count_inactive_dm_tasks(conn)
 
     if inactive_count <= 0:
@@ -804,7 +804,6 @@ async def menu_dm_cleanup(event: callback_query) -> None:
                 [Button.inline("🏠 Главное меню", b"menu_home")],
             ],
         )
-        await event.answer()
         return
 
     await render_menu(
@@ -817,7 +816,25 @@ async def menu_dm_cleanup(event: callback_query) -> None:
             [Button.inline("❌ Отмена", b"menu_dm_list")],
         ],
     )
+
+
+@bot.on(Query(data=b"menu_dm_cleanup"))
+async def menu_dm_cleanup(event: callback_query) -> None:
+    """Ask for confirmation before removing stopped DM tasks."""
+    if event.sender_id not in ADMIN_ID_LIST:
+        await event.answer("Недоступно", alert=True)
+        return
+
+    await _show_dm_cleanup_confirmation(event)
     await event.answer()
+
+
+@bot.on(New_Message(pattern=r"^/dm_cleanup(?:@\w+)?$"))
+async def cmd_dm_cleanup(event: callback_message) -> None:
+    """Slash-command fallback for opening the stopped-task cleanup dialog."""
+    if event.sender_id not in ADMIN_ID_LIST:
+        return
+    await _show_dm_cleanup_confirmation(event)
 
 
 @bot.on(Query(data=b"menu_dm_cleanup_confirm"))

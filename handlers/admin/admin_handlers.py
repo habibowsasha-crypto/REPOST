@@ -23,6 +23,7 @@ def _main_menu_buttons():
             Button.inline("📋 DM-задачи", b"menu_dm_list"),
         ],
         [Button.inline("🛑 Остановить DM-задачу", b"menu_dm_stop")],
+        [Button.inline("🧹 Очистить неактуальные DM-задачи", b"menu_dm_cleanup")],
         [
             Button.inline("🤖 AI статус", b"menu_ai_status"),
             Button.inline("💬 AI-диалоги", b"menu_ai_dialogs"),
