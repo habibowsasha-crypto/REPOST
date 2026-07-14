@@ -137,6 +137,7 @@ class DialogRow:
     target_user_id: int
     username: Optional[str]
     first_name: Optional[str]
+    source_chat_title: Optional[str]
     stage: str
     status: str
     message_count: int
@@ -153,6 +154,7 @@ def create_ai_tables() -> None:
             target_user_id INTEGER NOT NULL,
             username TEXT,
             first_name TEXT,
+            source_chat_title TEXT,
             stage TEXT DEFAULT 'new_contact',
             status TEXT DEFAULT 'active',
             message_count INTEGER DEFAULT 0,
@@ -231,6 +233,7 @@ def create_ai_tables() -> None:
     for table, col, ddl in [
         ("ai_dialogs", "stopped_reason", "ALTER TABLE ai_dialogs ADD COLUMN stopped_reason TEXT"),
         ("ai_dialogs", "message_count", "ALTER TABLE ai_dialogs ADD COLUMN message_count INTEGER DEFAULT 0"),
+        ("ai_dialogs", "source_chat_title", "ALTER TABLE ai_dialogs ADD COLUMN source_chat_title TEXT"),
         ("ai_messages", "tokens_used", "ALTER TABLE ai_messages ADD COLUMN tokens_used INTEGER DEFAULT 0"),
     ]:
         try:
@@ -252,7 +255,7 @@ def _get_dialog_by_target(account_user_id: int, target_user_id: int) -> Optional
     cursor = conn.cursor()
     cursor.execute(
         """SELECT id, dm_task_id, account_user_id, target_user_id, username, first_name,
-                  stage, status, message_count, stopped_reason
+                  source_chat_title, stage, status, message_count, stopped_reason
            FROM ai_dialogs WHERE account_user_id = ? AND target_user_id = ?""",
         (account_user_id, target_user_id),
     )
@@ -265,7 +268,7 @@ def _get_dialog_by_id(dialog_id: int) -> Optional[DialogRow]:
     cursor = conn.cursor()
     cursor.execute(
         """SELECT id, dm_task_id, account_user_id, target_user_id, username, first_name,
-                  stage, status, message_count, stopped_reason
+                  source_chat_title, stage, status, message_count, stopped_reason
            FROM ai_dialogs WHERE id = ?""",
         (dialog_id,),
     )
@@ -281,6 +284,7 @@ def _upsert_dialog(
     target_user_id: int,
     username: Optional[str],
     first_name: Optional[str],
+    source_chat_title: Optional[str] = None,
 ) -> DialogRow:
     existing = _get_dialog_by_target(account_user_id, target_user_id)
     now = _now_iso()
@@ -288,9 +292,10 @@ def _upsert_dialog(
     if existing:
         cursor.execute(
             """UPDATE ai_dialogs SET dm_task_id = ?, username = COALESCE(?, username),
-                      first_name = COALESCE(?, first_name), updated_at = ?
+                      first_name = COALESCE(?, first_name),
+                      source_chat_title = COALESCE(?, source_chat_title), updated_at = ?
                WHERE id = ?""",
-            (dm_task_id, username, first_name, now, existing.id),
+            (dm_task_id, username, first_name, source_chat_title, now, existing.id),
         )
         conn.commit()
         cursor.close()
@@ -298,10 +303,10 @@ def _upsert_dialog(
 
     cursor.execute(
         """INSERT INTO ai_dialogs
-           (dm_task_id, account_user_id, target_user_id, username, first_name, stage,
+           (dm_task_id, account_user_id, target_user_id, username, first_name, source_chat_title, stage,
             status, message_count, created_at, updated_at)
-           VALUES (?,?,?,?,?,'new_contact','active',0,?,?)""",
-        (dm_task_id, account_user_id, target_user_id, username, first_name, now, now),
+           VALUES (?,?,?,?,?,?,'new_contact','active',0,?,?)""",
+        (dm_task_id, account_user_id, target_user_id, username, first_name, source_chat_title, now, now),
     )
     dialog_id = cursor.lastrowid
     conn.commit()
@@ -377,6 +382,7 @@ def record_first_dm(
     account_user_id: int,
     target: User,
     text: str,
+    source_chat_title: Optional[str] = None,
 ) -> None:
     """Create a new AI response cycle after a real first DM was delivered.
 
@@ -400,6 +406,7 @@ def record_first_dm(
         target_user_id=target.id,
         username=getattr(target, "username", None),
         first_name=getattr(target, "first_name", None),
+        source_chat_title=source_chat_title,
     )
     _save_message(dialog.id, "outgoing", text, provider="dm_first", model="first_dm")
 
@@ -516,6 +523,41 @@ def _sanitize_short_text(
     return value
 
 
+def _clean_source_chat_title(value: Optional[str]) -> str:
+    """Return a compact, safe title for a plain-text Telegram message."""
+    title = " ".join((value or "").replace("\n", " ").replace("\r", " ").split()).strip()
+    title = title.strip('\"\'«»“”„`')
+    if not title:
+        return ""
+    if len(title) > 72:
+        title = title[:69].rstrip() + "..."
+    return title
+
+
+def _source_chat_attention_fallback(source_chat_title: Optional[str]) -> str:
+    """Message #2 with the exact chat that triggered the first DM.
+
+    These are local templates on purpose: the title is preserved exactly and the
+    model cannot invent a different source or move the VIP offer/link to message #2.
+    """
+    title = _clean_source_chat_title(source_chat_title)
+    if not title:
+        return _attention_fallback()
+
+    quoted = f"«{title}»"
+    variants = (
+        f"Слушай, а у тебя есть VIP от {quoted}?",
+        f"Ты давно сидишь в {quoted}?",
+        f"Как думаешь, у {quoted} реально высокий винрейт?",
+        f"Ты сам торгуешь по идеям из {quoted} или просто наблюдаешь?",
+        f"Как тебе вообще {quoted}, давно за ним следишь?",
+        f"У {quoted} сигналы нормально заходят, как считаешь?",
+        f"Ты в {quoted} больше читаешь аналитику или смотришь сигналы?",
+        f"Слушай, а VIP у {quoted} когда-нибудь пробовал?",
+    )
+    return random.choice(variants)
+
+
 def _attention_fallback() -> str:
     variants = (
         "Понял тебя. Слушай, а подборка идей сразу из нескольких закрытых каналов тебе была бы интересна?",
@@ -528,12 +570,18 @@ def _attention_fallback() -> str:
     return random.choice(variants)
 
 
-async def _generate_attention_reply(user_text: str) -> tuple[str, int, str]:
+async def _generate_attention_reply(
+    user_text: str, source_chat_title: Optional[str] = None
+) -> tuple[str, int, str]:
     """Generate message #2: continue naturally, catch attention, ask one easy question.
 
     The first DM has already greeted the person, so a second greeting is explicitly
     forbidden. The offer facts and link are reserved for message #3.
     """
+    source_title = _clean_source_chat_title(source_chat_title)
+    if source_title:
+        return _source_chat_attention_fallback(source_title), 0, "local_source_chat_attention"
+
     fallback = _attention_fallback()
     api_key = config("OPENAI_API_KEY", default="").strip()
     if not api_key:
@@ -931,7 +979,9 @@ async def handle_private_incoming(
 
         if stage in attention_stages:
             try:
-                reply, tokens, model = await _generate_attention_reply(text)
+                reply, tokens, model = await _generate_attention_reply(
+                    text, dialog.source_chat_title
+                )
             except Exception as exc:
                 logger.error(
                     f"[AI DM] OpenAI attention error for dialog={dialog.id}, user={sender.id}: {exc}"
@@ -958,7 +1008,7 @@ async def handle_private_incoming(
                 dialog.id,
                 "outgoing",
                 reply,
-                provider="openai" if model != "local_attention" else "local",
+                provider="openai" if model not in {"local_attention", "local_source_chat_attention"} else "local",
                 model=model,
                 tokens_used=tokens,
             )
@@ -1069,7 +1119,7 @@ def ai_stats() -> dict[str, Any]:
         "messages_today": messages_today,
         "dialogs_today": dialogs_today,
         "daily_dialog_limit": _safe_int("AI_DAILY_DIALOG_LIMIT", 0, min_value=0),
-        "funnel_mode": "three_message_varied_offer",
+        "funnel_mode": "three_message_source_chat_attention",
         "close_after_offer": True,
         "post_offer_apology": True,
     }

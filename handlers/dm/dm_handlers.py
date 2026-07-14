@@ -57,6 +57,10 @@ dm_monitor_tasks: dict = {}     # task_id → asyncio.Task
 # task_id → deque of (target_user_id, sender_obj)
 dm_send_queues: dict = {}
 
+# Название исходного чата хранится отдельно, чтобы не менять рабочий формат
+# очереди первого DM: (task_id, target_user_id) → source_chat_title.
+dm_source_chat_titles: dict[tuple[int, int], str] = {}
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Вспомогательные функции
@@ -255,6 +259,7 @@ async def _send_worker(task_id: int, client: TelegramClient) -> None:
         queue.extend(items)
 
         target_id, sender = queue.popleft()
+        source_chat_title = dm_source_chat_titles.get((task_id, target_id))
 
         # Повторная проверка перед отправкой
         if _is_blacklisted(task_id, target_id):
@@ -286,6 +291,7 @@ async def _send_worker(task_id: int, client: TelegramClient) -> None:
                     account_user_id=t["user_id"],
                     target=sender,
                     text=outgoing_text,
+                    source_chat_title=source_chat_title,
                 )
             except Exception as exc:
                 # The Telegram message was already delivered. AI history failure must
@@ -293,14 +299,17 @@ async def _send_worker(task_id: int, client: TelegramClient) -> None:
                 logger.error(f"[DM {task_id}] не удалось сохранить AI-диалог {target_id}: {exc}")
             uname = getattr(sender, "username", None)
             logger.info(f"[DM {task_id}] ✅ ЛС → {target_id} (@{uname or '?'})")
+            dm_source_chat_titles.pop((task_id, target_id), None)
 
         except UserPrivacyRestrictedError:
             _log_event(task_id, target_id, "privacy")
             logger.info(f"[DM {task_id}] 🔒 {target_id} закрыл ЛС — в blacklist на 24ч")
+            dm_source_chat_titles.pop((task_id, target_id), None)
 
         except (UserIsBlockedError, InputUserDeactivatedError):
             _log_event(task_id, target_id, "blocked")
             logger.debug(f"[DM {task_id}] ⛔ {target_id} заблокировал или деактивирован")
+            dm_source_chat_titles.pop((task_id, target_id), None)
 
         except PeerFloodError:
             logger.warning(f"[DM {task_id}] 🌊 PeerFlood — пауза 10 мин")
@@ -317,6 +326,7 @@ async def _send_worker(task_id: int, client: TelegramClient) -> None:
         except Exception as exc:
             _log_event(task_id, target_id, "error")
             logger.error(f"[DM {task_id}] ❌ ошибка отправки {target_id}: {exc}")
+            dm_source_chat_titles.pop((task_id, target_id), None)
 
         # Случайная задержка между отправками
         try:
@@ -412,6 +422,19 @@ async def _monitor_loop(task_id: int) -> None:
             if any(uid == target_id for uid, _ in queue):
                 return
 
+            source_chat_title = None
+            try:
+                source_chat = await event.get_chat()
+                source_chat_title = getattr(source_chat, "title", None)
+            except Exception as exc:
+                logger.debug(
+                    f"[DM {task_id}] не удалось получить название исходного чата "
+                    f"для user={target_id}: {exc}"
+                )
+
+            if source_chat_title:
+                dm_source_chat_titles[(task_id, target_id)] = str(source_chat_title)
+
             queue.append((target_id, sender))
             logger.debug(f"[DM {task_id}] добавлен в очередь: {target_id}, размер очереди: {len(queue)}")
 
@@ -450,6 +473,8 @@ async def _monitor_loop(task_id: int) -> None:
         if current is asyncio.current_task():
             dm_monitor_tasks.pop(task_id, None)
         dm_send_queues.pop(task_id, None)
+        for key in [key for key in dm_source_chat_titles if key[0] == task_id]:
+            dm_source_chat_titles.pop(key, None)
 
 
 def _launch_monitor(task_id: int) -> None:
@@ -861,6 +886,8 @@ async def menu_dm_cleanup_confirm(event: callback_query) -> None:
                     f"Не удалось отключить клиент удалённой DM-задачи #{task_id}: {exc}"
                 )
         dm_send_queues.pop(task_id, None)
+        for key in [key for key in dm_source_chat_titles if key[0] == task_id]:
+            dm_source_chat_titles.pop(key, None)
 
     active_count = count_active_dm_tasks(conn)
 
