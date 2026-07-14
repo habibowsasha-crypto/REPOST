@@ -378,7 +378,15 @@ def record_first_dm(
     target: User,
     text: str,
 ) -> None:
-    """Creates/updates an active dialog after the first DM has actually been sent."""
+    """Create a new AI response cycle after a real first DM was delivered.
+
+    A dialog row is reused per sender/recipient pair. Older versions only updated
+    metadata for an existing row, so a recipient whose previous cycle was already
+    ``completed`` stayed completed and the AI silently ignored the new reply.
+
+    A newly delivered first DM re-opens ordinary completed/error cycles. Explicit
+    opt-out, admin stop and human-takeover states remain closed as before.
+    """
     if not ai_enabled():
         return
     create_ai_tables()
@@ -394,10 +402,34 @@ def record_first_dm(
         first_name=getattr(target, "first_name", None),
     )
     _save_message(dialog.id, "outgoing", text, provider="dm_first", model="first_dm")
+
+    protected_closed_statuses = {"closed_negative", "admin_stopped", "human_needed"}
     cursor = conn.cursor()
-    cursor.execute("UPDATE ai_dialogs SET last_outgoing_at = ?, updated_at = ? WHERE id = ?", (_now_iso(), _now_iso(), dialog.id))
-    conn.commit()
-    cursor.close()
+    try:
+        if dialog.status in protected_closed_statuses:
+            cursor.execute(
+                "UPDATE ai_dialogs SET last_outgoing_at = ?, updated_at = ? WHERE id = ?",
+                (_now_iso(), _now_iso(), dialog.id),
+            )
+            logger.info(
+                f"[AI DM] first DM recorded without reopening protected state: "
+                f"dialog={dialog.id}, user={target.id}, status={dialog.status}"
+            )
+        else:
+            cursor.execute(
+                """UPDATE ai_dialogs
+                   SET status = 'active', stage = 'first_dm_sent', stopped_reason = NULL,
+                       last_outgoing_at = ?, updated_at = ?
+                   WHERE id = ?""",
+                (_now_iso(), _now_iso(), dialog.id),
+            )
+            logger.info(
+                f"[AI DM] response cycle opened after first DM: "
+                f"dialog={dialog.id}, user={target.id}, previous_status={dialog.status}"
+            )
+        conn.commit()
+    finally:
+        cursor.close()
 
 
 PIRATE_VIP_LINK = "https://telegram.me/+pvPjmt2KW_QyZTAy"
@@ -492,19 +524,40 @@ def _canonical_offer_reply(intro: str) -> str:
     )
 
 
+def _latest_first_dm_message_id(dialog_id: int) -> int:
+    """Return the message boundary for the current first-DM response cycle."""
+    cursor = conn.cursor()
+    try:
+        row = cursor.execute(
+            """
+            SELECT MAX(id) FROM ai_messages
+            WHERE dialog_id = ? AND provider = 'dm_first'
+            """,
+            (dialog_id,),
+        ).fetchone()
+        return int((row or [0])[0] or 0)
+    finally:
+        cursor.close()
+
+
 def _dialog_has_sent_offer(dialog_id: int) -> bool:
-    """Detect both the canonical and older t.me versions of the same invite."""
+    """Detect an offer sent after the latest first DM in the current cycle.
+
+    Older offers must not suppress the reply to a newly delivered first DM.
+    """
+    cycle_start_id = _latest_first_dm_message_id(dialog_id)
     cursor = conn.cursor()
     try:
         row = cursor.execute(
             """
             SELECT 1 FROM ai_messages
             WHERE dialog_id = ?
+              AND id > ?
               AND direction = 'outgoing'
               AND instr(COALESCE(message_text, ''), ?) > 0
             LIMIT 1
             """,
-            (dialog_id, PIRATE_VIP_LINK_TOKEN),
+            (dialog_id, cycle_start_id, PIRATE_VIP_LINK_TOKEN),
         ).fetchone()
         return row is not None
     finally:
@@ -512,17 +565,19 @@ def _dialog_has_sent_offer(dialog_id: int) -> bool:
 
 
 def _dialog_has_post_offer_apology(dialog_id: int) -> bool:
+    cycle_start_id = _latest_first_dm_message_id(dialog_id)
     cursor = conn.cursor()
     try:
         row = cursor.execute(
             """
             SELECT 1 FROM ai_messages
             WHERE dialog_id = ?
+              AND id > ?
               AND direction = 'outgoing'
               AND model = 'post_offer_apology'
             LIMIT 1
             """,
-            (dialog_id,),
+            (dialog_id, cycle_start_id),
         ).fetchone()
         return row is not None
     finally:
