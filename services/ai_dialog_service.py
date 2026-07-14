@@ -459,69 +459,241 @@ def _extract_output_text(response: Any) -> str:
         return ""
 
 
-def _offer_intro_fallback() -> str:
+_GREETING_PREFIXES = (
+    "привет",
+    "здравствуй",
+    "здравствуйте",
+    "добрый день",
+    "добрый вечер",
+    "доброе утро",
+    "салют",
+    "здорово",
+    "хай",
+    "hello",
+)
+_FORBIDDEN_WRAPPER_TOKENS = (
+    "http://",
+    "https://",
+    "t.me",
+    "telegram.me",
+    "2trade",
+    "sancho",
+    "cryptoman",
+    "80/20",
+    "аниськевич",
+    "0.5",
+    "1000",
+)
+
+
+def _starts_with_greeting(text: str) -> bool:
+    normalized = " ".join((text or "").strip().lower().split())
+    return any(normalized.startswith(prefix) for prefix in _GREETING_PREFIXES)
+
+
+def _sanitize_short_text(
+    text: str,
+    *,
+    max_words: int,
+    allow_question: bool,
+    fallback: str,
+) -> str:
+    value = " ".join((text or "").replace("\n", " ").split()).strip()
+    lower = value.lower()
+    if not value or _starts_with_greeting(value):
+        return fallback
+    if any(token in lower for token in _FORBIDDEN_WRAPPER_TOKENS):
+        return fallback
+    if not allow_question and "?" in value:
+        return fallback
+    words = value.split()
+    if len(words) > max_words:
+        value = " ".join(words[:max_words]).rstrip(" ,;:-")
+        if allow_question:
+            value = value.rstrip(".!?") + "?"
+        else:
+            value = value.rstrip(".!?") + "."
+    return value
+
+
+def _attention_fallback() -> str:
     variants = (
-        "Смотри, расскажу быстро 👇",
-        "Да, к делу — вот что хотел показать 👇",
-        "Короче, не буду тянуть — есть такая подборка 👇",
-        "Расскажу сразу по сути 👇",
+        "Понял тебя. Слушай, а подборка идей сразу из нескольких закрытых каналов тебе была бы интересна?",
+        "Ясно. Тогда короткий вопрос: ты когда-нибудь сравнивал сигналы сразу из нескольких VIP-каналов?",
+        "Хорошо. Есть одна бесплатная штука по трейдингу, которая может сэкономить время. Показать суть?",
+        "Понял. А тебе было бы удобно смотреть идеи нескольких закрытых каналов в одном месте?",
+        "Тогда спрошу прямо: бесплатная подборка постов из закрытых трейдинг-каналов тебе интересна?",
+        "Окей. Есть полезная подборка по крипте без оплаты. Рассказать в двух словах?",
     )
     return random.choice(variants)
 
 
-async def _generate_offer_intro(user_text: str) -> tuple[str, int, str]:
-    """Generate only one short contextual lead-in for the fixed offer block.
+async def _generate_attention_reply(user_text: str) -> tuple[str, int, str]:
+    """Generate message #2: continue naturally, catch attention, ask one easy question.
 
-    The model cannot alter the mandatory offer facts or link because those are
-    appended locally after this sentence.
+    The first DM has already greeted the person, so a second greeting is explicitly
+    forbidden. The offer facts and link are reserved for message #3.
     """
+    fallback = _attention_fallback()
     api_key = config("OPENAI_API_KEY", default="").strip()
     if not api_key:
-        return _offer_intro_fallback(), 0, "local_intro"
+        return fallback, 0, "local_attention"
 
     model = config("AI_MODEL", default="gpt-4o-mini").strip()
     from openai import AsyncOpenAI
 
+    style = random.choice((
+        "по-простому и дружелюбно",
+        "коротко и уверенно",
+        "спокойно и без давления",
+        "живым разговорным языком",
+        "максимально естественно",
+    ))
     client = AsyncOpenAI(api_key=api_key)
     response = await client.responses.create(
         model=model,
         instructions=(
-            "Ответь по-русски одной короткой естественной фразой-вступлением, максимум 12 слов. "
-            "Не задавай вопросов, не используй ссылки, не перечисляй каналы, не обещай прибыль. "
-            "Фраза должна мягко перейти к краткому объяснению предложения."
+            "Ты пишешь второе сообщение в коротком Telegram-диалоге. Первое сообщение уже было, "
+            "поэтому НЕ здоровайся повторно и не повторяй слова пользователя. Ответь по-русски, "
+            "1-2 короткими предложениями, максимум 24 слова. Продолжи разговор, зацепи внимание и "
+            "закончи одним простым вопросом, на который легко ответить. Можно намекнуть на бесплатную "
+            "подборку закрытых трейдинг-каналов, но не называй каналы, не давай ссылку, не упоминай "
+            "0.5 секунды, 1000$, доходность или гарантии. Тон: " + style + "."
         ),
         input=[{"role": "user", "content": user_text}],
-        max_output_tokens=_safe_int("AI_OFFER_INTRO_MAX_TOKENS", 48, min_value=16, max_value=96),
+        max_output_tokens=_safe_int("AI_ATTENTION_MAX_TOKENS", 80, min_value=24, max_value=128),
     )
     usage = getattr(response, "usage", None)
     tokens = int(getattr(usage, "total_tokens", 0) or 0) if usage is not None else 0
-    intro = _extract_output_text(response).replace("\n", " ").strip()
-    if not intro:
-        raise RuntimeError("OpenAI returned empty offer intro")
-
-    lower_intro = intro.lower()
-    forbidden = ("http://", "https://", "t.me", "telegram.me", "2trade", "sancho", "cryptoman", "80/20", "аниськевич")
-    if "?" in intro or any(token in lower_intro for token in forbidden):
-        raise RuntimeError("OpenAI intro violated compact-funnel format")
-
-    # Defensive cap: even a disobedient model cannot create a long preamble.
-    words = intro.split()
-    if len(words) > 16:
-        intro = " ".join(words[:16]).rstrip(" ,;:-") + "."
-    return intro, tokens, model
-
-
-def _canonical_offer_reply(intro: str) -> str:
-    sources = "\n".join(f"🔹 {name}" for name in PIRATE_VIP_SOURCES)
-    return (
-        f"{intro.strip()}\n\n"
-        "Есть 🏴‍☠️ PIRATE VIP FREE — бесплатная подборка постов сразу из 5 VIP-каналов:\n\n"
-        f"{sources}\n\n"
-        "Новые посты из этих VIP-каналов дублируются с задержкой до 0.5 секунды. "
-        "Совокупная стоимость отдельных доступов — более 1000$, а здесь всё бесплатно.\n\n"
-        f"Вот ссылка: {PIRATE_VIP_LINK}\n\n"
-        "Заходи и спокойно посмотри. Не спеши выходить — просто глянь, подходит ли тебе 🙂"
+    raw = _extract_output_text(response)
+    reply = _sanitize_short_text(
+        raw,
+        max_words=24,
+        allow_question=True,
+        fallback=fallback,
     )
+    if "?" not in reply:
+        reply = reply.rstrip(".! ") + "?"
+    return reply, tokens, model
+
+
+def _offer_wrapper_fallback() -> tuple[str, str]:
+    leads = (
+        "Тогда покажу по сути, без лишней воды 👇",
+        "Смотри, вот сама подборка и что в ней есть 👇",
+        "Тогда держи всю информацию в одном сообщении 👇",
+        "Вот о чём я говорил — коротко и по делу 👇",
+        "Показываю, чтобы ты сам спокойно оценил 👇",
+        "Тогда сразу к сути — вот что доступно бесплатно 👇",
+    )
+    closings = (
+        "Можешь зайти и спокойно посмотреть — никаких обязательств.",
+        "Просто загляни и сам реши, полезно тебе это или нет.",
+        "Не спеши выходить: посмотри публикации и оцени всё сам.",
+        "Зайди, полистай и спокойно сделай собственный вывод.",
+        "Можно просто посмотреть со стороны — всё уже открыто бесплатно.",
+        "Глянь без спешки: останешься только если реально зайдёт.",
+    )
+    return random.choice(leads), random.choice(closings)
+
+
+async def _generate_offer_wrapper(user_text: str) -> tuple[str, str, int, str]:
+    """Generate variable lead/closing while mandatory VIP facts stay local and exact."""
+    fallback_lead, fallback_close = _offer_wrapper_fallback()
+    api_key = config("OPENAI_API_KEY", default="").strip()
+    if not api_key:
+        return fallback_lead, fallback_close, 0, "local_offer_wrapper"
+
+    model = config("AI_MODEL", default="gpt-4o-mini").strip()
+    from openai import AsyncOpenAI
+
+    style = random.choice((
+        "дружелюбно и по-простому",
+        "коротко и уверенно",
+        "спокойно и ненавязчиво",
+        "живым разговорным языком",
+        "с лёгкой интригой",
+        "максимально естественно",
+    ))
+    client = AsyncOpenAI(api_key=api_key)
+    response = await client.responses.create(
+        model=model,
+        instructions=(
+            "Сформируй две разные короткие фразы для третьего сообщения Telegram-диалога. "
+            "Первая — естественный переход к предложению, вторая — мягкое завершение без давления. "
+            "Первое приветствие уже было: не здоровайся. Не задавай вопросов. Не используй ссылки, "
+            "названия каналов, цифры 0.5 или 1000, обещания прибыли и гарантии. Каждая фраза максимум "
+            "14 слов. Ответь строго в формате двух строк:\nLEAD: ...\nCLOSE: ...\nТон: " + style + "."
+        ),
+        input=[{"role": "user", "content": user_text}],
+        max_output_tokens=_safe_int("AI_OFFER_INTRO_MAX_TOKENS", 48, min_value=32, max_value=128),
+    )
+    usage = getattr(response, "usage", None)
+    tokens = int(getattr(usage, "total_tokens", 0) or 0) if usage is not None else 0
+    raw = _extract_output_text(response)
+
+    lead = ""
+    close = ""
+    for line in raw.splitlines():
+        stripped = line.strip()
+        upper = stripped.upper()
+        if upper.startswith("LEAD:"):
+            lead = stripped.split(":", 1)[1].strip()
+        elif upper.startswith("CLOSE:"):
+            close = stripped.split(":", 1)[1].strip()
+
+    lead = _sanitize_short_text(
+        lead,
+        max_words=14,
+        allow_question=False,
+        fallback=fallback_lead,
+    )
+    close = _sanitize_short_text(
+        close,
+        max_words=14,
+        allow_question=False,
+        fallback=fallback_close,
+    )
+    return lead, close, tokens, model
+
+
+def _build_varied_offer_reply(lead: str, close: str) -> str:
+    """Build message #3.
+
+    Lead, layout and closing vary. The five sources, mirroring delay, combined
+    access value, free access and exact invitation link are always present.
+    """
+    sources = "\n".join(f"🔹 {name}" for name in PIRATE_VIP_SOURCES)
+    layouts = (
+        (
+            f"{lead}\n\n"
+            "Есть 🏴‍☠️ PIRATE VIP FREE — бесплатная подборка постов сразу из 5 VIP-каналов:\n\n"
+            f"{sources}\n\n"
+            "Новые посты из этих VIP-каналов дублируются с задержкой до 0.5 секунды. "
+            "Совокупная стоимость отдельных доступов — более 1000$, а здесь всё бесплатно.\n\n"
+            f"Ссылка: {PIRATE_VIP_LINK}\n\n"
+            f"{close}"
+        ),
+        (
+            f"{lead}\n\n"
+            "🏴‍☠️ PIRATE VIP FREE собирает новые публикации из пяти закрытых источников "
+            "с задержкой до 0.5 секунды. Отдельно эти доступы стоят совокупно более 1000$, "
+            "а здесь смотреть их можно бесплатно.\n\n"
+            f"Внутри:\n{sources}\n\n"
+            f"Вот ссылка: {PIRATE_VIP_LINK}\n\n"
+            f"{close}"
+        ),
+        (
+            f"{lead}\n\n"
+            "Что внутри 🏴‍☠️ PIRATE VIP FREE:\n\n"
+            f"{sources}\n\n"
+            "Все новые посты дублируются в одно место с задержкой до 0.5 секунды. "
+            "Совокупная стоимость пяти отдельных VIP-доступов — более 1000$, но подборка бесплатная.\n\n"
+            f"Зайти можно здесь: {PIRATE_VIP_LINK}\n\n"
+            f"{close}"
+        ),
+    )
+    return random.choice(layouts)
 
 
 def _latest_first_dm_message_id(dialog_id: int) -> int:
@@ -541,10 +713,7 @@ def _latest_first_dm_message_id(dialog_id: int) -> int:
 
 
 def _dialog_has_sent_offer(dialog_id: int) -> bool:
-    """Detect an offer sent after the latest first DM in the current cycle.
-
-    Older offers must not suppress the reply to a newly delivered first DM.
-    """
+    """Detect an offer sent after the latest first DM in the current cycle."""
     cycle_start_id = _latest_first_dm_message_id(dialog_id)
     cursor = conn.cursor()
     try:
@@ -619,6 +788,16 @@ async def _send_post_offer_apology(
     logger.info(f"[AI DM] one-time post-offer apology sent: dialog={dialog.id}, user={sender.id}")
 
 
+async def _reply_delay() -> None:
+    dmin = _safe_int("AI_REPLY_DELAY_MIN_SECONDS", 15, min_value=0, max_value=3600)
+    dmax = _safe_int("AI_REPLY_DELAY_MAX_SECONDS", 60, min_value=0, max_value=3600)
+    if dmax < dmin:
+        dmax = dmin
+    delay = random.randint(dmin, dmax)
+    if delay:
+        await asyncio.sleep(delay)
+
+
 async def handle_private_incoming(
     *,
     dm_task_id: int,
@@ -628,14 +807,16 @@ async def handle_private_incoming(
     text: str,
     message_id: int | None = None,
 ) -> None:
-    """Handle a private reply with a strict two-step compact funnel.
+    """Handle a private reply with a strict three-message funnel.
 
     Outgoing sequence:
       1. Existing random first DM (sent by the DM worker).
-      2. One concise offer containing all mandatory facts and the exact link.
-      3. Optional one-time apology only when the user explicitly rejects/opts out.
+      2. One short attention/continuation reply without a repeated greeting.
+      3. One varied VIP offer with all mandatory facts and the exact link.
+      4. Optional one-time apology only when the user explicitly rejects after link.
 
-    After the offer link has been sent, all other incoming messages are ignored.
+    The offer is sent only after the user's second reply. After the link, all
+    ordinary incoming messages are ignored.
     """
     if not ai_enabled():
         return
@@ -673,9 +854,6 @@ async def handle_private_incoming(
         human_words = _csv_words("AI_HUMAN_TAKEOVER_WORDS", HUMAN_WORDS_DEFAULT)
         offer_already_sent = _dialog_has_sent_offer(dialog.id)
 
-        # Existing conversations from older versions may still be marked active
-        # even though the link was already sent. Close them on the next incoming
-        # message and never restart the long conversation.
         if offer_already_sent:
             _save_message(dialog.id, "incoming", text, provider="telegram")
             _mark_incoming(dialog.id)
@@ -741,56 +919,106 @@ async def handle_private_incoming(
             logger.info(f"[AI DM] human takeover: dialog={dialog.id}, user={sender.id}")
             return
 
-        dmin = _safe_int("AI_REPLY_DELAY_MIN_SECONDS", 15, min_value=0, max_value=3600)
-        dmax = _safe_int("AI_REPLY_DELAY_MAX_SECONDS", 60, min_value=0, max_value=3600)
-        if dmax < dmin:
-            dmax = dmin
-        delay = random.randint(dmin, dmax)
-        if delay:
-            await asyncio.sleep(delay)
+        await _reply_delay()
 
-        # The dialog may have been stopped during the delay.
+        # The dialog may have been stopped or advanced by another event during delay.
         dialog = _get_dialog_by_id(dialog.id) or dialog
         if dialog.status != "active" or _dialog_has_sent_offer(dialog.id):
             return
 
-        try:
-            intro, tokens, model = await _generate_offer_intro(text)
-        except Exception as exc:
-            logger.error(f"[AI DM] OpenAI intro error for dialog={dialog.id}, user={sender.id}: {exc}")
-            intro, tokens, model = _offer_intro_fallback(), 0, "local_intro"
+        stage = (dialog.stage or "new_contact").strip().lower()
+        attention_stages = {"new_contact", "first_dm_sent", "active", "qualify"}
 
-        reply = _canonical_offer_reply(intro)
+        if stage in attention_stages:
+            try:
+                reply, tokens, model = await _generate_attention_reply(text)
+            except Exception as exc:
+                logger.error(
+                    f"[AI DM] OpenAI attention error for dialog={dialog.id}, user={sender.id}: {exc}"
+                )
+                reply, tokens, model = _attention_fallback(), 0, "local_attention"
 
-        if ai_dry_run():
-            logger.info(f"[AI DM DRY RUN compact offer] user={sender.id}: {reply}")
+            if ai_dry_run():
+                logger.info(f"[AI DM DRY RUN attention] user={sender.id}: {reply}")
+                _save_message(
+                    dialog.id,
+                    "system",
+                    f"[DRY RUN attention] {reply}",
+                    provider="dry_run",
+                    model=model,
+                    tokens_used=tokens,
+                )
+                return
+
+            sent = await _safe_send_message(client, sender, reply, "attention_reply")
+            if not sent:
+                _set_dialog_status(dialog.id, "send_error", "telegram_send_failed", stage="send_error")
+                return
             _save_message(
                 dialog.id,
-                "system",
-                f"[DRY RUN compact offer] {reply}",
-                provider="dry_run",
+                "outgoing",
+                reply,
+                provider="openai" if model != "local_attention" else "local",
                 model=model,
                 tokens_used=tokens,
             )
+            _mark_outgoing(dialog.id)
+            _set_stage(dialog.id, "attention_sent")
+            logger.info(
+                f"[AI DM] attention reply sent; waiting second user reply: "
+                f"dialog={dialog.id}, user={sender.id}"
+            )
             return
 
-        sent = await _safe_send_message(client, sender, reply, "compact_offer")
-        if not sent:
-            _set_dialog_status(dialog.id, "send_error", "telegram_send_failed", stage="send_error")
+        if stage == "attention_sent":
+            try:
+                lead, close, tokens, model = await _generate_offer_wrapper(text)
+            except Exception as exc:
+                logger.error(
+                    f"[AI DM] OpenAI offer-wrapper error for dialog={dialog.id}, user={sender.id}: {exc}"
+                )
+                lead, close = _offer_wrapper_fallback()
+                tokens, model = 0, "local_offer_wrapper"
+
+            reply = _build_varied_offer_reply(lead, close)
+
+            if ai_dry_run():
+                logger.info(f"[AI DM DRY RUN varied offer] user={sender.id}: {reply}")
+                _save_message(
+                    dialog.id,
+                    "system",
+                    f"[DRY RUN varied offer] {reply}",
+                    provider="dry_run",
+                    model=model,
+                    tokens_used=tokens,
+                )
+                return
+
+            sent = await _safe_send_message(client, sender, reply, "varied_offer")
+            if not sent:
+                _set_dialog_status(dialog.id, "send_error", "telegram_send_failed", stage="send_error")
+                return
+            _save_message(
+                dialog.id,
+                "outgoing",
+                reply,
+                provider="openai+local" if model != "local_offer_wrapper" else "local",
+                model=model,
+                tokens_used=tokens,
+            )
+            _mark_outgoing(dialog.id)
+            _set_dialog_status(dialog.id, "completed", "offer_sent", stage="completed")
+            logger.info(
+                f"[AI DM] varied offer sent and dialog completed: dialog={dialog.id}, user={sender.id}"
+            )
             return
 
-        _save_message(
-            dialog.id,
-            "outgoing",
-            reply,
-            provider="openai+local" if model != "local_intro" else "local",
-            model=model,
-            tokens_used=tokens,
-        )
-        _mark_outgoing(dialog.id)
-        _set_dialog_status(dialog.id, "completed", "offer_sent", stage="completed")
-        logger.info(
-            f"[AI DM] compact offer sent and dialog completed: dialog={dialog.id}, user={sender.id}"
+        # Backward-compatible recovery for an unknown active stage: do not send an
+        # offer prematurely. Restart from the attention step and wait for one more reply.
+        _set_stage(dialog.id, "first_dm_sent")
+        logger.warning(
+            f"[AI DM] unknown active stage reset to first_dm_sent: "
+            f"dialog={dialog.id}, user={sender.id}, stage={stage}"
         )
 
 
@@ -841,7 +1069,7 @@ def ai_stats() -> dict[str, Any]:
         "messages_today": messages_today,
         "dialogs_today": dialogs_today,
         "daily_dialog_limit": _safe_int("AI_DAILY_DIALOG_LIMIT", 0, min_value=0),
-        "funnel_mode": "compact_offer_once",
+        "funnel_mode": "three_message_varied_offer",
         "close_after_offer": True,
         "post_offer_apology": True,
     }

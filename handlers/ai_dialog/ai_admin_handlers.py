@@ -34,7 +34,8 @@ async def cmd_ai_status(event: callback_message) -> None:
         + (f" / лимит {s['daily_dialog_limit']}" if s.get('daily_dialog_limit') else "")
         + "\n"
         f"Сообщений сегодня: {s['messages_today']}\n"
-        "Режим: компактный — одно предложение со ссылкой\n"
+        "Режим: 3 сообщения — первое DM → внимание → VIP-предложение\n"
+        "VIP-предложение: формулировки меняются, обязательные факты сохраняются\n"
         "После ссылки: диалог закрывается\n"
         "При отказе: максимум одно извинение\n\n"
         "Команды: /ai_dialogs, /ai_stop USER_ID, /ai_resume USER_ID, /ai_export",
@@ -137,7 +138,8 @@ async def menu_ai_status(event):
         + (f" / лимит {s['daily_dialog_limit']}" if s.get('daily_dialog_limit') else "")
         + "\n"
         f"Сообщений сегодня: {s['messages_today']}\n"
-        "Режим: компактный — одно предложение со ссылкой\n"
+        "Режим: 3 сообщения — первое DM → внимание → VIP-предложение\n"
+        "VIP-предложение: формулировки меняются, обязательные факты сохраняются\n"
         "После ссылки: диалог закрывается\n"
         "При отказе: максимум одно извинение",
         buttons=[[Button.inline("🏠 Главное меню", b"menu_home")]],
