@@ -54,7 +54,7 @@ dm_monitor_clients: dict = {}   # task_id → TelegramClient
 dm_monitor_tasks: dict = {}     # task_id → asyncio.Task
 
 # ─── очереди отправки (рандомайзер) ───────────────────────────────────────────
-# task_id → deque of (target_user_id, sender_obj)
+# task_id → deque of (target_user_id, sender_obj, source_chat_title)
 dm_send_queues: dict = {}
 
 
@@ -254,7 +254,7 @@ async def _send_worker(task_id: int, client: TelegramClient) -> None:
         queue.clear()
         queue.extend(items)
 
-        target_id, sender = queue.popleft()
+        target_id, sender, source_chat_title = queue.popleft()
 
         # Повторная проверка перед отправкой
         if _is_blacklisted(task_id, target_id):
@@ -286,6 +286,7 @@ async def _send_worker(task_id: int, client: TelegramClient) -> None:
                     account_user_id=t["user_id"],
                     target=sender,
                     text=outgoing_text,
+                    source_chat_title=source_chat_title,
                 )
             except Exception as exc:
                 # The Telegram message was already delivered. AI history failure must
@@ -305,13 +306,13 @@ async def _send_worker(task_id: int, client: TelegramClient) -> None:
         except PeerFloodError:
             logger.warning(f"[DM {task_id}] 🌊 PeerFlood — пауза 10 мин")
             await asyncio.sleep(600)
-            queue.appendleft((target_id, sender))  # вернуть в очередь
+            queue.appendleft((target_id, sender, source_chat_title))  # вернуть в очередь
             continue
 
         except FloodWaitError as e:
             logger.warning(f"[DM {task_id}] ⏳ FloodWait {e.seconds}s")
             await asyncio.sleep(e.seconds)
-            queue.appendleft((target_id, sender))
+            queue.appendleft((target_id, sender, source_chat_title))
             continue
 
         except Exception as exc:
@@ -409,10 +410,20 @@ async def _monitor_loop(task_id: int) -> None:
 
             # Проверяем, не в очереди ли уже
             queue = dm_send_queues.get(task_id, deque())
-            if any(uid == target_id for uid, _ in queue):
+            if any(item[0] == target_id for item in queue):
                 return
 
-            queue.append((target_id, sender))
+            source_chat_title = None
+            try:
+                source_chat = await event.get_chat()
+                source_chat_title = getattr(source_chat, "title", None)
+            except Exception as exc:
+                logger.debug(
+                    f"[DM {task_id}] не удалось получить название исходного чата "
+                    f"для user={target_id}: {exc}"
+                )
+
+            queue.append((target_id, sender, source_chat_title))
             logger.debug(f"[DM {task_id}] добавлен в очередь: {target_id}, размер очереди: {len(queue)}")
 
         # Держим клиент живым
