@@ -1,0 +1,46 @@
+AUDIT: TgBlaster DM + AI Dialog v1.0.6
+
+SCOPE
+- Source base: v1.0.5 audit_no_new_restrictions.
+- Functional code changes are limited to:
+  1. services/ai_dialog_service.py
+  2. handlers/ai_dialog/ai_admin_handlers.py
+- Documentation/config examples changed:
+  .env.example, README.md, VERSION, patch notes, this audit.
+- DM/group/account/broadcast code is byte-for-byte inherited from v1.0.5.
+
+CHECKS COMPLETED
+- Python AST parse: 38 files OK.
+- compileall: OK.
+- Runtime import with installed project dependencies and dummy credentials: OK.
+- Registered Telethon event handlers: 77.
+- SQLite core/DM/AI schema creation: OK.
+- Main menu DM/AI button presence: OK.
+- DM callback handlers menu_dm_post/menu_dm_list/menu_dm_stop: present.
+- Compact AI behavior test: OK.
+- Mandatory 5-source list test: OK.
+- Exact telegram.me invite link test: OK.
+- No t.me replacement of the canonical link: OK.
+- Stop after link: OK.
+- One-time post-offer apology: OK.
+- Second apology blocked: OK.
+- Legacy active dialog already containing link: closed without further conversation.
+- Stop phrase before offer: old stop behavior preserved.
+- Duplicate incoming Telegram message protection: preserved.
+- Secret scan: no real Telegram/OpenAI credentials found.
+- Archive cleanliness: no .env, .session, database, log, pyc or __pycache__ files.
+
+IMPORTANT BEHAVIOR
+- Normal outgoing sequence is two messages total:
+  1. random first DM;
+  2. complete PIRATE VIP FREE information block with link.
+- A third outgoing message is possible only as one short apology after an explicit opt-out.
+- The AI cannot replace or modify the mandatory source list, delay, value statement or invite link because these are appended locally in code.
+
+UNCHANGED CORE MECHANIC
+- The mechanic "user writes in a tracked group -> connected account sends the first private DM" was not changed.
+- Ordinary group membership remains sufficient. Admin/owner rights are not required.
+
+LIMITATIONS OF THIS AUDIT
+- No live Telegram account, Railway deployment or paid OpenAI request was used.
+- Telegram/OpenAI integration was tested through runtime imports and controlled fake-client tests.
