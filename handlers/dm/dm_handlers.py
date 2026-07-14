@@ -38,7 +38,7 @@ from config import (
 )
 from utils.database.database import create_dm_tables
 from utils.telegram import gid_key
-from services.first_message import choose_first_dm_text
+from services.first_message import choose_first_dm_text, is_random_first_dm_enabled
 from services.ai_dialog_service import handle_private_incoming, record_first_dm
 
 # ─── состояние диалога настройки ──────────────────────────────────────────────
@@ -580,11 +580,25 @@ async def dm_chats_done(event: callback_query) -> None:
     if not st["selected_chats"]:
         await event.answer("⚠ Выберите хотя бы один чат!", alert=True)
         return
-    st["step"] = "text"
-    await render_menu(event, 
-        f"✅ Выбрано чатов: {len(st['selected_chats'])}\n\n"
-        "📝 Введите текст сообщения для ЛС:"
-    )
+    if is_random_first_dm_enabled():
+        # В случайном режиме ручной текст не нужен: при каждой отправке
+        # choose_first_dm_text() выберет один из встроенных/пользовательских шаблонов.
+        st["post_text"] = ""
+        st["step"] = "interval"
+        await render_menu(
+            event,
+            f"✅ Выбрано чатов: {len(st['selected_chats'])}\n\n"
+            "🎲 Случайное первое сообщение включено. Ручной текст вводить не нужно.\n\n"
+            "⏱ **Интервал повтора** (минуты) — через сколько минут можно снова написать "
+            "одному и тому же человеку:\n_(например: `60`)_",
+        )
+    else:
+        st["step"] = "text"
+        await render_menu(
+            event,
+            f"✅ Выбрано чатов: {len(st['selected_chats'])}\n\n"
+            "📝 Введите текст сообщения для ЛС:",
+        )
     await event.answer()
 
 
