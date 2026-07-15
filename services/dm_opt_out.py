@@ -21,7 +21,7 @@ _table_ready = False
 
 
 def _now_iso() -> str:
-    return datetime.datetime.utcnow().isoformat()
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
 def create_opt_out_table() -> None:
@@ -169,6 +169,16 @@ def add_opt_out(
                 now,
             ),
         )
+        # Cancel any not-yet-delivered persistent first-DM reservations. The live
+        # queue purger below handles in-memory entries for every connected account.
+        if cursor.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='dm_first_dm_claims'"
+        ).fetchone():
+            cursor.execute(
+                "DELETE FROM dm_first_dm_claims WHERE target_user_id = ?",
+                (int(target_user_id),),
+            )
         conn.commit()
     finally:
         cursor.close()

@@ -1,7 +1,4 @@
-from services.menu_ui import render_menu
-from services.admin_state import clear_admin_interaction_state, is_command_event
-"""
-DM Autoposter — автопостер в личные сообщения.
+"""DM Autoposter — автопостер в личные сообщения.
 
 Фичи:
   - Случайная задержка между отправками (мин-макс секунд)
@@ -10,12 +7,16 @@ DM Autoposter — автопостер в личные сообщения.
   - Интервал повтора одному человеку (уже был)
 """
 
+from services.menu_ui import render_menu
+from services.admin_state import clear_admin_interaction_state, is_command_event
+
 import asyncio
 import datetime
 import random
 from collections import deque
 from loguru import logger
 from typing import Optional
+from weakref import WeakValueDictionary
 
 from telethon import TelegramClient, events
 from telethon.errors import (
@@ -41,6 +42,15 @@ from utils.telegram import gid_key
 from services.first_message import choose_first_dm_text, is_random_first_dm_enabled
 from services.ai_dialog_service import handle_private_incoming, record_first_dm
 from services.dm_opt_out import is_opted_out, register_queue_purger
+from services.dm_contact_analytics import (
+    is_completed_contact,
+    is_contact_in_progress,
+    record_first_dm as record_contact_first_dm,
+    record_source_seen,
+    register_completed_queue_purger,
+    release_first_dm_claim,
+    try_claim_first_dm,
+)
 from services.dm_task_cleanup import (
     count_active_dm_tasks,
     count_inactive_dm_tasks,
@@ -61,6 +71,26 @@ dm_send_queues: dict = {}
 # Название исходного чата хранится отдельно, чтобы не менять рабочий формат
 # очереди первого DM: (task_id, target_user_id) → source_chat_title.
 dm_source_chat_titles: dict[tuple[int, int], str] = {}
+dm_source_chat_ids: dict[tuple[int, int], int] = {}
+
+# Serialize the final eligibility check and actual first-DM delivery for one
+# sender-account/recipient pair. This prevents two active DM tasks of the same
+# connected account from sending duplicate first messages at the same moment.
+_contact_send_locks: WeakValueDictionary[tuple[int, int], asyncio.Lock] = WeakValueDictionary()
+
+
+def _get_contact_send_lock(account_user_id: int, target_user_id: int) -> asyncio.Lock:
+    key = (int(account_user_id), int(target_user_id))
+    lock = _contact_send_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _contact_send_locks[key] = lock
+    return lock
+
+
+def _drop_source_metadata(task_id: int, target_user_id: int) -> None:
+    dm_source_chat_titles.pop((int(task_id), int(target_user_id)), None)
+    dm_source_chat_ids.pop((int(task_id), int(target_user_id)), None)
 
 
 def _purge_user_from_all_dm_queues(target_user_id: int) -> int:
@@ -78,10 +108,44 @@ def _purge_user_from_all_dm_queues(target_user_id: int) -> int:
             )
     for key in [key for key in dm_source_chat_titles if key[1] == target_user_id]:
         dm_source_chat_titles.pop(key, None)
+    for key in [key for key in dm_source_chat_ids if key[1] == target_user_id]:
+        dm_source_chat_ids.pop(key, None)
     return removed
 
 
 register_queue_purger(_purge_user_from_all_dm_queues)
+
+
+def _purge_completed_user_from_account_queues(
+    account_user_id: int, target_user_id: int
+) -> int:
+    """Remove stale queued copies for the account that finished the dialog.
+
+    This is essential for the approved cleanup semantics: after an administrator
+    clears a completed-contact block, no old queue entry may fire immediately. A
+    fresh group message must be observed first.
+    """
+    removed = 0
+    account_user_id = int(account_user_id)
+    target_user_id = int(target_user_id)
+    for task_id, queue in list(dm_send_queues.items()):
+        task = _get_task(task_id)
+        if not task or int(task["user_id"]) != account_user_id:
+            continue
+        kept = [item for item in queue if int(item[0]) != target_user_id]
+        removed += len(queue) - len(kept)
+        if len(kept) != len(queue):
+            queue.clear()
+            queue.extend(kept)
+            _drop_source_metadata(task_id, target_user_id)
+            logger.info(
+                f"[DM completed] account={account_user_id} user={target_user_id} "
+                f"removed from task={task_id} queue"
+            )
+    return removed
+
+
+register_completed_queue_purger(_purge_completed_user_from_account_queues)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -89,7 +153,7 @@ register_queue_purger(_purge_user_from_all_dm_queues)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _now_iso() -> str:
-    return datetime.datetime.utcnow().isoformat()
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
 def _minutes_since(iso_ts: str) -> float:
@@ -102,7 +166,7 @@ def _minutes_since(iso_ts: str) -> float:
         now = datetime.datetime.now(datetime.timezone.utc)
         dt = dt.astimezone(datetime.timezone.utc)
     else:
-        now = datetime.datetime.utcnow()
+        now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
     return max(0.0, (now - dt).total_seconds() / 60)
 
 
@@ -148,6 +212,16 @@ def _log_event(task_id: int, target_user_id: int, status: str) -> None:
     )
     conn.commit()
     cursor.close()
+
+
+def _safe_log_event(task_id: int, target_user_id: int, status: str) -> None:
+    """Persist technical delivery status without turning a sent DM into a retry."""
+    try:
+        _log_event(task_id, target_user_id, status)
+    except Exception as exc:
+        logger.error(
+            f"[DM {task_id}] не удалось сохранить статус {status} для {target_user_id}: {exc}"
+        )
 
 
 def _get_task(task_id: int) -> Optional[dict]:
@@ -258,23 +332,23 @@ async def _resolve_watched_chats(
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def _send_worker(task_id: int, client: TelegramClient) -> None:
-    """
-    Отдельная корутина — разгребает очередь dm_send_queues[task_id].
-    Между каждой отправкой — случайная пауза delay_min..delay_max секунд.
-    Очередь периодически перемешивается для рандомного порядка.
+    """Drain one task's unchanged two-item first-DM queue safely.
+
+    The queue format remains exactly ``(target_user_id, sender_obj)``. A shared
+    account/user lock only serializes the final check and delivery so parallel
+    tasks of the same connected account cannot send duplicate first messages.
     """
     queue = dm_send_queues.setdefault(task_id, deque())
 
     while True:
-        t = _get_task(task_id)
-        if not t or not t["is_active"]:
+        task = _get_task(task_id)
+        if not task or not task["is_active"]:
             return
 
         if not queue:
             await asyncio.sleep(2)
             continue
 
-        # Перемешиваем очередь перед каждой серией
         items = list(queue)
         random.shuffle(items)
         queue.clear()
@@ -282,84 +356,160 @@ async def _send_worker(task_id: int, client: TelegramClient) -> None:
 
         target_id, sender = queue.popleft()
         source_chat_title = dm_source_chat_titles.get((task_id, target_id))
+        source_chat_id = dm_source_chat_ids.get((task_id, target_id))
+        retry_delay: Optional[int] = None
+        claim_token: Optional[str] = None
 
-        # Постоянный opt-out: пользователь сам попросил больше не писать.
-        if is_opted_out(target_id):
-            logger.debug(f"[DM {task_id}] {target_id} в постоянном opt-out, пропуск")
-            dm_source_chat_titles.pop((task_id, target_id), None)
-            continue
+        lock = _get_contact_send_lock(task["user_id"], target_id)
+        async with lock:
+            # Re-read the task and all recipient guards inside the shared lock.
+            task = _get_task(task_id)
+            if not task or not task["is_active"]:
+                _drop_source_metadata(task_id, target_id)
+                return
 
-        # Повторная проверка перед отправкой
-        if _is_blacklisted(task_id, target_id):
-            logger.debug(f"[DM {task_id}] {target_id} в blacklist, пропуск")
-            continue
-        if _already_sent_recently(task_id, target_id, t["interval_minutes"]):
-            logger.debug(f"[DM {task_id}] {target_id} недавно получал, пропуск")
-            continue
-
-        # Отправка
-        try:
-            outgoing_text = choose_first_dm_text(t["post_text"] or "") or (t["post_text"] or "Привет 👋")
-            if t["photo_url"]:
-                # Telegram ограничивает caption до 1024 символов
-                if outgoing_text and len(outgoing_text) <= 1024:
-                    await client.send_file(sender, t["photo_url"], caption=outgoing_text)
-                else:
-                    # Текст слишком длинный — фото и текст отдельно
-                    await client.send_file(sender, t["photo_url"])
-                    if outgoing_text:
-                        await client.send_message(sender, outgoing_text)
-            else:
-                await client.send_message(sender, outgoing_text)
-
-            _log_event(task_id, target_id, "sent")
-            try:
-                record_first_dm(
-                    dm_task_id=task_id,
-                    account_user_id=t["user_id"],
-                    target=sender,
-                    text=outgoing_text,
-                    source_chat_title=source_chat_title,
+            if is_opted_out(target_id):
+                logger.debug(f"[DM {task_id}] {target_id} в постоянном opt-out, пропуск")
+                _drop_source_metadata(task_id, target_id)
+                continue
+            if is_completed_contact(task["user_id"], target_id):
+                logger.debug(
+                    f"[DM {task_id}] {target_id}: этот аккаунт уже завершил диалог, пропуск"
                 )
+                _drop_source_metadata(task_id, target_id)
+                continue
+            if is_contact_in_progress(task["user_id"], target_id):
+                logger.debug(
+                    f"[DM {task_id}] {target_id}: у этого аккаунта уже идёт диалог, пропуск"
+                )
+                _drop_source_metadata(task_id, target_id)
+                continue
+            if _is_blacklisted(task_id, target_id):
+                logger.debug(f"[DM {task_id}] {target_id} в blacklist, пропуск")
+                _drop_source_metadata(task_id, target_id)
+                continue
+            if _already_sent_recently(task_id, target_id, task["interval_minutes"]):
+                logger.debug(f"[DM {task_id}] {target_id} недавно получал, пропуск")
+                _drop_source_metadata(task_id, target_id)
+                continue
+
+            claim_token = try_claim_first_dm(
+                account_user_id=task["user_id"],
+                target_user_id=target_id,
+                dm_task_id=task_id,
+                source_chat_id=source_chat_id,
+            )
+            if not claim_token:
+                logger.debug(
+                    f"[DM {task_id}] {target_id}: first-DM claim занят или контакт уже закрыт"
+                )
+                _drop_source_metadata(task_id, target_id)
+                continue
+
+            outgoing_text = (
+                choose_first_dm_text(task["post_text"] or "")
+                or (task["post_text"] or "Привет 👋")
+            )
+
+            try:
+                if task["photo_url"]:
+                    if outgoing_text and len(outgoing_text) <= 1024:
+                        await client.send_file(
+                            sender, task["photo_url"], caption=outgoing_text
+                        )
+                    else:
+                        await client.send_file(sender, task["photo_url"])
+                        if outgoing_text:
+                            await client.send_message(sender, outgoing_text)
+                else:
+                    await client.send_message(sender, outgoing_text)
+
+            except UserPrivacyRestrictedError:
+                release_first_dm_claim(task["user_id"], target_id, claim_token)
+                _safe_log_event(task_id, target_id, "privacy")
+                logger.info(
+                    f"[DM {task_id}] 🔒 {target_id} закрыл ЛС — в blacklist на 24ч"
+                )
+                _drop_source_metadata(task_id, target_id)
+
+            except (UserIsBlockedError, InputUserDeactivatedError):
+                release_first_dm_claim(task["user_id"], target_id, claim_token)
+                _safe_log_event(task_id, target_id, "blocked")
+                logger.debug(
+                    f"[DM {task_id}] ⛔ {target_id} заблокировал или деактивирован"
+                )
+                _drop_source_metadata(task_id, target_id)
+
+            except PeerFloodError:
+                release_first_dm_claim(task["user_id"], target_id, claim_token)
+                retry_delay = 600
+                logger.warning(f"[DM {task_id}] 🌊 PeerFlood — пауза 10 мин")
+
+            except FloodWaitError as exc:
+                release_first_dm_claim(task["user_id"], target_id, claim_token)
+                retry_delay = max(1, int(exc.seconds))
+                logger.warning(f"[DM {task_id}] ⏳ FloodWait {retry_delay}s")
+
             except Exception as exc:
-                # The Telegram message was already delivered. AI history failure must
-                # not turn a successful send into a false delivery error.
-                logger.error(f"[DM {task_id}] не удалось сохранить AI-диалог {target_id}: {exc}")
-            uname = getattr(sender, "username", None)
-            logger.info(f"[DM {task_id}] ✅ ЛС → {target_id} (@{uname or '?'})")
-            dm_source_chat_titles.pop((task_id, target_id), None)
+                release_first_dm_claim(task["user_id"], target_id, claim_token)
+                _safe_log_event(task_id, target_id, "error")
+                logger.error(f"[DM {task_id}] ❌ ошибка отправки {target_id}: {exc}")
+                _drop_source_metadata(task_id, target_id)
 
-        except UserPrivacyRestrictedError:
-            _log_event(task_id, target_id, "privacy")
-            logger.info(f"[DM {task_id}] 🔒 {target_id} закрыл ЛС — в blacklist на 24ч")
-            dm_source_chat_titles.pop((task_id, target_id), None)
+            else:
+                # Telegram already accepted the DM. Persistence failures below must
+                # never cause the same message to be retried or reported as unsent.
+                _safe_log_event(task_id, target_id, "sent")
+                contact_cycle_id: Optional[int] = None
+                try:
+                    contact_cycle_id = record_contact_first_dm(
+                        dm_task_id=task_id,
+                        account_user_id=task["user_id"],
+                        target_user_id=target_id,
+                        source_chat_id=source_chat_id,
+                        source_chat_title=source_chat_title,
+                        claim_token=claim_token,
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        f"[DM {task_id}] первое DM доставлено, но цикл контакта "
+                        f"для user={target_id} не сохранён; защитный claim оставлен: {exc}"
+                    )
 
-        except (UserIsBlockedError, InputUserDeactivatedError):
-            _log_event(task_id, target_id, "blocked")
-            logger.debug(f"[DM {task_id}] ⛔ {target_id} заблокировал или деактивирован")
-            dm_source_chat_titles.pop((task_id, target_id), None)
+                try:
+                    record_first_dm(
+                        dm_task_id=task_id,
+                        account_user_id=task["user_id"],
+                        target=sender,
+                        text=outgoing_text,
+                        source_chat_id=source_chat_id,
+                        source_chat_title=source_chat_title,
+                        contact_cycle_id=contact_cycle_id,
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        f"[DM {task_id}] первое DM доставлено, но AI-диалог "
+                        f"для user={target_id} не сохранён: {exc}"
+                    )
 
-        except PeerFloodError:
-            logger.warning(f"[DM {task_id}] 🌊 PeerFlood — пауза 10 мин")
-            await asyncio.sleep(600)
-            queue.appendleft((target_id, sender))  # вернуть в очередь
+                username = getattr(sender, "username", None)
+                logger.info(
+                    f"[DM {task_id}] ✅ ЛС → {target_id} (@{username or '?'})"
+                )
+                _drop_source_metadata(task_id, target_id)
+
+        if retry_delay is not None:
+            await asyncio.sleep(retry_delay)
+            latest = _get_task(task_id)
+            if latest and latest["is_active"]:
+                queue.appendleft((target_id, sender))
+            else:
+                _drop_source_metadata(task_id, target_id)
             continue
 
-        except FloodWaitError as e:
-            logger.warning(f"[DM {task_id}] ⏳ FloodWait {e.seconds}s")
-            await asyncio.sleep(e.seconds)
-            queue.appendleft((target_id, sender))
-            continue
-
-        except Exception as exc:
-            _log_event(task_id, target_id, "error")
-            logger.error(f"[DM {task_id}] ❌ ошибка отправки {target_id}: {exc}")
-            dm_source_chat_titles.pop((task_id, target_id), None)
-
-        # Случайная задержка между отправками
         try:
-            delay_min = max(0, int(t.get("delay_min") or 30))
-            delay_max = max(delay_min, int(t.get("delay_max") or 90))
+            delay_min = max(0, int(task.get("delay_min") or 30))
+            delay_max = max(delay_min, int(task.get("delay_max") or 90))
         except (TypeError, ValueError):
             delay_min, delay_max = 30, 90
         delay = random.randint(delay_min, delay_max)
@@ -440,9 +590,46 @@ async def _monitor_loop(task_id: int) -> None:
             if not t or not t["is_active"]:
                 return
 
+            source_chat_id = None
+            source_chat_title = None
+            try:
+                source_chat = await event.get_chat()
+                raw_chat_id = getattr(source_chat, "id", None)
+                source_chat_id = int(raw_chat_id) if raw_chat_id is not None else None
+                source_chat_title = getattr(source_chat, "title", None)
+            except Exception as exc:
+                logger.debug(
+                    f"[DM {task_id}] не удалось получить исходный чат для user={target_id}: {exc}"
+                )
+
+            if source_chat_id is not None:
+                try:
+                    record_source_seen(
+                        account_user_id=t["user_id"],
+                        target_user_id=target_id,
+                        source_chat_id=source_chat_id,
+                        source_chat_title=(
+                            str(source_chat_title) if source_chat_title else None
+                        ),
+                    )
+                except Exception as exc:
+                    # Analytics must never break the original group-message trigger.
+                    logger.error(
+                        f"[DM {task_id}] не удалось сохранить источник для "
+                        f"user={target_id}: {exc}"
+                    )
+
             # Глобальный постоянный opt-out действует для всех аккаунтов и задач.
             if is_opted_out(target_id):
                 logger.debug(f"[DM {task_id}] {target_id} в постоянном opt-out, в очередь не добавлен")
+                return
+            # Утверждённое правило: завершённый контакт блокирует повторный первый DM
+            # только для того подключённого аккаунта, который уже завершил диалог.
+            if is_completed_contact(t["user_id"], target_id):
+                logger.debug(f"[DM {task_id}] {target_id}: завершённый контакт этого аккаунта")
+                return
+            if is_contact_in_progress(t["user_id"], target_id):
+                logger.debug(f"[DM {task_id}] {target_id}: диалог этого аккаунта уже активен")
                 return
             if _is_blacklisted(task_id, target_id):
                 return
@@ -450,22 +637,14 @@ async def _monitor_loop(task_id: int) -> None:
                 return
 
             # Проверяем, не в очереди ли уже
-            queue = dm_send_queues.get(task_id, deque())
+            queue = dm_send_queues.setdefault(task_id, deque())
             if any(uid == target_id for uid, _ in queue):
                 return
 
-            source_chat_title = None
-            try:
-                source_chat = await event.get_chat()
-                source_chat_title = getattr(source_chat, "title", None)
-            except Exception as exc:
-                logger.debug(
-                    f"[DM {task_id}] не удалось получить название исходного чата "
-                    f"для user={target_id}: {exc}"
-                )
-
             if source_chat_title:
                 dm_source_chat_titles[(task_id, target_id)] = str(source_chat_title)
+            if source_chat_id is not None:
+                dm_source_chat_ids[(task_id, target_id)] = source_chat_id
 
             queue.append((target_id, sender))
             logger.debug(f"[DM {task_id}] добавлен в очередь: {target_id}, размер очереди: {len(queue)}")
@@ -507,6 +686,8 @@ async def _monitor_loop(task_id: int) -> None:
         dm_send_queues.pop(task_id, None)
         for key in [key for key in dm_source_chat_titles if key[0] == task_id]:
             dm_source_chat_titles.pop(key, None)
+        for key in [key for key in dm_source_chat_ids if key[0] == task_id]:
+            dm_source_chat_ids.pop(key, None)
 
 
 def _launch_monitor(task_id: int) -> None:
@@ -920,6 +1101,8 @@ async def menu_dm_cleanup_confirm(event: callback_query) -> None:
         dm_send_queues.pop(task_id, None)
         for key in [key for key in dm_source_chat_titles if key[0] == task_id]:
             dm_source_chat_titles.pop(key, None)
+        for key in [key for key in dm_source_chat_ids if key[0] == task_id]:
+            dm_source_chat_ids.pop(key, None)
 
     active_count = count_active_dm_tasks(conn)
 

@@ -25,13 +25,30 @@ from services.maxim_sales_funnel import (
     FunnelPlan,
     build_local_plan,
     generate_plan,
+    generate_post_link_plan,
     is_explicit_stop,
+    is_human_takeover_request,
+    post_link_final_messages,
 )
-from services.dm_opt_out import add_opt_out, migrate_legacy_closed_dialogs, opt_out_count
+from services.dm_opt_out import (
+    add_opt_out,
+    is_opted_out,
+    migrate_legacy_closed_dialogs,
+    opt_out_count,
+)
+from services.dm_contact_analytics import (
+    is_completed_contact,
+    mark_completed as mark_contact_completed,
+    mark_first_reply as mark_contact_first_reply,
+    mark_latest_first_reply,
+    mark_link_sent as mark_contact_link_sent,
+    mark_opted_out as mark_contact_opted_out,
+    touch_cycle as touch_contact_cycle,
+)
 
 
 def _now_iso() -> str:
-    return datetime.datetime.utcnow().isoformat()
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
 def _truthy(name: str, default: str = "false") -> bool:
@@ -50,11 +67,6 @@ def ai_dry_run() -> bool:
 def _csv_words(name: str, default: str) -> list[str]:
     raw = config(name, default=default)
     return [w.strip().lower() for w in raw.split(",") if w.strip()]
-
-
-def _contains_any(text: str, words: list[str]) -> bool:
-    lower = (text or "").lower()
-    return any(word in lower for word in words)
 
 
 def _safe_int(name: str, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
@@ -120,7 +132,7 @@ async def _safe_send_message(client: TelegramClient, target: User, text: str, co
         return False
 
 
-STOP_WORDS_DEFAULT = "стоп,не пиши,отстань,не интересно,не надо,удали,заблокирую,жалоба,спам"
+STOP_WORDS_DEFAULT = "не пиши,больше не пиши,отстань,не интересно,не надо,заблокирую"
 HUMAN_WORDS_DEFAULT = "админ,оператор,человек,менеджер,живой"
 
 # Per-user async locks protect against duplicate/parallel AI replies when several
@@ -145,7 +157,9 @@ class DialogRow:
     target_user_id: int
     username: Optional[str]
     first_name: Optional[str]
+    source_chat_id: Optional[int]
     source_chat_title: Optional[str]
+    contact_cycle_id: Optional[int]
     stage: str
     status: str
     message_count: int
@@ -162,7 +176,9 @@ def create_ai_tables() -> None:
             target_user_id INTEGER NOT NULL,
             username TEXT,
             first_name TEXT,
+            source_chat_id INTEGER,
             source_chat_title TEXT,
+            contact_cycle_id INTEGER,
             stage TEXT DEFAULT 'new_contact',
             status TEXT DEFAULT 'active',
             message_count INTEGER DEFAULT 0,
@@ -241,7 +257,9 @@ def create_ai_tables() -> None:
     for table, col, ddl in [
         ("ai_dialogs", "stopped_reason", "ALTER TABLE ai_dialogs ADD COLUMN stopped_reason TEXT"),
         ("ai_dialogs", "message_count", "ALTER TABLE ai_dialogs ADD COLUMN message_count INTEGER DEFAULT 0"),
+        ("ai_dialogs", "source_chat_id", "ALTER TABLE ai_dialogs ADD COLUMN source_chat_id INTEGER"),
         ("ai_dialogs", "source_chat_title", "ALTER TABLE ai_dialogs ADD COLUMN source_chat_title TEXT"),
+        ("ai_dialogs", "contact_cycle_id", "ALTER TABLE ai_dialogs ADD COLUMN contact_cycle_id INTEGER"),
         ("ai_messages", "tokens_used", "ALTER TABLE ai_messages ADD COLUMN tokens_used INTEGER DEFAULT 0"),
     ]:
         try:
@@ -264,7 +282,7 @@ def _get_dialog_by_target(account_user_id: int, target_user_id: int) -> Optional
     cursor = conn.cursor()
     cursor.execute(
         """SELECT id, dm_task_id, account_user_id, target_user_id, username, first_name,
-                  source_chat_title, stage, status, message_count, stopped_reason
+                  source_chat_id, source_chat_title, contact_cycle_id, stage, status, message_count, stopped_reason
            FROM ai_dialogs WHERE account_user_id = ? AND target_user_id = ?""",
         (account_user_id, target_user_id),
     )
@@ -277,7 +295,7 @@ def _get_dialog_by_id(dialog_id: int) -> Optional[DialogRow]:
     cursor = conn.cursor()
     cursor.execute(
         """SELECT id, dm_task_id, account_user_id, target_user_id, username, first_name,
-                  source_chat_title, stage, status, message_count, stopped_reason
+                  source_chat_id, source_chat_title, contact_cycle_id, stage, status, message_count, stopped_reason
            FROM ai_dialogs WHERE id = ?""",
         (dialog_id,),
     )
@@ -293,7 +311,9 @@ def _upsert_dialog(
     target_user_id: int,
     username: Optional[str],
     first_name: Optional[str],
+    source_chat_id: Optional[int] = None,
     source_chat_title: Optional[str] = None,
+    contact_cycle_id: Optional[int] = None,
 ) -> DialogRow:
     existing = _get_dialog_by_target(account_user_id, target_user_id)
     now = _now_iso()
@@ -302,9 +322,20 @@ def _upsert_dialog(
         cursor.execute(
             """UPDATE ai_dialogs SET dm_task_id = ?, username = COALESCE(?, username),
                       first_name = COALESCE(?, first_name),
-                      source_chat_title = COALESCE(?, source_chat_title), updated_at = ?
+                      source_chat_id = COALESCE(?, source_chat_id),
+                      source_chat_title = COALESCE(?, source_chat_title),
+                      contact_cycle_id = COALESCE(?, contact_cycle_id), updated_at = ?
                WHERE id = ?""",
-            (dm_task_id, username, first_name, source_chat_title, now, existing.id),
+            (
+                dm_task_id,
+                username,
+                first_name,
+                source_chat_id,
+                source_chat_title,
+                contact_cycle_id,
+                now,
+                existing.id,
+            ),
         )
         conn.commit()
         cursor.close()
@@ -312,10 +343,22 @@ def _upsert_dialog(
 
     cursor.execute(
         """INSERT INTO ai_dialogs
-           (dm_task_id, account_user_id, target_user_id, username, first_name, source_chat_title, stage,
+           (dm_task_id, account_user_id, target_user_id, username, first_name,
+            source_chat_id, source_chat_title, contact_cycle_id, stage,
             status, message_count, created_at, updated_at)
-           VALUES (?,?,?,?,?,?,'new_contact','active',0,?,?)""",
-        (dm_task_id, account_user_id, target_user_id, username, first_name, source_chat_title, now, now),
+           VALUES (?,?,?,?,?,?,?,?,'new_contact','active',0,?,?)""",
+        (
+            dm_task_id,
+            account_user_id,
+            target_user_id,
+            username,
+            first_name,
+            source_chat_id,
+            source_chat_title,
+            contact_cycle_id,
+            now,
+            now,
+        ),
     )
     dialog_id = cursor.lastrowid
     conn.commit()
@@ -366,6 +409,26 @@ def _set_stage(dialog_id: int, stage: str) -> None:
     cursor.close()
 
 
+def _finalize_completed_dialog(dialog: DialogRow, reason: str) -> None:
+    """Persist same-account repeat protection before closing the AI row.
+
+    The contact table is the source of truth for future first-DM eligibility. It
+    is written first so a partial database failure cannot leave a user exposed to
+    another first message after Максим has already finished the conversation.
+    When the original contact-cycle insert was lost after Telegram delivery, the
+    identity fields create a recovery protection record without inventing history.
+    """
+    mark_contact_completed(
+        dialog.contact_cycle_id,
+        reason,
+        account_user_id=dialog.account_user_id,
+        target_user_id=dialog.target_user_id,
+        source_chat_id=dialog.source_chat_id,
+        source_chat_title=dialog.source_chat_title,
+    )
+    _set_dialog_status(dialog.id, "completed", reason, stage="completed")
+
+
 def _mark_incoming(dialog_id: int) -> None:
     cursor = conn.cursor()
     cursor.execute("UPDATE ai_dialogs SET last_incoming_at = ?, updated_at = ? WHERE id = ?", (_now_iso(), _now_iso(), dialog_id))
@@ -391,7 +454,9 @@ def record_first_dm(
     account_user_id: int,
     target: User,
     text: str,
+    source_chat_id: Optional[int] = None,
     source_chat_title: Optional[str] = None,
+    contact_cycle_id: Optional[int] = None,
 ) -> None:
     """Create a new AI response cycle after a real first DM was delivered.
 
@@ -415,7 +480,9 @@ def record_first_dm(
         target_user_id=target.id,
         username=getattr(target, "username", None),
         first_name=getattr(target, "first_name", None),
+        source_chat_id=source_chat_id,
         source_chat_title=source_chat_title,
+        contact_cycle_id=contact_cycle_id,
     )
     _save_message(dialog.id, "outgoing", text, provider="dm_first", model="first_dm")
 
@@ -435,9 +502,19 @@ def record_first_dm(
             cursor.execute(
                 """UPDATE ai_dialogs
                    SET status = 'active', stage = 'first_dm_sent', stopped_reason = NULL,
+                       source_chat_id = COALESCE(?, source_chat_id),
+                       source_chat_title = COALESCE(?, source_chat_title),
+                       contact_cycle_id = COALESCE(?, contact_cycle_id),
                        last_outgoing_at = ?, updated_at = ?
                    WHERE id = ?""",
-                (_now_iso(), _now_iso(), dialog.id),
+                (
+                    source_chat_id,
+                    source_chat_title,
+                    contact_cycle_id,
+                    _now_iso(),
+                    _now_iso(),
+                    dialog.id,
+                ),
             )
             logger.info(
                 f"[AI DM] response cycle opened after first DM: "
@@ -568,6 +645,7 @@ def _persist_global_opt_out(
         username=getattr(sender, "username", None),
         first_name=getattr(sender, "first_name", None),
     )
+    mark_contact_opted_out(dialog.contact_cycle_id, reason)
     _set_dialog_status(dialog.id, "closed_negative", reason, stage="closed_negative")
 
 
@@ -726,6 +804,42 @@ async def _send_stop_reply(
     logger.info(f"[AI DM] explicit stop persisted: dialog={dialog.id}, user={sender.id}")
 
 
+async def _handle_stop_without_dialog(
+    *,
+    dm_task_id: int,
+    account_user_id: int,
+    client: TelegramClient,
+    sender: User,
+    contact_cycle_id: Optional[int],
+) -> None:
+    """Persist an explicit stop even if the AI row is missing or AI is disabled."""
+    already_saved = is_opted_out(int(sender.id))
+    add_opt_out(
+        int(sender.id),
+        reason="explicit_stop_without_ai_dialog",
+        source_account_user_id=int(account_user_id),
+        source_dm_task_id=int(dm_task_id),
+        username=getattr(sender, "username", None),
+        first_name=getattr(sender, "first_name", None),
+    )
+    mark_contact_opted_out(contact_cycle_id, "explicit_stop_without_ai_dialog")
+    if already_saved:
+        return
+
+    reply = config(
+        "AI_STOP_REPLY",
+        default="Понял, извини, что побеспокоил. Больше писать не буду.",
+    ).strip()
+    if ai_dry_run():
+        logger.info(f"[AI DM DRY RUN stop without dialog] user={sender.id}: {reply}")
+        return
+    sent = await _safe_send_message(client, sender, reply, "stop_without_ai_dialog")
+    if not sent:
+        logger.warning(
+            f"[AI DM] opt-out saved but stop reply without dialog failed: user={sender.id}"
+        )
+
+
 async def handle_private_incoming(
     *,
     dm_task_id: int,
@@ -740,10 +854,13 @@ async def handle_private_incoming(
     The first DM is still selected and sent exclusively by the existing DM path.
     This function starts only after the recipient replies to that delivered DM.
     """
-    if not ai_enabled():
+    text = (text or "").strip()
+    if not text:
         return
-    create_ai_tables()
 
+    # De-duplication and explicit opt-out remain active even when AI replies are
+    # temporarily disabled. A direct request to stop must never be lost.
+    create_ai_tables()
     if not _claim_incoming_message(account_user_id, sender.id, message_id):
         logger.debug(
             f"[AI DM] duplicate private message ignored: "
@@ -751,14 +868,55 @@ async def handle_private_incoming(
         )
         return
 
+    contact_cycle_id = mark_latest_first_reply(account_user_id, sender.id)
+    stop_words = _csv_words("AI_STOP_WORDS", STOP_WORDS_DEFAULT)
+    explicit_stop = is_explicit_stop(text, stop_words)
+
     lock = _get_dialog_lock(account_user_id, sender.id)
     async with lock:
         dialog = _get_dialog_by_target(account_user_id, sender.id)
+
+        if not ai_enabled():
+            if explicit_stop:
+                if dialog:
+                    _save_message(dialog.id, "incoming", text, provider="telegram")
+                    _mark_incoming(dialog.id)
+                    mark_contact_first_reply(dialog.contact_cycle_id)
+                    touch_contact_cycle(dialog.contact_cycle_id)
+                    if _dialog_has_sent_offer(dialog.id):
+                        await _send_post_offer_apology(
+                            dialog=dialog, client=client, sender=sender
+                        )
+                    else:
+                        await _send_stop_reply(
+                            dialog=dialog, client=client, sender=sender
+                        )
+                else:
+                    await _handle_stop_without_dialog(
+                        dm_task_id=dm_task_id,
+                        account_user_id=account_user_id,
+                        client=client,
+                        sender=sender,
+                        contact_cycle_id=contact_cycle_id,
+                    )
+            return
+
         if not dialog:
+            if explicit_stop:
+                await _handle_stop_without_dialog(
+                    dm_task_id=dm_task_id,
+                    account_user_id=account_user_id,
+                    client=client,
+                    sender=sender,
+                    contact_cycle_id=contact_cycle_id,
+                )
+                return
             if _truthy("AI_REPLY_ONLY_KNOWN_DIALOGS", "true"):
                 return
             if _daily_dialog_limit_reached():
-                logger.warning(f"[AI DM] daily dialog limit reached; skip incoming user={sender.id}")
+                logger.warning(
+                    f"[AI DM] daily dialog limit reached; skip incoming user={sender.id}"
+                )
                 return
             dialog = _upsert_dialog(
                 dm_task_id=dm_task_id,
@@ -766,37 +924,57 @@ async def handle_private_incoming(
                 target_user_id=sender.id,
                 username=getattr(sender, "username", None),
                 first_name=getattr(sender, "first_name", None),
+                contact_cycle_id=contact_cycle_id,
             )
 
-        text = (text or "").strip()
-        if not text:
-            return
-
-        stop_words = _csv_words("AI_STOP_WORDS", STOP_WORDS_DEFAULT)
         human_words = _csv_words("AI_HUMAN_TAKEOVER_WORDS", HUMAN_WORDS_DEFAULT)
         offer_already_sent = _dialog_has_sent_offer(dialog.id)
 
-        if offer_already_sent:
-            _save_message(dialog.id, "incoming", text, provider="telegram")
-            _mark_incoming(dialog.id)
-            if is_explicit_stop(text, stop_words):
-                await _send_post_offer_apology(dialog=dialog, client=client, sender=sender)
-            else:
-                _set_dialog_status(dialog.id, "completed", "offer_already_sent", stage="completed")
-                logger.info(f"[AI DM] post-offer message ignored: dialog={dialog.id}, user={sender.id}")
-            return
+        # Self-heal a rare partial-commit state: if the contact protection was
+        # saved but the AI row stayed active, close the AI side before processing
+        # another ordinary message. Explicit stop is still honoured below.
+        if dialog.status == "active" and is_completed_contact(
+            account_user_id, sender.id
+        ):
+            _set_dialog_status(
+                dialog.id,
+                "completed",
+                "completed_contact_guard",
+                stage="completed",
+            )
+            dialog = _get_dialog_by_id(dialog.id) or dialog
 
+        # A completed dialog is truly closed. The only later message we still
+        # process is an explicit request never to be contacted again.
         if dialog.status != "active":
+            if explicit_stop and dialog.status != "closed_negative":
+                _save_message(dialog.id, "incoming", text, provider="telegram")
+                _mark_incoming(dialog.id)
+                mark_contact_first_reply(dialog.contact_cycle_id)
+                touch_contact_cycle(dialog.contact_cycle_id)
+                if offer_already_sent:
+                    await _send_post_offer_apology(
+                        dialog=dialog, client=client, sender=sender
+                    )
+                else:
+                    await _send_stop_reply(dialog=dialog, client=client, sender=sender)
             return
 
         _save_message(dialog.id, "incoming", text, provider="telegram")
         _mark_incoming(dialog.id)
+        mark_contact_first_reply(dialog.contact_cycle_id)
+        touch_contact_cycle(dialog.contact_cycle_id)
 
-        if is_explicit_stop(text, stop_words):
-            await _send_stop_reply(dialog=dialog, client=client, sender=sender)
+        if explicit_stop:
+            if offer_already_sent:
+                await _send_post_offer_apology(
+                    dialog=dialog, client=client, sender=sender
+                )
+            else:
+                await _send_stop_reply(dialog=dialog, client=client, sender=sender)
             return
 
-        if _contains_any(text, human_words):
+        if is_human_takeover_request(text, human_words):
             reply = config(
                 "AI_HUMAN_TAKEOVER_REPLY",
                 default="Понял, лучше передам человеку, чтобы ответили точнее.",
@@ -813,12 +991,57 @@ async def handle_private_incoming(
                 return
             sent = await _safe_send_message(client, sender, reply, "human_takeover")
             if not sent:
-                _set_dialog_status(dialog.id, "send_error", "telegram_send_failed", stage="send_error")
+                _set_dialog_status(
+                    dialog.id, "send_error", "telegram_send_failed", stage="send_error"
+                )
                 return
-            _save_message(dialog.id, "outgoing", reply, provider="local", model="human_takeover")
+            _save_message(
+                dialog.id, "outgoing", reply, provider="local", model="human_takeover"
+            )
             _mark_outgoing(dialog.id)
-            _set_dialog_status(dialog.id, "human_needed", "human_takeover", stage="human_needed")
-            logger.info(f"[AI DM] human takeover: dialog={dialog.id}, user={sender.id}")
+            _set_dialog_status(
+                dialog.id, "human_needed", "human_takeover", stage="human_needed"
+            )
+            logger.info(
+                f"[AI DM] human takeover: dialog={dialog.id}, user={sender.id}"
+            )
+            return
+
+        if offer_already_sent:
+            await _reply_delay()
+            dialog = _get_dialog_by_id(dialog.id) or dialog
+            if dialog.status != "active":
+                return
+
+            history = _current_cycle_history(dialog.id)
+            try:
+                plan = await generate_post_link_plan(
+                    history=history,
+                    source_chat_title=dialog.source_chat_title,
+                )
+            except Exception as exc:
+                logger.error(
+                    f"[AI DM] post-link generation error for dialog={dialog.id}, "
+                    f"user={sender.id}: {exc}"
+                )
+                plan = FunnelPlan(
+                    action="post_link_final",
+                    next_stage="completed",
+                    close_after=True,
+                    messages=post_link_final_messages(
+                        text, source_chat_title=dialog.source_chat_title
+                    ),
+                    model="local_post_link_fallback",
+                )
+            sent = await _send_maxim_plan(
+                dialog=dialog, client=client, sender=sender, plan=plan
+            )
+            if not sent:
+                return
+            _finalize_completed_dialog(dialog, "natural_finish_after_link")
+            logger.info(
+                f"[AI DM] post-link dialog completed: dialog={dialog.id}, user={sender.id}"
+            )
             return
 
         await _reply_delay()
@@ -828,15 +1051,19 @@ async def handle_private_incoming(
         if dialog.status != "active" or _dialog_has_sent_offer(dialog.id):
             return
 
-        max_followups = _safe_int("AI_MAX_FOLLOWUP_MESSAGES", 7, min_value=3, max_value=12)
+        max_followups = _safe_int(
+            "AI_MAX_FOLLOWUP_MESSAGES", 7, min_value=3, max_value=12
+        )
         followup_count = _current_cycle_followup_count(dialog.id)
+        # The configured number limits ordinary follow-ups. If an old or unusual
+        # cycle has already reached it without a link, allow exactly one final
+        # link-bearing response instead of silently closing while the user is active.
+        effective_followup_count = min(followup_count, max_followups - 1)
         if followup_count >= max_followups:
-            _set_dialog_status(dialog.id, "completed", "max_followups_reached", stage="completed")
             logger.warning(
-                f"[AI DM] follow-up cap reached without another reply: "
-                f"dialog={dialog.id}, user={sender.id}, count={followup_count}"
+                f"[AI DM] ordinary follow-up cap reached; using one final closure "
+                f"reply: dialog={dialog.id}, user={sender.id}, count={followup_count}"
             )
-            return
 
         history = _current_cycle_history(dialog.id)
         try:
@@ -844,7 +1071,7 @@ async def handle_private_incoming(
                 stage=dialog.stage,
                 history=history,
                 source_chat_title=dialog.source_chat_title,
-                followup_count=followup_count,
+                followup_count=effective_followup_count,
                 max_followups=max_followups,
             )
         except Exception as exc:
@@ -855,11 +1082,11 @@ async def handle_private_incoming(
                 stage=dialog.stage,
                 history=history,
                 source_chat_title=dialog.source_chat_title,
-                followup_count=followup_count,
+                followup_count=effective_followup_count,
                 max_followups=max_followups,
             )
 
-        remaining = max_followups - followup_count
+        remaining = max(1, max_followups - followup_count)
         plan = _fit_plan_to_remaining(plan, remaining)
         sent = await _send_maxim_plan(
             dialog=dialog,
@@ -870,10 +1097,23 @@ async def handle_private_incoming(
         if not sent:
             return
 
-        if plan.close_after or any(PIRATE_VIP_LINK_TOKEN in message for message in plan.messages):
-            _set_dialog_status(dialog.id, "completed", "offer_sent", stage="completed")
+        has_link = any(PIRATE_VIP_LINK_TOKEN in message for message in plan.messages)
+        if has_link:
+            _set_dialog_status(
+                dialog.id,
+                "active",
+                "link_sent_waiting_final",
+                stage="post_link_active",
+            )
+            mark_contact_link_sent(dialog.contact_cycle_id)
             logger.info(
-                f"[AI DM] Maxim link sent and dialog completed: "
+                f"[AI DM] Maxim link sent; waiting for final reply or timeout: "
+                f"dialog={dialog.id}, user={sender.id}, action={plan.action}"
+            )
+        elif plan.close_after:
+            _finalize_completed_dialog(dialog, "logical_finish")
+            logger.info(
+                f"[AI DM] Maxim dialog completed without link: "
                 f"dialog={dialog.id}, user={sender.id}, action={plan.action}"
             )
         else:

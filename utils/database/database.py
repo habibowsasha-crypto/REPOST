@@ -4,6 +4,7 @@ from loguru import logger
 
 from config import conn
 from services.dm_opt_out import create_opt_out_table
+from services.dm_contact_analytics import create_contact_tables
 
 
 def _normalize_group_id_value(value) -> int:
@@ -302,4 +303,5 @@ def create_dm_tables() -> None:
         cursor.close()
 
     create_opt_out_table()
+    create_contact_tables()
 

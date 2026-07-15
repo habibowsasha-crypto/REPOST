@@ -21,6 +21,7 @@ from config import (
 )
 from handlers.dm.dm_handlers import dm_monitor_tasks, restore_dm_tasks
 from services.ai_dialog_service import create_ai_tables
+from services.dm_contact_analytics import create_contact_tables, expire_stale_dialogs
 from utils.database import create_table, delete_table
 from utils.database.database import create_dm_tables
 
@@ -79,7 +80,25 @@ async def validate_saved_sessions() -> None:
                 pass
 
 
+async def _run_dialog_expiry_job() -> None:
+    """Run lifecycle expiry on the bot event loop, not in a worker thread."""
+    try:
+        expire_stale_dialogs()
+    except Exception as exc:
+        logger.exception(f"[DM analytics] dialog expiry job failed: {exc}")
+
+
 async def setup_scheduler() -> None:
+    if scheduler.get_job("dm-dialog-expiry") is None:
+        scheduler.add_job(
+            _run_dialog_expiry_job,
+            "interval",
+            hours=1,
+            id="dm-dialog-expiry",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
     if not scheduler.running:
         scheduler.start()
     logger.info("📅 Планировщик запущен")
@@ -104,6 +123,7 @@ def run() -> None:
     create_table()
     create_dm_tables()
     create_ai_tables()
+    create_contact_tables()
     # Ordinary broadcast jobs are not restorable by the legacy scheduler path.
     delete_table()
 

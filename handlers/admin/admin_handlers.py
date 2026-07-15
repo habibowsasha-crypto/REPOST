@@ -28,6 +28,7 @@ def _main_menu_buttons():
             Button.inline("🤖 AI статус", b"menu_ai_status"),
             Button.inline("💬 AI-диалоги", b"menu_ai_dialogs"),
         ],
+        [Button.inline("📊 Контакты и диалоги", b"menu_dm_contacts")],
         [Button.inline("📝 Первые DM-шаблоны", b"menu_first_dm_templates")],
         [Button.inline("📨 Обычная рассылка во все аккаунты", b"broadcast_All_account")],
         [Button.inline("❌ Остановить обычную рассылку", b"Stop_Broadcast_All_account")],
