@@ -14,13 +14,13 @@ class FirstDmIntegrityTests(unittest.TestCase):
             "a34f2613c338b1f89284335d2462cc1ed1b1e43b3063dcdf4a511a3b7f0f32aa",
         )
 
-    def test_dm_runtime_matches_v1_0_13(self) -> None:
+    def test_first_dm_runtime_keeps_two_item_queue_and_original_selector(self) -> None:
         path = Path(__file__).resolve().parents[1] / "handlers" / "dm" / "dm_handlers.py"
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        self.assertEqual(
-            digest,
-            "e3314ad1aeab97b399a11a3ce4aeb1d42b73e29dd73c265e390a3540613dffe6",
-        )
+        source = path.read_text(encoding="utf-8")
+        self.assertIn("queue.append((target_id, sender))", source)
+        self.assertIn("target_id, sender = queue.popleft()", source)
+        self.assertIn("outgoing_text = choose_first_dm_text", source)
+        self.assertIn("if is_opted_out(target_id):", source)
 
 
 if __name__ == "__main__":

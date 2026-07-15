@@ -27,6 +27,7 @@ from services.maxim_sales_funnel import (
     generate_plan,
     is_explicit_stop,
 )
+from services.dm_opt_out import add_opt_out, migrate_legacy_closed_dialogs, opt_out_count
 
 
 def _now_iso() -> str:
@@ -250,6 +251,7 @@ def create_ai_tables() -> None:
             pass
     conn.commit()
     cursor.close()
+    migrate_legacy_closed_dialogs()
 
 
 def _row_to_dialog(row: tuple | None) -> Optional[DialogRow]:
@@ -553,10 +555,27 @@ def _post_offer_apology() -> str:
     return config("AI_POST_OFFER_APOLOGY", default=default).strip() or default
 
 
+def _persist_global_opt_out(
+    *, dialog: DialogRow, sender: User, reason: str
+) -> None:
+    """Honor a user's request not to be contacted across all future DM tasks."""
+    add_opt_out(
+        int(sender.id),
+        reason=reason,
+        source_dialog_id=dialog.id,
+        source_account_user_id=dialog.account_user_id,
+        source_dm_task_id=dialog.dm_task_id,
+        username=getattr(sender, "username", None),
+        first_name=getattr(sender, "first_name", None),
+    )
+    _set_dialog_status(dialog.id, "closed_negative", reason, stage="closed_negative")
+
+
 async def _send_post_offer_apology(
     *, dialog: DialogRow, client: TelegramClient, sender: User
 ) -> None:
     """Send at most one courtesy apology after the link, then close."""
+    _persist_global_opt_out(dialog=dialog, sender=sender, reason="post_offer_explicit_stop")
     if _dialog_has_post_offer_apology(dialog.id):
         _set_dialog_status(
             dialog.id,
@@ -580,11 +599,12 @@ async def _send_post_offer_apology(
 
     sent = await _safe_send_message(client, sender, reply, "post_offer_apology")
     if not sent:
-        _set_dialog_status(dialog.id, "send_error", "telegram_send_failed", stage="send_error")
+        logger.warning(
+            f"[AI DM] opt-out saved but apology send failed: dialog={dialog.id}, user={sender.id}"
+        )
         return
     _save_message(dialog.id, "outgoing", reply, provider="local", model="post_offer_apology")
     _mark_outgoing(dialog.id)
-    _set_dialog_status(dialog.id, "closed_negative", "post_offer_rejection", stage="closed_negative")
     logger.info(f"[AI DM] one-time post-offer apology sent: dialog={dialog.id}, user={sender.id}")
 
 
@@ -684,6 +704,7 @@ async def _send_stop_reply(
         "AI_STOP_REPLY",
         default="Понял, извини, что побеспокоил. Больше писать не буду.",
     ).strip()
+    _persist_global_opt_out(dialog=dialog, sender=sender, reason="explicit_stop")
     if ai_dry_run():
         logger.info(f"[AI DM DRY RUN stop] user={sender.id}: {reply}")
         _save_message(
@@ -696,12 +717,13 @@ async def _send_stop_reply(
         return
     sent = await _safe_send_message(client, sender, reply, "stop_reply")
     if not sent:
-        _set_dialog_status(dialog.id, "send_error", "telegram_send_failed", stage="send_error")
+        logger.warning(
+            f"[AI DM] opt-out saved but stop reply send failed: dialog={dialog.id}, user={sender.id}"
+        )
         return
     _save_message(dialog.id, "outgoing", reply, provider="local", model="stop_reply")
     _mark_outgoing(dialog.id)
-    _set_dialog_status(dialog.id, "closed_negative", "explicit_stop", stage="closed_negative")
-    logger.info(f"[AI DM] explicit stop: dialog={dialog.id}, user={sender.id}")
+    logger.info(f"[AI DM] explicit stop persisted: dialog={dialog.id}, user={sender.id}")
 
 
 async def handle_private_incoming(
@@ -887,6 +909,25 @@ def resume_dialog_by_user(target_user_id: int) -> bool:
     return affected > 0
 
 
+def clear_opt_out_dialog_state_by_user(target_user_id: int) -> bool:
+    """Make an explicitly stopped dialog reopenable by a future first DM.
+
+    The dialog is not made active immediately, so an old private message cannot
+    restart the funnel by itself after an administrator removes the opt-out.
+    """
+    cursor = conn.cursor()
+    cursor.execute(
+        """UPDATE ai_dialogs
+           SET status='completed', stage='completed', stopped_reason=NULL, updated_at=?
+           WHERE target_user_id=? AND status='closed_negative'""",
+        (_now_iso(), target_user_id),
+    )
+    affected = cursor.rowcount
+    conn.commit()
+    cursor.close()
+    return affected > 0
+
+
 def ai_stats() -> dict[str, Any]:
     create_ai_tables()
     cursor = conn.cursor()
@@ -915,6 +956,7 @@ def ai_stats() -> dict[str, Any]:
         "paid_source_count": _safe_int("AI_PAID_VIP_SOURCE_COUNT", 50, min_value=1, max_value=9999),
         "close_after_offer": True,
         "post_offer_apology": True,
+        "persistent_opt_out_users": opt_out_count(),
     }
 
 

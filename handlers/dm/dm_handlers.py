@@ -40,6 +40,7 @@ from utils.database.database import create_dm_tables
 from utils.telegram import gid_key
 from services.first_message import choose_first_dm_text, is_random_first_dm_enabled
 from services.ai_dialog_service import handle_private_incoming, record_first_dm
+from services.dm_opt_out import is_opted_out, register_queue_purger
 from services.dm_task_cleanup import (
     count_active_dm_tasks,
     count_inactive_dm_tasks,
@@ -60,6 +61,27 @@ dm_send_queues: dict = {}
 # Название исходного чата хранится отдельно, чтобы не менять рабочий формат
 # очереди первого DM: (task_id, target_user_id) → source_chat_title.
 dm_source_chat_titles: dict[tuple[int, int], str] = {}
+
+
+def _purge_user_from_all_dm_queues(target_user_id: int) -> int:
+    """Remove an opted-out user from every live first-DM queue."""
+    removed = 0
+    target_user_id = int(target_user_id)
+    for task_id, queue in list(dm_send_queues.items()):
+        kept = [item for item in queue if int(item[0]) != target_user_id]
+        removed += len(queue) - len(kept)
+        if len(kept) != len(queue):
+            queue.clear()
+            queue.extend(kept)
+            logger.info(
+                f"[DM opt-out] user={target_user_id} removed from task={task_id} queue"
+            )
+    for key in [key for key in dm_source_chat_titles if key[1] == target_user_id]:
+        dm_source_chat_titles.pop(key, None)
+    return removed
+
+
+register_queue_purger(_purge_user_from_all_dm_queues)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -261,6 +283,12 @@ async def _send_worker(task_id: int, client: TelegramClient) -> None:
         target_id, sender = queue.popleft()
         source_chat_title = dm_source_chat_titles.get((task_id, target_id))
 
+        # Постоянный opt-out: пользователь сам попросил больше не писать.
+        if is_opted_out(target_id):
+            logger.debug(f"[DM {task_id}] {target_id} в постоянном opt-out, пропуск")
+            dm_source_chat_titles.pop((task_id, target_id), None)
+            continue
+
         # Повторная проверка перед отправкой
         if _is_blacklisted(task_id, target_id):
             logger.debug(f"[DM {task_id}] {target_id} в blacklist, пропуск")
@@ -412,6 +440,10 @@ async def _monitor_loop(task_id: int) -> None:
             if not t or not t["is_active"]:
                 return
 
+            # Глобальный постоянный opt-out действует для всех аккаунтов и задач.
+            if is_opted_out(target_id):
+                logger.debug(f"[DM {task_id}] {target_id} в постоянном opt-out, в очередь не добавлен")
+                return
             if _is_blacklisted(task_id, target_id):
                 return
             if _already_sent_recently(task_id, target_id, t["interval_minutes"]):

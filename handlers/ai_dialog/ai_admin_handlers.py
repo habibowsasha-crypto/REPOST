@@ -9,11 +9,13 @@ from telethon import Button
 from config import ADMIN_ID_LIST, New_Message, Query, bot, callback_message
 from services.ai_dialog_service import (
     ai_stats,
+    clear_opt_out_dialog_state_by_user,
     export_dialogs_text,
     recent_dialogs,
     resume_dialog_by_user,
     stop_dialog_by_user,
 )
+from services.dm_opt_out import list_opt_out_users, remove_opt_out
 from services.first_message import get_templates_preview, reload_first_dm_templates_cache
 
 
@@ -36,11 +38,12 @@ async def cmd_ai_status(event: callback_message) -> None:
         f"Сообщений сегодня: {s['messages_today']}\n"
         f"Персонаж: {s.get('persona', 'Максим')}\n"
         f"Режим: контекстная продающая воронка, до {s.get('max_followups', 7)} AI-сообщений после первого DM\n"
-        f"Бесплатная подборка: {s.get('free_source_count', 6)} источников | расширенная: почти {s.get('paid_source_count', 50)}\n"
+        f"Бесплатная группа: посты из {s.get('free_source_count', 6)} закрытых VIP-каналов | расширенная: почти {s.get('paid_source_count', 50)}\n"
         "Максим отвечает по контексту, честно раскрывает роль трафера и даёт ссылку без обязательного прямого запроса\n"
         "После ссылки: диалог закрывается\n"
-        "При прямом отказе: одно извинение и остановка\n\n"
-        "Команды: /ai_dialogs, /ai_stop USER_ID, /ai_resume USER_ID, /ai_export",
+        "При прямом отказе: одно извинение, постоянный opt-out и остановка\n"
+        f"Постоянный opt-out: {s.get('persistent_opt_out_users', 0)} пользователей\n\n"
+        "Команды: /ai_dialogs, /ai_stop USER_ID, /ai_resume USER_ID, /ai_export, /dm_optout_list, /dm_optout_remove USER_ID",
     )
 
 
@@ -106,6 +109,46 @@ async def cmd_ai_export(event: callback_message) -> None:
             pass
 
 
+@bot.on(New_Message(pattern=r"^/dm_optout_list(?:@\w+)?(?:\s+(\d+))?$"))
+async def cmd_dm_optout_list(event: callback_message) -> None:
+    if event.sender_id not in ADMIN_ID_LIST:
+        return
+    raw_limit = event.pattern_match.group(1)
+    limit = min(max(int(raw_limit or 30), 1), 30)
+    rows = list_opt_out_users(limit=limit)
+    if not rows:
+        await event.respond("📭 Постоянный opt-out пуст.")
+        return
+    lines = ["🚫 **Пользователи, которым больше нельзя писать:**\n"]
+    for user_id, username, first_name, reason, created_at, updated_at in rows:
+        who = f"@{username}" if username else (first_name or "без имени")
+        lines.append(
+            f"`{user_id}` | {who}\n"
+            f"причина: `{reason}` | добавлен: {(created_at or '')[:19]}"
+        )
+    await event.respond("\n\n".join(lines))
+
+
+@bot.on(New_Message(pattern=r"^/dm_optout_remove(?:@\w+)?(?:\s+(\d+))?$"))
+async def cmd_dm_optout_remove(event: callback_message) -> None:
+    if event.sender_id not in ADMIN_ID_LIST:
+        return
+    raw = event.pattern_match.group(1)
+    if not raw:
+        await event.respond("Использование: `/dm_optout_remove USER_ID`")
+        return
+    user_id = int(raw)
+    removed = remove_opt_out(user_id)
+    clear_opt_out_dialog_state_by_user(user_id)
+    if removed:
+        await event.respond(
+            "✅ Постоянный запрет снят. Пользователь сможет снова получить первый DM "
+            "только после нового сообщения в отслеживаемом чате."
+        )
+    else:
+        await event.respond("⚠ Пользователь не найден в постоянном opt-out.")
+
+
 @bot.on(New_Message(pattern=r"^/first_dm_templates(?:@\w+)?$"))
 async def cmd_first_dm_templates(event: callback_message) -> None:
     if event.sender_id not in ADMIN_ID_LIST:
@@ -142,10 +185,11 @@ async def menu_ai_status(event):
         f"Сообщений сегодня: {s['messages_today']}\n"
         f"Персонаж: {s.get('persona', 'Максим')}\n"
         f"Режим: контекстная продающая воронка, до {s.get('max_followups', 7)} AI-сообщений после первого DM\n"
-        f"Бесплатная подборка: {s.get('free_source_count', 6)} источников | расширенная: почти {s.get('paid_source_count', 50)}\n"
+        f"Бесплатная группа: посты из {s.get('free_source_count', 6)} закрытых VIP-каналов | расширенная: почти {s.get('paid_source_count', 50)}\n"
         "Максим отвечает по контексту, честно раскрывает роль трафера и даёт ссылку без обязательного прямого запроса\n"
         "После ссылки: диалог закрывается\n"
-        "При прямом отказе: одно извинение и остановка",
+        "При прямом отказе: одно извинение, постоянный opt-out и остановка\n"
+        f"Постоянный opt-out: {s.get('persistent_opt_out_users', 0)} пользователей",
         buttons=[[Button.inline("🏠 Главное меню", b"menu_home")]],
     )
     await event.answer()

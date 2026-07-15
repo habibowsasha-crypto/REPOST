@@ -3,6 +3,7 @@ import sqlite3
 from loguru import logger
 
 from config import conn
+from services.dm_opt_out import create_opt_out_table
 
 
 def _normalize_group_id_value(value) -> int:
@@ -299,3 +300,6 @@ def create_dm_tables() -> None:
         conn.commit()
     finally:
         cursor.close()
+
+    create_opt_out_table()
+
