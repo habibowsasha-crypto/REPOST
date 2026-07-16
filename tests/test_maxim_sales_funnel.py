@@ -13,9 +13,9 @@ os.environ["API_ID"] = "123456"
 os.environ["API_HASH"] = "test_hash"
 os.environ["BOT_TOKEN"] = "123456:test_token"
 os.environ["ADMIN_ID_LIST"] = "123"
-os.environ["DB_PATH"] = "/tmp/tgblaster_v118_unittest.db"
-os.environ["BOT_SESSION_PATH"] = "/tmp/tgblaster_v118_unittest_bot"
-os.environ["MEDIA_DIR"] = "/tmp/tgblaster_v118_unittest_media"
+os.environ["DB_PATH"] = "/tmp/tgblaster_v120_unittest.db"
+os.environ["BOT_SESSION_PATH"] = "/tmp/tgblaster_v120_unittest_bot"
+os.environ["MEDIA_DIR"] = "/tmp/tgblaster_v120_unittest_media"
 os.environ["AI_DM_ENABLED"] = "true"
 os.environ["AI_DM_DRY_RUN"] = "false"
 os.environ["OPENAI_API_KEY"] = ""
@@ -23,11 +23,14 @@ os.environ["AI_REPLY_DELAY_MIN_SECONDS"] = "0"
 os.environ["AI_REPLY_DELAY_MAX_SECONDS"] = "0"
 os.environ["AI_BURST_DELAY_MIN_SECONDS"] = "0"
 os.environ["AI_BURST_DELAY_MAX_SECONDS"] = "0"
+os.environ["AI_LINK_HELP_DELAY_MIN_SECONDS"] = "0"
+os.environ["AI_LINK_HELP_DELAY_MAX_SECONDS"] = "0"
 os.environ["AI_MAX_FOLLOWUP_MESSAGES"] = "7"
 
 from config import conn
 from services.ai_dialog_service import (
     _get_dialog_by_target,
+    _select_link_help_variant,
     clear_opt_out_dialog_state_by_user,
     create_ai_tables,
     handle_private_incoming,
@@ -40,10 +43,14 @@ from services.dm_contact_analytics import (
 from services.dm_opt_out import is_opted_out, remove_opt_out
 from services.maxim_sales_funnel import (
     PIRATE_VIP_LINK,
+    LINK_ACCESS_HELP_VARIANTS,
     build_local_plan,
+    classify_intent,
     is_explicit_stop,
+    is_soft_decline,
     generate_post_link_plan,
     is_human_takeover_request,
+    validate_link_access_help,
 )
 from utils.database.database import create_dm_tables
 
@@ -65,6 +72,7 @@ class MaximSalesFunnelTests(unittest.IsolatedAsyncioTestCase):
         cursor = conn.cursor()
         cursor.execute("DELETE FROM dm_opt_out_users")
         cursor.execute("DELETE FROM ai_processed_messages")
+        cursor.execute("DELETE FROM ai_link_help_usage")
         cursor.execute("DELETE FROM ai_messages")
         cursor.execute("DELETE FROM ai_dialogs")
         cursor.execute("DELETE FROM dm_first_dm_claims")
@@ -107,9 +115,10 @@ class MaximSalesFunnelTests(unittest.IsolatedAsyncioTestCase):
 
         before = len(self.client.sent)
         await self.reply("Ну да, заранее не поймешь")
-        self.assertEqual(len(self.client.sent) - before, 2)
-        self.assertTrue(any("зарплат" in message.lower() for message in self.client.sent[before:]))
+        self.assertEqual(len(self.client.sent) - before, 1)
         self.assertTrue(any("моментально" in message.lower() for message in self.client.sent[before:]))
+        self.assertTrue(any("софт" in message.lower() for message in self.client.sent[before:]))
+        self.assertTrue(any("сливами vip-каналов" in message.lower() for message in self.client.sent[before:]))
         self.assertFalse(any("подборк" in message.lower() for message in self.client.sent[before:]))
 
         await self.reply("Понял")
@@ -176,12 +185,15 @@ class MaximSalesFunnelTests(unittest.IsolatedAsyncioTestCase):
         await self.reply("Ну да")
         await self.reply("Понял")
         combined = " ".join(self.client.sent).lower()
-        self.assertIn("бесплатная telegram-группа", combined)
+        self.assertIn("бесплатный telegram-канал", combined)
+        self.assertIn("сливами vip-каналов", combined)
+        self.assertIn("софт моментально копирует", combined)
         self.assertIn("платных закрытых vip-каналов", combined)
         self.assertIn("моментально", combined)
-        self.assertIn("сотни долларов", combined)
         self.assertNotIn("почти моментально", combined)
         self.assertNotIn("бесплатная подборка", combined)
+        self.assertNotIn("бесплатная telegram-группа", combined)
+        self.assertNotIn("бесплатный чат", combined)
         self.assertNotIn("торговать проще", combined)
 
     async def test_manual_optout_removal_allows_future_cycle_only(self) -> None:
@@ -384,7 +396,7 @@ class MaximSalesFunnelTests(unittest.IsolatedAsyncioTestCase):
         mocked = AsyncMock(
             return_value=(
                 [
-                    "Да, бесплатную группу можно смотреть без оплаты. "
+                    "Да, бесплатный канал можно смотреть без оплаты. "
                     "Платный доступ брать не обязан."
                 ],
                 17,
@@ -411,6 +423,61 @@ class MaximSalesFunnelTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(PIRATE_VIP_LINK, plan.messages[0])
         mocked.assert_awaited_once()
 
+    async def test_post_link_not_clickable_explains_telegram_contact_banner(self) -> None:
+        self.open_cycle()
+        await self.reply("А тебе какая с этого выгода?")
+        self.assertTrue(any(PIRATE_VIP_LINK in message for message in self.client.sent))
+
+        before = len(self.client.sent)
+        await self.reply("Перейти не могу, нажимаю по ссылке — не кликается")
+        final_messages = self.client.sent[before:]
+
+        self.assertEqual(len(final_messages), 1)
+        answer = final_messages[0].lower()
+        self.assertIn("заблокировать", answer)
+        self.assertIn("добавить", answer)
+        self.assertIn("крестик", answer)
+        self.assertIn("скопируй", answer)
+        self.assertIn("telegram", answer)
+        self.assertNotIn("проблема в приложении", answer)
+        self.assertNotIn("устройстве", answer)
+        self.assertNotIn(PIRATE_VIP_LINK, final_messages[0])
+
+        dialog = _get_dialog_by_target(9001, self.sender.id)
+        self.assertEqual(dialog.status, "completed")
+
+    async def test_post_link_vague_openai_access_answer_falls_back_to_exact_help(self) -> None:
+        previous_key = os.environ.get("OPENAI_API_KEY", "")
+        os.environ["OPENAI_API_KEY"] = "test-only-key"
+        mocked = AsyncMock(
+            side_effect=[
+                (["Возможно, проблема в приложении или устройстве. Попробуй позже."], 11),
+                (["Попробуй скопировать ссылку в браузер."], 9),
+            ]
+        )
+        history = [
+            ("outgoing", "Вот, глянь сам: " + PIRATE_VIP_LINK),
+            ("incoming", "Не могу перейти, ссылка не нажимается"),
+        ]
+        try:
+            with patch("services.maxim_sales_funnel._openai_generate", mocked):
+                plan = await generate_post_link_plan(
+                    history=history, source_chat_title="Crypto Chat"
+                )
+        finally:
+            os.environ["OPENAI_API_KEY"] = previous_key
+
+        self.assertEqual(plan.model, "local_post_link_final")
+        self.assertEqual(plan.tokens_used, 0)
+        self.assertEqual(len(plan.messages), 1)
+        answer = plan.messages[0].lower()
+        self.assertIn("заблокировать", answer)
+        self.assertIn("добавить", answer)
+        self.assertIn("крестик", answer)
+        self.assertIn("скопируй", answer)
+        self.assertNotIn(PIRATE_VIP_LINK, plan.messages[0])
+        self.assertEqual(mocked.await_count, 0)
+
     async def test_post_link_repeats_link_only_on_explicit_request(self) -> None:
         self.open_cycle()
         await self.reply("А тебе какая с этого выгода?")
@@ -418,6 +485,203 @@ class MaximSalesFunnelTests(unittest.IsolatedAsyncioTestCase):
         await self.reply("Ссылка не открывается, скинь ещё раз")
         final_messages = self.client.sent[before:]
         self.assertEqual(sum(PIRATE_VIP_LINK in item for item in final_messages), 1)
+
+
+    async def test_every_initial_link_gets_an_immediate_varied_help_message(self) -> None:
+        self.open_cycle()
+        await self.reply("А тебе какая с этого выгода?")
+
+        link_positions = [
+            index for index, message in enumerate(self.client.sent)
+            if PIRATE_VIP_LINK in message
+        ]
+        self.assertEqual(len(link_positions), 1)
+        link_index = link_positions[0]
+        self.assertLess(link_index + 1, len(self.client.sent))
+        help_message = self.client.sent[link_index + 1]
+        self.assertTrue(validate_link_access_help(help_message))
+        self.assertNotIn(PIRATE_VIP_LINK, help_message)
+
+        row = conn.execute(
+            """
+            SELECT variant_index FROM ai_link_help_usage
+            WHERE account_user_id = ? AND target_user_id = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (9001, self.sender.id),
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(help_message, LINK_ACCESS_HELP_VARIANTS[int(row[0])])
+
+    async def test_link_help_pool_has_more_than_ten_unique_safe_variants(self) -> None:
+        self.assertGreater(len(LINK_ACCESS_HELP_VARIANTS), 10)
+        self.assertEqual(len(LINK_ACCESS_HELP_VARIANTS), len(set(LINK_ACCESS_HELP_VARIANTS)))
+        for message in LINK_ACCESS_HELP_VARIANTS:
+            with self.subTest(message=message):
+                self.assertTrue(validate_link_access_help(message))
+                self.assertNotIn(PIRATE_VIP_LINK, message)
+
+    async def test_link_help_rotation_avoids_recent_variants_persistently(self) -> None:
+        self.open_cycle()
+        dialog = _get_dialog_by_target(9001, self.sender.id)
+        self.assertIsNotNone(dialog)
+
+        chosen: list[int] = []
+        for _ in range(13):
+            variant_index, message = _select_link_help_variant(dialog)
+            chosen.append(variant_index)
+            self.assertEqual(message, LINK_ACCESS_HELP_VARIANTS[variant_index])
+
+        self.assertEqual(len(chosen), len(set(chosen)))
+        persisted = conn.execute(
+            """
+            SELECT variant_index FROM ai_link_help_usage
+            WHERE account_user_id = ?
+            ORDER BY id ASC
+            """,
+            (9001,),
+        ).fetchall()
+        self.assertEqual([int(row[0]) for row in persisted], chosen)
+
+    async def test_explicit_link_resend_gets_a_new_help_variant(self) -> None:
+        self.open_cycle()
+        await self.reply("А тебе какая с этого выгода?")
+        first_help_row = conn.execute(
+            """
+            SELECT variant_index FROM ai_link_help_usage
+            WHERE account_user_id = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (9001,),
+        ).fetchone()
+        self.assertIsNotNone(first_help_row)
+
+        before = len(self.client.sent)
+        await self.reply("Скинь ссылку ещё раз")
+        resent = self.client.sent[before:]
+        self.assertEqual(sum(PIRATE_VIP_LINK in item for item in resent), 1)
+        resent_link_index = next(
+            index for index, message in enumerate(resent) if PIRATE_VIP_LINK in message
+        )
+        self.assertLess(resent_link_index + 1, len(resent))
+        self.assertTrue(validate_link_access_help(resent[resent_link_index + 1]))
+
+        second_help_row = conn.execute(
+            """
+            SELECT variant_index FROM ai_link_help_usage
+            WHERE account_user_id = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (9001,),
+        ).fetchone()
+        self.assertIsNotNone(second_help_row)
+        self.assertNotEqual(int(first_help_row[0]), int(second_help_row[0]))
+
+
+    async def test_link_help_failure_does_not_turn_delivered_link_into_send_error(self) -> None:
+        class LinkDeliveredHelpFailsClient(FakeClient):
+            async def send_message(self, target, text: str):
+                if validate_link_access_help(text):
+                    raise RuntimeError("simulated optional help failure")
+                return await super().send_message(target, text)
+
+        self.client = LinkDeliveredHelpFailsClient()
+        self.open_cycle()
+        await self.reply("А тебе какая с этого выгода?")
+
+        self.assertTrue(any(PIRATE_VIP_LINK in message for message in self.client.sent))
+        dialog = _get_dialog_by_target(9001, self.sender.id)
+        self.assertIsNotNone(dialog)
+        self.assertEqual(dialog.status, "active")
+        self.assertEqual(dialog.stage, "post_link_active")
+
+    async def test_plain_language_reexplanation_matches_screenshot_case(self) -> None:
+        self.open_cycle("Как ты к этому относишься?")
+        await self.reply("Я не понимаю о чем ты, слишком сложно")
+        self.assertEqual(len(self.client.sent), 1)
+        answer = self.client.sent[0].lower()
+        self.assertIn("бесплатный telegram-канал", answer)
+        self.assertIn("сливами vip-каналов", answer)
+        self.assertIn("софт моментально копирует", answer)
+        self.assertIn("6 платных закрытых vip-каналов", answer)
+        self.assertIn("каждый доступ", answer)
+        self.assertNotIn("бесплатная группа", answer)
+        self.assertNotIn(PIRATE_VIP_LINK, self.client.sent[0])
+
+    async def test_exact_ne_perehodit_uses_deterministic_banner_help(self) -> None:
+        self.open_cycle()
+        await self.reply("А тебе какая с этого выгода?")
+        before = len(self.client.sent)
+        await self.reply("Не переходит")
+        messages = self.client.sent[before:]
+        self.assertEqual(len(messages), 1)
+        answer = messages[0].lower()
+        for marker in ("заблокировать", "добавить", "крестик", "скопируй", "telegram"):
+            self.assertIn(marker, answer)
+        self.assertNotIn("браузер", answer)
+        self.assertNotIn("устройств", answer)
+
+    async def test_soft_decline_closes_for_account_without_global_optout(self) -> None:
+        self.open_cycle()
+        self.assertTrue(is_soft_decline("Нет, спасибо"))
+        self.assertEqual(classify_intent("Нет, спасибо"), "soft_decline")
+        self.assertFalse(is_explicit_stop("Нет, спасибо", ["не надо"]))
+
+        await self.reply("Нет, спасибо")
+        self.assertEqual(self.client.sent, ["Понял, без проблем. Не буду навязывать."])
+        self.assertFalse(is_opted_out(self.sender.id))
+        dialog = _get_dialog_by_target(9001, self.sender.id)
+        self.assertIsNotNone(dialog)
+        self.assertEqual(dialog.status, "completed")
+        row = conn.execute(
+            """
+            SELECT completion_reason FROM dm_completed_contacts
+            WHERE account_user_id=? AND target_user_id=?
+            """,
+            (9001, self.sender.id),
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], "completed_no_interest")
+
+    async def test_polite_no_thanks_after_link_closes_without_second_pitch(self) -> None:
+        self.open_cycle()
+        await self.reply("А тебе какая с этого выгода?")
+        before = len(self.client.sent)
+        await self.reply("Спасибо, не надо")
+        final_messages = self.client.sent[before:]
+        self.assertEqual(final_messages, ["Понял, без проблем. Не буду навязывать."])
+        self.assertFalse(is_opted_out(self.sender.id))
+        self.assertFalse(any(PIRATE_VIP_LINK in message for message in final_messages))
+
+    async def test_automatic_help_does_not_consume_sales_followup_limit(self) -> None:
+        self.open_cycle()
+        await self.reply("А тебе какая с этого выгода?")
+        dialog = _get_dialog_by_target(9001, self.sender.id)
+        self.assertIsNotNone(dialog)
+        cycle_start = conn.execute(
+            """
+            SELECT MAX(id) FROM ai_messages
+            WHERE dialog_id = ? AND provider = 'dm_first'
+            """,
+            (dialog.id,),
+        ).fetchone()[0]
+        counted = conn.execute(
+            """
+            SELECT COUNT(*) FROM ai_messages
+            WHERE dialog_id = ? AND id > ? AND direction = 'outgoing'
+              AND provider <> 'dm_first'
+              AND model NOT IN ('stop_reply', 'post_offer_apology', 'link_access_auto_help')
+            """,
+            (dialog.id, cycle_start),
+        ).fetchone()[0]
+        all_outgoing = conn.execute(
+            """
+            SELECT COUNT(*) FROM ai_messages
+            WHERE dialog_id = ? AND id > ? AND direction = 'outgoing'
+            """,
+            (dialog.id, cycle_start),
+        ).fetchone()[0]
+        self.assertEqual(all_outgoing, counted + 1)
 
 
 if __name__ == "__main__":

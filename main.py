@@ -19,7 +19,12 @@ from config import (
     conn,
     scheduler,
 )
-from handlers.dm.dm_handlers import dm_monitor_tasks, restore_dm_tasks
+from handlers.dm.dm_handlers import (
+    dm_account_dispatcher_tasks,
+    dm_monitor_tasks,
+    restore_dm_tasks,
+)
+from services.account_profiles import save_account_profile
 from services.ai_dialog_service import create_ai_tables
 from services.dm_contact_analytics import create_contact_tables, expire_stale_dialogs
 from utils.database import create_table, delete_table
@@ -68,6 +73,8 @@ async def validate_saved_sessions() -> None:
         try:
             await client.connect()
             if await client.is_user_authorized():
+                me = await client.get_me()
+                save_account_profile(me)
                 logger.info(f"Сессия аккаунта {user_id} авторизована")
             else:
                 logger.warning(f"Сессия аккаунта {user_id} больше не авторизована")
@@ -105,11 +112,15 @@ async def setup_scheduler() -> None:
 
 
 async def shutdown_runtime() -> None:
-    for task_id, task in list(dm_monitor_tasks.items()):
+    for task in list(dm_monitor_tasks.values()):
         if not task.done():
             task.cancel()
-    if dm_monitor_tasks:
-        await asyncio.gather(*list(dm_monitor_tasks.values()), return_exceptions=True)
+    for task in list(dm_account_dispatcher_tasks.values()):
+        if not task.done():
+            task.cancel()
+    runtime_tasks = [*dm_monitor_tasks.values(), *dm_account_dispatcher_tasks.values()]
+    if runtime_tasks:
+        await asyncio.gather(*runtime_tasks, return_exceptions=True)
 
     if scheduler.running:
         scheduler.shutdown(wait=False)

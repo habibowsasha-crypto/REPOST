@@ -253,10 +253,26 @@ def is_contact_in_progress(account_user_id: int, target_user_id: int) -> bool:
         if row is not None:
             return True
 
-        # Recovery guard: if Telegram accepted a first DM and the contact-cycle
-        # write failed, the AI dialog can still exist. Treat a recent active AI
-        # row as an in-progress contact so another task of the same account does
-        # not send a duplicate first message. Old orphan rows expire naturally.
+        # Recovery guard: if Telegram accepted a first DM but both contact/AI
+        # persistence paths failed, the sent log still prevents a duplicate for
+        # the normal before-link observation window.
+        sent_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='dm_sent_log'"
+        ).fetchone()
+        if sent_table and conn.execute(
+            """
+            SELECT 1 FROM dm_sent_log AS log
+            JOIN dm_tasks AS task ON task.id=log.dm_task_id
+            WHERE task.user_id=? AND log.target_user_id=?
+              AND log.status='sent' AND log.sent_at>=?
+            LIMIT 1
+            """,
+            (int(account_user_id), int(target_user_id), cutoff),
+        ).fetchone():
+            return True
+
+        # If the contact-cycle write failed, the AI dialog can still exist.
+        # Treat a recent active AI row as in progress; old orphan rows expire.
         ai_table = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_dialogs'"
         ).fetchone()
@@ -313,6 +329,27 @@ def try_claim_first_dm(
                     LIMIT 1
                     """,
                     (int(account_user_id), int(target_user_id)),
+                ).fetchone():
+                    return None
+                sent_table = conn.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='dm_sent_log'"
+                ).fetchone()
+                sent_cutoff = (
+                    now
+                    - datetime.timedelta(
+                        hours=dialog_timeout_settings()["before_link_hours"]
+                    )
+                ).isoformat()
+                if sent_table and conn.execute(
+                    """
+                    SELECT 1 FROM dm_sent_log AS log
+                    JOIN dm_tasks AS task ON task.id=log.dm_task_id
+                    WHERE task.user_id=? AND log.target_user_id=?
+                      AND log.status='sent' AND log.sent_at>=?
+                    LIMIT 1
+                    """,
+                    (int(account_user_id), int(target_user_id), sent_cutoff),
                 ).fetchone():
                     return None
                 ai_table = conn.execute(

@@ -22,6 +22,7 @@ from telethon.tl.types import User
 from config import conn
 from services.maxim_sales_funnel import (
     PIRATE_VIP_LINK_TOKEN,
+    LINK_ACCESS_HELP_VARIANTS,
     FunnelPlan,
     build_local_plan,
     generate_plan,
@@ -29,6 +30,7 @@ from services.maxim_sales_funnel import (
     is_explicit_stop,
     is_human_takeover_request,
     post_link_final_messages,
+    validate_link_access_help,
 )
 from services.dm_opt_out import (
     add_opt_out,
@@ -211,6 +213,16 @@ def create_ai_tables() -> None:
             PRIMARY KEY (account_user_id, target_user_id, telegram_message_id)
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS ai_link_help_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_user_id INTEGER NOT NULL,
+            target_user_id INTEGER NOT NULL,
+            dialog_id INTEGER NOT NULL,
+            variant_index INTEGER NOT NULL,
+            used_at TEXT NOT NULL
+        )
+    """)
     # Older installations may have been created before the UNIQUE constraint.
     # Merge duplicate dialog rows without losing their message history.
     duplicates = cursor.execute(
@@ -251,6 +263,10 @@ def create_ai_tables() -> None:
     )
     cursor.execute(
         "CREATE INDEX IF NOT EXISTS idx_ai_processed_at ON ai_processed_messages(processed_at)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ai_link_help_account_id "
+        "ON ai_link_help_usage(account_user_id, id DESC)"
     )
 
     # Лёгкие миграции для старых БД.
@@ -577,7 +593,7 @@ def _current_cycle_followup_count(dialog_id: int) -> int:
               AND id > ?
               AND direction = 'outgoing'
               AND provider <> 'dm_first'
-              AND model NOT IN ('stop_reply', 'post_offer_apology')
+              AND model NOT IN ('stop_reply', 'post_offer_apology', 'link_access_auto_help')
             """,
             (dialog_id, cycle_start_id),
         ).fetchone()
@@ -706,6 +722,131 @@ async def _burst_delay() -> None:
         await asyncio.sleep(delay)
 
 
+async def _link_help_delay() -> None:
+    """A short independent pause makes the hint look like a human afterthought."""
+    dmin = _safe_int("AI_LINK_HELP_DELAY_MIN_SECONDS", 3, min_value=0, max_value=60)
+    dmax = _safe_int("AI_LINK_HELP_DELAY_MAX_SECONDS", 7, min_value=0, max_value=60)
+    if dmax < dmin:
+        dmax = dmin
+    delay = random.randint(dmin, dmax)
+    if delay:
+        await asyncio.sleep(delay)
+
+
+def _select_link_help_variant(dialog: DialogRow) -> tuple[int, str]:
+    """Choose a persistent non-recent variant for this connected account.
+
+    The pool is intentionally curated instead of generated freely by AI.  This
+    preserves the exact Telegram UI instruction while avoiding visible template
+    repetition across users and process restarts.
+    """
+    variants = LINK_ACCESS_HELP_VARIANTS
+    if not variants:
+        raise RuntimeError("LINK_ACCESS_HELP_VARIANTS is empty")
+
+    recent_window = min(12, max(1, len(variants) - 1))
+    cursor = conn.cursor()
+    try:
+        recent_rows = cursor.execute(
+            """
+            SELECT variant_index
+            FROM ai_link_help_usage
+            WHERE account_user_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (dialog.account_user_id, recent_window),
+        ).fetchall()
+        recent = {int(row[0]) for row in recent_rows if 0 <= int(row[0]) < len(variants)}
+        candidates = [index for index in range(len(variants)) if index not in recent]
+        if not candidates:
+            last = int(recent_rows[0][0]) if recent_rows else -1
+            candidates = [index for index in range(len(variants)) if index != last]
+        variant_index = random.choice(candidates or list(range(len(variants))))
+        message = variants[variant_index]
+        if not validate_link_access_help(message):
+            raise ValueError(f"invalid link-help variant: {variant_index}")
+
+        cursor.execute(
+            """
+            INSERT INTO ai_link_help_usage
+                (account_user_id, target_user_id, dialog_id, variant_index, used_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                dialog.account_user_id,
+                dialog.target_user_id,
+                dialog.id,
+                variant_index,
+                _now_iso(),
+            ),
+        )
+        # Keep the table bounded without losing enough history for rotation.
+        cursor.execute(
+            """
+            DELETE FROM ai_link_help_usage
+            WHERE account_user_id = ?
+              AND id NOT IN (
+                  SELECT id FROM ai_link_help_usage
+                  WHERE account_user_id = ?
+                  ORDER BY id DESC
+                  LIMIT 240
+              )
+            """,
+            (dialog.account_user_id, dialog.account_user_id),
+        )
+        conn.commit()
+        return variant_index, message
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+
+
+async def _send_automatic_link_help(
+    *, dialog: DialogRow, client: TelegramClient, sender: User
+) -> bool:
+    """Send one varied hint after a delivered invitation link.
+
+    Failure of this optional hint never converts a successfully delivered link
+    into a Telegram send error for the whole dialog.
+    """
+    try:
+        variant_index, message = _select_link_help_variant(dialog)
+    except Exception as exc:
+        logger.error(
+            f"[AI DM] link-help variant selection failed: dialog={dialog.id}, "
+            f"user={sender.id}: {exc}"
+        )
+        return False
+
+    await _link_help_delay()
+    sent = await _safe_send_message(
+        client, sender, message, f"link_access_auto_help_{variant_index}"
+    )
+    if not sent:
+        logger.warning(
+            f"[AI DM] invitation link delivered but automatic help failed: "
+            f"dialog={dialog.id}, user={sender.id}, variant={variant_index}"
+        )
+        return False
+
+    _save_message(
+        dialog.id,
+        "outgoing",
+        message,
+        provider="local",
+        model="link_access_auto_help",
+    )
+    _mark_outgoing(dialog.id)
+    logger.info(
+        f"[AI DM] automatic link help sent: dialog={dialog.id}, "
+        f"user={sender.id}, variant={variant_index}"
+    )
+    return True
+
+
 def _fit_plan_to_remaining(plan: FunnelPlan, remaining: int) -> FunnelPlan:
     """Keep the approved follow-up cap while preserving a link-bearing final reply."""
     remaining = max(0, remaining)
@@ -756,6 +897,7 @@ async def _send_maxim_plan(
         return False
 
     provider = "local" if plan.model.startswith("local_") else "openai"
+    invitation_link_delivered = False
     for index, message in enumerate(plan.messages, start=1):
         sent = await _safe_send_message(client, sender, message, f"maxim_{plan.action}_{index}")
         if not sent:
@@ -770,8 +912,17 @@ async def _send_maxim_plan(
             tokens_used=plan.tokens_used if index == 1 else 0,
         )
         _mark_outgoing(dialog.id)
+        if PIRATE_VIP_LINK_TOKEN in message:
+            invitation_link_delivered = True
         if index < len(plan.messages):
             await _burst_delay()
+
+    if invitation_link_delivered:
+        await _send_automatic_link_help(
+            dialog=dialog,
+            client=client,
+            sender=sender,
+        )
     return True
 
 
@@ -1038,7 +1189,12 @@ async def handle_private_incoming(
             )
             if not sent:
                 return
-            _finalize_completed_dialog(dialog, "natural_finish_after_link")
+            completion_reason = (
+                "completed_no_interest"
+                if plan.action == "soft_decline"
+                else "natural_finish_after_link"
+            )
+            _finalize_completed_dialog(dialog, completion_reason)
             logger.info(
                 f"[AI DM] post-link dialog completed: dialog={dialog.id}, user={sender.id}"
             )
@@ -1111,7 +1267,12 @@ async def handle_private_incoming(
                 f"dialog={dialog.id}, user={sender.id}, action={plan.action}"
             )
         elif plan.close_after:
-            _finalize_completed_dialog(dialog, "logical_finish")
+            completion_reason = (
+                "completed_no_interest"
+                if plan.action == "soft_decline"
+                else "logical_finish"
+            )
+            _finalize_completed_dialog(dialog, completion_reason)
             logger.info(
                 f"[AI DM] Maxim dialog completed without link: "
                 f"dialog={dialog.id}, user={sender.id}, action={plan.action}"

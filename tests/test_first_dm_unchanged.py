@@ -15,20 +15,21 @@ class FirstDmIntegrityTests(unittest.TestCase):
             "a34f2613c338b1f89284335d2462cc1ed1b1e43b3063dcdf4a511a3b7f0f32aa",
         )
 
-    def test_first_dm_runtime_keeps_two_item_queue_and_original_selector(self) -> None:
+    def test_first_dm_runtime_uses_safe_queue_and_original_selector(self) -> None:
         path = Path(__file__).resolve().parents[1] / "handlers" / "dm" / "dm_handlers.py"
         source = path.read_text(encoding="utf-8")
-        self.assertIn("queue.append((target_id, sender))", source)
-        self.assertIn("target_id, sender = queue.popleft()", source)
+        self.assertIn("enqueue_pending(", source)
+        self.assertIn("get_due_pending(account_user_id)", source)
+        self.assertIn("claim_pending(row_id)", source)
         self.assertRegex(
             source,
             re.compile(r"outgoing_text\s*=\s*\(\s*choose_first_dm_text", re.S),
         )
         self.assertIn("if is_opted_out(target_id):", source)
-        self.assertIn("if is_completed_contact(task[\"user_id\"], target_id):", source)
-        self.assertIn("if is_contact_in_progress(task[\"user_id\"], target_id):", source)
-        self.assertIn("claim_token = try_claim_first_dm(", source)
-        self.assertIn("claim_token=claim_token", source)
+        self.assertIn("if is_completed_contact(account_user_id, target_id):", source)
+        self.assertIn("if is_contact_in_progress(account_user_id, target_id):", source)
+        self.assertIn("first_claim = try_claim_first_dm(", source)
+        self.assertIn("claim_token=first_claim", source)
 
     def test_contact_analytics_symbols_are_imported_before_runtime_use(self) -> None:
         path = Path(__file__).resolve().parents[1] / "handlers" / "dm" / "dm_handlers.py"

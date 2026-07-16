@@ -1,47 +1,52 @@
-"""DM Autoposter — автопостер в личные сообщения.
+"""DM Autoposter: watched-chat triggers and safe persistent first-DM dispatch."""
 
-Фичи:
-  - Случайная задержка между отправками (мин-макс секунд)
-  - Рандомная очередь (перемешивание pending-пользователей)
-  - Закрытый ЛС → пользователь в blacklist на 24ч, не спамим повторно
-  - Интервал повтора одному человеку (уже был)
-"""
-
-from services.menu_ui import render_menu
-from services.admin_state import clear_admin_interaction_state, is_command_event
+from __future__ import annotations
 
 import asyncio
 import datetime
-import random
-from collections import deque
-from loguru import logger
+from types import SimpleNamespace
 from typing import Optional
-from weakref import WeakValueDictionary
 
+from loguru import logger
 from telethon import TelegramClient, events
 from telethon.errors import (
-    UserPrivacyRestrictedError,
     FloodWaitError,
     InputUserDeactivatedError,
-    UserIsBlockedError,
     PeerFloodError,
+    UserIsBlockedError,
+    UserPrivacyRestrictedError,
 )
 from telethon.sessions import StringSession
 from telethon.tl.custom import Button
-from telethon.tl.types import InputPeerChannel, InputPeerChat, PeerChannel, PeerChat, User
+from telethon.tl.types import (
+    InputPeerChannel,
+    InputPeerChat,
+    InputPeerUser,
+    PeerChannel,
+    PeerChat,
+    PeerUser,
+    User,
+)
 
 from config import (
-    API_ID, API_HASH,
-    bot, conn,
-    New_Message, Query,
-    callback_query, callback_message,
-    ADMIN_ID_LIST, MEDIA_DIR,
+    ADMIN_ID_LIST,
+    API_HASH,
+    API_ID,
+    MEDIA_DIR,
+    New_Message,
+    Query,
+    bot,
+    callback_message,
+    callback_query,
+    conn,
 )
-from utils.database.database import create_dm_tables
-from utils.telegram import gid_key
-from services.first_message import choose_first_dm_text, is_random_first_dm_enabled
+from services.account_profiles import (
+    format_account_label,
+    refresh_stale_account_profiles,
+    save_account_profile,
+)
+from services.admin_state import clear_admin_interaction_state, is_command_event
 from services.ai_dialog_service import handle_private_incoming, record_first_dm
-from services.dm_opt_out import is_opted_out, register_queue_purger
 from services.dm_contact_analytics import (
     is_completed_contact,
     is_contact_in_progress,
@@ -51,106 +56,74 @@ from services.dm_contact_analytics import (
     release_first_dm_claim,
     try_claim_first_dm,
 )
+from services.dm_opt_out import is_opted_out, register_queue_purger
 from services.dm_task_cleanup import (
     count_active_dm_tasks,
     count_inactive_dm_tasks,
     delete_inactive_dm_tasks,
 )
+from services.dm_task_queue import (
+    account_gate_wait_seconds,
+    cancel_account_target,
+    cancel_row,
+    cancel_target_globally,
+    count_pending,
+    claim_pending,
+    clear_task_pending,
+    earliest_due_at,
+    enqueue_pending,
+    finalize_sent,
+    get_account_dispatch_state,
+    get_due_pending,
+    mark_account_send_completed,
+    mark_sending,
+    mark_uncertain,
+    MAX_DELAY_SECONDS,
+    pause_account,
+    prepare_tasks_for_deletion,
+    reassign_task_pending_to_active_sources,
+    recover_stale_queue,
+    schedule_retry,
+    set_account_cooldown,
+)
+from services.first_message import choose_first_dm_text, is_random_first_dm_enabled
+from services.menu_ui import render_menu
+from utils.database.database import create_dm_tables
+from utils.telegram import gid_key
 
-# ─── состояние диалога настройки ──────────────────────────────────────────────
+# Admin setup state.
 dm_setup_state: dict = {}
 
-# ─── активные клиенты и задачи ────────────────────────────────────────────────
-dm_monitor_clients: dict = {}   # task_id → TelegramClient
-dm_monitor_tasks: dict = {}     # task_id → asyncio.Task
+# One monitor/client per task remains in stage B. Stage C will consolidate them
+# into one account-level Telethon runtime without changing this queue contract.
+dm_monitor_clients: dict[int, TelegramClient] = {}
+dm_monitor_tasks: dict[int, asyncio.Task] = {}
+dm_account_dispatcher_tasks: dict[int, asyncio.Task] = {}
 
-# ─── очереди отправки (рандомайзер) ───────────────────────────────────────────
-# task_id → deque of (target_user_id, sender_obj)
-dm_send_queues: dict = {}
-
-# Название исходного чата хранится отдельно, чтобы не менять рабочий формат
-# очереди первого DM: (task_id, target_user_id) → source_chat_title.
+# Compatibility-only alias for old imports. The live first-DM queue is now SQLite.
+dm_send_queues: dict[int, tuple] = {}
 dm_source_chat_titles: dict[tuple[int, int], str] = {}
 dm_source_chat_ids: dict[tuple[int, int], int] = {}
 
-# Serialize the final eligibility check and actual first-DM delivery for one
-# sender-account/recipient pair. This prevents two active DM tasks of the same
-# connected account from sending duplicate first messages at the same moment.
-_contact_send_locks: WeakValueDictionary[tuple[int, int], asyncio.Lock] = WeakValueDictionary()
+_task_operation_locks: dict[int, tuple[asyncio.AbstractEventLoop, asyncio.Lock]] = {}
 
 
-def _get_contact_send_lock(account_user_id: int, target_user_id: int) -> asyncio.Lock:
-    key = (int(account_user_id), int(target_user_id))
-    lock = _contact_send_locks.get(key)
-    if lock is None:
-        lock = asyncio.Lock()
-        _contact_send_locks[key] = lock
-    return lock
+def get_dm_task_operation_lock(task_id: int) -> asyncio.Lock:
+    """Return a task lock bound to the current event loop.
 
-
-def _drop_source_metadata(task_id: int, target_user_id: int) -> None:
-    dm_source_chat_titles.pop((int(task_id), int(target_user_id)), None)
-    dm_source_chat_ids.pop((int(task_id), int(target_user_id)), None)
-
-
-def _purge_user_from_all_dm_queues(target_user_id: int) -> int:
-    """Remove an opted-out user from every live first-DM queue."""
-    removed = 0
-    target_user_id = int(target_user_id)
-    for task_id, queue in list(dm_send_queues.items()):
-        kept = [item for item in queue if int(item[0]) != target_user_id]
-        removed += len(queue) - len(kept)
-        if len(kept) != len(queue):
-            queue.clear()
-            queue.extend(kept)
-            logger.info(
-                f"[DM opt-out] user={target_user_id} removed from task={task_id} queue"
-            )
-    for key in [key for key in dm_source_chat_titles if key[1] == target_user_id]:
-        dm_source_chat_titles.pop(key, None)
-    for key in [key for key in dm_source_chat_ids if key[1] == target_user_id]:
-        dm_source_chat_ids.pop(key, None)
-    return removed
-
-
-register_queue_purger(_purge_user_from_all_dm_queues)
-
-
-def _purge_completed_user_from_account_queues(
-    account_user_id: int, target_user_id: int
-) -> int:
-    """Remove stale queued copies for the account that finished the dialog.
-
-    This is essential for the approved cleanup semantics: after an administrator
-    clears a completed-contact block, no old queue entry may fire immediately. A
-    fresh group message must be observed first.
+    Railway uses one loop, while tests and controlled restarts may create a new
+    loop in the same process. Replacing a stale loop-bound lock avoids a false
+    RuntimeError without weakening synchronization inside the active loop.
     """
-    removed = 0
-    account_user_id = int(account_user_id)
-    target_user_id = int(target_user_id)
-    for task_id, queue in list(dm_send_queues.items()):
-        task = _get_task(task_id)
-        if not task or int(task["user_id"]) != account_user_id:
-            continue
-        kept = [item for item in queue if int(item[0]) != target_user_id]
-        removed += len(queue) - len(kept)
-        if len(kept) != len(queue):
-            queue.clear()
-            queue.extend(kept)
-            _drop_source_metadata(task_id, target_user_id)
-            logger.info(
-                f"[DM completed] account={account_user_id} user={target_user_id} "
-                f"removed from task={task_id} queue"
-            )
-    return removed
+    task_id = int(task_id)
+    loop = asyncio.get_running_loop()
+    current = _task_operation_locks.get(task_id)
+    if current is None or current[0] is not loop:
+        lock = asyncio.Lock()
+        _task_operation_locks[task_id] = (loop, lock)
+        return lock
+    return current[1]
 
-
-register_completed_queue_purger(_purge_completed_user_from_account_queues)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Вспомогательные функции
-# ══════════════════════════════════════════════════════════════════════════════
 
 def _now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -158,154 +131,132 @@ def _now_iso() -> str:
 
 def _minutes_since(iso_ts: str) -> float:
     try:
-        dt = datetime.datetime.fromisoformat(iso_ts)
+        parsed = datetime.datetime.fromisoformat(iso_ts)
     except (TypeError, ValueError):
-        logger.warning(f"Некорректная дата в DM-логе: {iso_ts!r}")
         return float("inf")
-    if dt.tzinfo is not None:
-        now = datetime.datetime.now(datetime.timezone.utc)
-        dt = dt.astimezone(datetime.timezone.utc)
-    else:
-        now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
-    return max(0.0, (now - dt).total_seconds() / 60)
-
-
-def _already_sent_recently(task_id: int, target_user_id: int, interval_minutes: int) -> bool:
-    """Проверяет интервал повтора одному человеку."""
-    cursor = conn.cursor()
-    cursor.execute(
-        """SELECT sent_at FROM dm_sent_log
-           WHERE dm_task_id = ? AND target_user_id = ? AND status = 'sent'
-           ORDER BY sent_at DESC LIMIT 1""",
-        (task_id, target_user_id),
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return max(
+        0.0,
+        (
+            datetime.datetime.now(datetime.timezone.utc)
+            - parsed.astimezone(datetime.timezone.utc)
+        ).total_seconds()
+        / 60,
     )
-    row = cursor.fetchone()
-    cursor.close()
-    if not row:
-        return False
-    return _minutes_since(row[0]) < interval_minutes
 
 
 def _is_blacklisted(task_id: int, target_user_id: int) -> bool:
-    """Проверяет, в blacklist ли пользователь (закрыл ЛС < 24ч назад)."""
-    cursor = conn.cursor()
-    cursor.execute(
-        """SELECT sent_at FROM dm_sent_log
-           WHERE dm_task_id = ? AND target_user_id = ? AND status = 'privacy'
-           ORDER BY sent_at DESC LIMIT 1""",
-        (task_id, target_user_id),
-    )
-    row = cursor.fetchone()
-    cursor.close()
-    if not row:
-        return False
-    # Блокируем на 24 часа
-    return _minutes_since(row[0]) < 60 * 24
+    row = conn.execute(
+        """
+        SELECT sent_at FROM dm_sent_log
+         WHERE dm_task_id=? AND target_user_id=? AND status='privacy'
+         ORDER BY sent_at DESC LIMIT 1
+        """,
+        (int(task_id), int(target_user_id)),
+    ).fetchone()
+    return bool(row and _minutes_since(row[0]) < 24 * 60)
 
 
 def _log_event(task_id: int, target_user_id: int, status: str) -> None:
-    """status: 'sent' | 'privacy' | 'blocked' | 'error'"""
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO dm_sent_log (dm_task_id, target_user_id, sent_at, status) VALUES (?,?,?,?)",
-        (task_id, target_user_id, _now_iso(), status),
-    )
-    conn.commit()
-    cursor.close()
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO dm_sent_log(dm_task_id, target_user_id, sent_at, status)
+            VALUES (?, ?, ?, ?)
+            """,
+            (int(task_id), int(target_user_id), _now_iso(), str(status)),
+        )
 
 
 def _safe_log_event(task_id: int, target_user_id: int, status: str) -> None:
-    """Persist technical delivery status without turning a sent DM into a retry."""
     try:
         _log_event(task_id, target_user_id, status)
     except Exception as exc:
         logger.error(
-            f"[DM {task_id}] не удалось сохранить статус {status} для {target_user_id}: {exc}"
+            f"[DM {task_id}] failed to persist status={status} user={target_user_id}: {exc}"
         )
 
 
 def _get_task(task_id: int) -> Optional[dict]:
-    cursor = conn.cursor()
-    cursor.execute(
-        """SELECT id, admin_id, user_id, session_string, post_text, photo_url,
-                  interval_minutes, is_active, delay_min, delay_max
-           FROM dm_tasks WHERE id = ?""",
-        (task_id,),
-    )
-    row = cursor.fetchone()
-    cursor.close()
+    row = conn.execute(
+        """
+        SELECT t.id, t.admin_id, t.user_id,
+               COALESCE(s.session_string, t.session_string),
+               t.post_text, t.photo_url, t.interval_minutes, t.is_active,
+               t.delay_min, t.delay_max
+          FROM dm_tasks AS t
+          LEFT JOIN sessions AS s ON s.user_id=t.user_id
+         WHERE t.id=?
+        """,
+        (int(task_id),),
+    ).fetchone()
     if not row:
         return None
-    keys = ["id", "admin_id", "user_id", "session_string", "post_text",
-            "photo_url", "interval_minutes", "is_active", "delay_min", "delay_max"]
+    keys = (
+        "id",
+        "admin_id",
+        "user_id",
+        "session_string",
+        "post_text",
+        "photo_url",
+        "interval_minutes",
+        "is_active",
+        "delay_min",
+        "delay_max",
+    )
     return dict(zip(keys, row))
 
 
-def _get_watched_chats(task_id: int) -> list:
-    cursor = conn.cursor()
-    cursor.execute("SELECT chat_id FROM dm_watched_chats WHERE dm_task_id = ?", (task_id,))
-    rows = cursor.fetchall()
-    cursor.close()
-    return [r[0] for r in rows]
+def _get_watched_chats(task_id: int) -> list[int]:
+    rows = conn.execute(
+        "SELECT chat_id FROM dm_watched_chats WHERE dm_task_id=? ORDER BY id",
+        (int(task_id),),
+    ).fetchall()
+    return [int(row[0]) for row in rows]
 
 
 async def _resolve_watched_chats(
-    client: TelegramClient, user_id: int, chat_ids: list[int]
+    client: TelegramClient, account_user_id: int, chat_ids: list[int]
 ) -> list:
-    """Resolve every available working group, including ordinary memberships.
-
-    New databases use saved access_hash values. Older rows are resolved through
-    the connected account session so tasks created before this patch keep working.
-    """
     if not chat_ids:
         return []
-
     placeholders = ",".join("?" for _ in chat_ids)
-    cursor = conn.cursor()
-    try:
-        discovered_rows = cursor.execute(
-            f"""
-            SELECT group_id, access_hash, peer_type, is_available
-            FROM discovered_groups
-            WHERE user_id = ? AND group_id IN ({placeholders})
-            """,
-            (user_id, *chat_ids),
-        ).fetchall()
-        legacy_rows = cursor.execute(
-            f"""
-            SELECT group_id, group_username
-            FROM groups
-            WHERE user_id = ? AND group_id IN ({placeholders})
-            """,
-            (user_id, *chat_ids),
-        ).fetchall()
-    finally:
-        cursor.close()
-
+    discovered_rows = conn.execute(
+        f"""
+        SELECT group_id, access_hash, peer_type, is_available
+          FROM discovered_groups
+         WHERE user_id=? AND group_id IN ({placeholders})
+        """,
+        (int(account_user_id), *chat_ids),
+    ).fetchall()
+    legacy_rows = conn.execute(
+        f"""
+        SELECT group_id, group_username FROM groups
+         WHERE user_id=? AND group_id IN ({placeholders})
+        """,
+        (int(account_user_id), *chat_ids),
+    ).fetchall()
     discovered = {int(row[0]): row[1:] for row in discovered_rows}
-    identifiers = {int(group_id): identifier for group_id, identifier in legacy_rows}
-    resolved = []
-    seen_ids: set[int] = set()
-
+    identifiers = {int(row[0]): row[1] for row in legacy_rows}
+    resolved: list = []
+    seen: set[int] = set()
     for raw_group_id in chat_ids:
         group_id = gid_key(raw_group_id)
         row = discovered.get(group_id)
         peer = None
         if row is not None:
-            access_hash, peer_type, is_available = row
-            if not is_available:
-                logger.warning(f"Пропускаю недоступную группу {group_id}")
+            access_hash, peer_type, available = row
+            if not available:
                 continue
             if peer_type == "channel" and access_hash is not None:
                 peer = InputPeerChannel(group_id, int(access_hash))
             elif peer_type == "chat":
                 peer = InputPeerChat(group_id)
-
         if peer is None:
-            identifier = identifiers.get(group_id)
             candidates = []
-            if identifier:
-                candidates.append(identifier)
+            if identifiers.get(group_id):
+                candidates.append(identifiers[group_id])
             candidates.extend((PeerChannel(group_id), PeerChat(group_id)))
             for candidate in candidates:
                 try:
@@ -313,255 +264,452 @@ async def _resolve_watched_chats(
                     break
                 except Exception:
                     continue
-
         if peer is None:
-            logger.warning(f"Не удалось восстановить Telegram peer для группы {group_id}")
+            logger.warning(f"[DM] cannot restore watched peer chat={group_id}")
             continue
-
-        peer_key = int(getattr(peer, "channel_id", getattr(peer, "chat_id", group_id)))
-        if peer_key in seen_ids:
+        key = int(getattr(peer, "channel_id", getattr(peer, "chat_id", group_id)))
+        if key in seen:
             continue
-        seen_ids.add(peer_key)
+        seen.add(key)
         resolved.append(peer)
-
     return resolved
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Воркер отправки (рандомная очередь + интервал)
-# ══════════════════════════════════════════════════════════════════════════════
+def _purge_opted_out_user(target_user_id: int) -> int:
+    target_user_id = int(target_user_id)
+    removed = cancel_target_globally(target_user_id, "global_opt_out")
+    for task_id, queue in list(dm_send_queues.items()):
+        try:
+            kept = [item for item in queue if int(item[0]) != target_user_id]
+            removed += len(queue) - len(kept)
+            queue.clear()
+            queue.extend(kept)
+        except (AttributeError, TypeError):
+            continue
+    for key in [key for key in dm_source_chat_titles if key[1] == target_user_id]:
+        dm_source_chat_titles.pop(key, None)
+    for key in [key for key in dm_source_chat_ids if key[1] == target_user_id]:
+        dm_source_chat_ids.pop(key, None)
+    return removed
 
-async def _send_worker(task_id: int, client: TelegramClient) -> None:
-    """Drain one task's unchanged two-item first-DM queue safely.
 
-    The queue format remains exactly ``(target_user_id, sender_obj)``. A shared
-    account/user lock only serializes the final check and delivery so parallel
-    tasks of the same connected account cannot send duplicate first messages.
-    """
-    queue = dm_send_queues.setdefault(task_id, deque())
+def _purge_completed_user(account_user_id: int, target_user_id: int) -> int:
+    account_user_id = int(account_user_id)
+    target_user_id = int(target_user_id)
+    removed = cancel_account_target(
+        account_user_id, target_user_id, "completed_contact"
+    )
+    for task_id, queue in list(dm_send_queues.items()):
+        task = _get_task(task_id)
+        if not task or int(task.get("user_id") or 0) != account_user_id:
+            continue
+        try:
+            kept = [item for item in queue if int(item[0]) != target_user_id]
+            removed += len(queue) - len(kept)
+            queue.clear()
+            queue.extend(kept)
+        except (AttributeError, TypeError):
+            continue
+        dm_source_chat_titles.pop((int(task_id), target_user_id), None)
+        dm_source_chat_ids.pop((int(task_id), target_user_id), None)
+    return removed
 
-    while True:
+
+register_queue_purger(_purge_opted_out_user)
+register_completed_queue_purger(_purge_completed_user)
+
+
+async def _resolve_pending_target(client: TelegramClient, row: dict):
+    target_id = int(row["target_user_id"])
+    access_hash = row.get("target_access_hash")
+    if access_hash is not None:
+        return InputPeerUser(target_id, int(access_hash))
+    username = (row.get("target_username") or "").strip().lstrip("@")
+    candidates = [f"@{username}"] if username else []
+    candidates.append(PeerUser(target_id))
+    for candidate in candidates:
+        try:
+            return await client.get_input_entity(candidate)
+        except (FloodWaitError, PeerFloodError):
+            raise
+        except Exception:
+            continue
+    raise ValueError(f"cannot resolve Telegram peer for user={target_id}")
+
+
+def _target_snapshot(row: dict) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=int(row["target_user_id"]),
+        username=row.get("target_username"),
+        first_name=row.get("target_first_name"),
+        last_name=row.get("target_last_name"),
+        access_hash=row.get("target_access_hash"),
+    )
+
+
+def _unresolved_backoff(attempts: int) -> int:
+    schedule = (60, 300, 900, 3600)
+    return schedule[min(max(int(attempts), 0), len(schedule) - 1)]
+
+
+async def _send_pending_row(row: dict) -> str:
+    row_id = int(row["id"])
+    task_id = int(row["dm_task_id"])
+    account_user_id = int(row["account_user_id"])
+    target_id = int(row["target_user_id"])
+    task_lock = get_dm_task_operation_lock(task_id)
+
+    async with task_lock:
         task = _get_task(task_id)
         if not task or not task["is_active"]:
-            return
+            # A stopped task keeps its queue. get_due_pending() will ignore it
+            # until the task is explicitly started again.
+            return "task_inactive"
 
-        if not queue:
-            await asyncio.sleep(2)
-            continue
+        queue_claim = claim_pending(row_id)
+        if not queue_claim:
+            return "lost_race"
 
-        items = list(queue)
-        random.shuffle(items)
-        queue.clear()
-        queue.extend(items)
-
-        target_id, sender = queue.popleft()
-        source_chat_title = dm_source_chat_titles.get((task_id, target_id))
-        source_chat_id = dm_source_chat_ids.get((task_id, target_id))
-        retry_delay: Optional[int] = None
-        claim_token: Optional[str] = None
-
-        lock = _get_contact_send_lock(task["user_id"], target_id)
-        async with lock:
-            # Re-read the task and all recipient guards inside the shared lock.
-            task = _get_task(task_id)
-            if not task or not task["is_active"]:
-                _drop_source_metadata(task_id, target_id)
-                return
-
-            if is_opted_out(target_id):
-                logger.debug(f"[DM {task_id}] {target_id} в постоянном opt-out, пропуск")
-                _drop_source_metadata(task_id, target_id)
-                continue
-            if is_completed_contact(task["user_id"], target_id):
-                logger.debug(
-                    f"[DM {task_id}] {target_id}: этот аккаунт уже завершил диалог, пропуск"
-                )
-                _drop_source_metadata(task_id, target_id)
-                continue
-            if is_contact_in_progress(task["user_id"], target_id):
-                logger.debug(
-                    f"[DM {task_id}] {target_id}: у этого аккаунта уже идёт диалог, пропуск"
-                )
-                _drop_source_metadata(task_id, target_id)
-                continue
-            if _is_blacklisted(task_id, target_id):
-                logger.debug(f"[DM {task_id}] {target_id} в blacklist, пропуск")
-                _drop_source_metadata(task_id, target_id)
-                continue
-            if _already_sent_recently(task_id, target_id, task["interval_minutes"]):
-                logger.debug(f"[DM {task_id}] {target_id} недавно получал, пропуск")
-                _drop_source_metadata(task_id, target_id)
-                continue
-
-            claim_token = try_claim_first_dm(
-                account_user_id=task["user_id"],
-                target_user_id=target_id,
-                dm_task_id=task_id,
-                source_chat_id=source_chat_id,
+        client = dm_monitor_clients.get(task_id)
+        if client is None or not client.is_connected():
+            schedule_retry(
+                row_id,
+                seconds=30,
+                error="task_client_not_ready",
+                status="retry_wait",
+                claim_token=queue_claim,
             )
-            if not claim_token:
-                logger.debug(
-                    f"[DM {task_id}] {target_id}: first-DM claim занят или контакт уже закрыт"
-                )
-                _drop_source_metadata(task_id, target_id)
-                continue
+            return "retry"
 
-            outgoing_text = (
-                choose_first_dm_text(task["post_text"] or "")
-                or (task["post_text"] or "Привет 👋")
-            )
+        if is_opted_out(target_id):
+            cancel_row(row_id, "global_opt_out", claim_token=queue_claim)
+            return "cancelled"
+        if is_completed_contact(account_user_id, target_id):
+            cancel_row(row_id, "completed_contact", claim_token=queue_claim)
+            return "cancelled"
+        if is_contact_in_progress(account_user_id, target_id):
+            cancel_row(row_id, "dialog_in_progress", claim_token=queue_claim)
+            return "cancelled"
+        if _is_blacklisted(task_id, target_id):
+            cancel_row(row_id, "privacy_blacklist", claim_token=queue_claim)
+            return "cancelled"
 
-            try:
-                if task["photo_url"]:
-                    if outgoing_text and len(outgoing_text) <= 1024:
-                        await client.send_file(
-                            sender, task["photo_url"], caption=outgoing_text
-                        )
-                    else:
-                        await client.send_file(sender, task["photo_url"])
-                        if outgoing_text:
-                            await client.send_message(sender, outgoing_text)
-                else:
-                    await client.send_message(sender, outgoing_text)
-
-            except UserPrivacyRestrictedError:
-                release_first_dm_claim(task["user_id"], target_id, claim_token)
-                _safe_log_event(task_id, target_id, "privacy")
-                logger.info(
-                    f"[DM {task_id}] 🔒 {target_id} закрыл ЛС — в blacklist на 24ч"
-                )
-                _drop_source_metadata(task_id, target_id)
-
-            except (UserIsBlockedError, InputUserDeactivatedError):
-                release_first_dm_claim(task["user_id"], target_id, claim_token)
-                _safe_log_event(task_id, target_id, "blocked")
-                logger.debug(
-                    f"[DM {task_id}] ⛔ {target_id} заблокировал или деактивирован"
-                )
-                _drop_source_metadata(task_id, target_id)
-
-            except PeerFloodError:
-                release_first_dm_claim(task["user_id"], target_id, claim_token)
-                retry_delay = 600
-                logger.warning(f"[DM {task_id}] 🌊 PeerFlood — пауза 10 мин")
-
-            except FloodWaitError as exc:
-                release_first_dm_claim(task["user_id"], target_id, claim_token)
-                retry_delay = max(1, int(exc.seconds))
-                logger.warning(f"[DM {task_id}] ⏳ FloodWait {retry_delay}s")
-
-            except Exception as exc:
-                release_first_dm_claim(task["user_id"], target_id, claim_token)
-                _safe_log_event(task_id, target_id, "error")
-                logger.error(f"[DM {task_id}] ❌ ошибка отправки {target_id}: {exc}")
-                _drop_source_metadata(task_id, target_id)
-
-            else:
-                # Telegram already accepted the DM. Persistence failures below must
-                # never cause the same message to be retried or reported as unsent.
-                _safe_log_event(task_id, target_id, "sent")
-                contact_cycle_id: Optional[int] = None
-                try:
-                    contact_cycle_id = record_contact_first_dm(
-                        dm_task_id=task_id,
-                        account_user_id=task["user_id"],
-                        target_user_id=target_id,
-                        source_chat_id=source_chat_id,
-                        source_chat_title=source_chat_title,
-                        claim_token=claim_token,
-                    )
-                except Exception as exc:
-                    logger.exception(
-                        f"[DM {task_id}] первое DM доставлено, но цикл контакта "
-                        f"для user={target_id} не сохранён; защитный claim оставлен: {exc}"
-                    )
-
-                try:
-                    record_first_dm(
-                        dm_task_id=task_id,
-                        account_user_id=task["user_id"],
-                        target=sender,
-                        text=outgoing_text,
-                        source_chat_id=source_chat_id,
-                        source_chat_title=source_chat_title,
-                        contact_cycle_id=contact_cycle_id,
-                    )
-                except Exception as exc:
-                    logger.exception(
-                        f"[DM {task_id}] первое DM доставлено, но AI-диалог "
-                        f"для user={target_id} не сохранён: {exc}"
-                    )
-
-                username = getattr(sender, "username", None)
-                logger.info(
-                    f"[DM {task_id}] ✅ ЛС → {target_id} (@{username or '?'})"
-                )
-                _drop_source_metadata(task_id, target_id)
-
-        if retry_delay is not None:
-            await asyncio.sleep(retry_delay)
-            latest = _get_task(task_id)
-            if latest and latest["is_active"]:
-                queue.appendleft((target_id, sender))
-            else:
-                _drop_source_metadata(task_id, target_id)
-            continue
+        first_claim = try_claim_first_dm(
+            account_user_id=account_user_id,
+            target_user_id=target_id,
+            dm_task_id=task_id,
+            source_chat_id=row.get("source_chat_id"),
+        )
+        if not first_claim:
+            cancel_row(row_id, "first_dm_claim_unavailable", claim_token=queue_claim)
+            return "cancelled"
 
         try:
-            delay_min = max(0, int(task.get("delay_min") or 30))
-            delay_max = max(delay_min, int(task.get("delay_max") or 90))
-        except (TypeError, ValueError):
-            delay_min, delay_max = 30, 90
-        delay = random.randint(delay_min, delay_max)
-        logger.debug(f"[DM {task_id}] пауза {delay}s перед следующей отправкой")
-        await asyncio.sleep(delay)
+            target_peer = await _resolve_pending_target(client, row)
+        except FloodWaitError as exc:
+            wait_seconds = max(1, int(exc.seconds))
+            release_first_dm_claim(account_user_id, target_id, first_claim)
+            schedule_retry(
+                row_id,
+                seconds=wait_seconds,
+                error=f"peer_resolve_flood_wait_{wait_seconds}",
+                status="retry_wait",
+                claim_token=queue_claim,
+            )
+            set_account_cooldown(account_user_id, wait_seconds, "FloodWait")
+            logger.warning(
+                f"[DM account {account_user_id}] FloodWait {wait_seconds}s while resolving peer"
+            )
+            return "flood_wait"
+        except PeerFloodError:
+            release_first_dm_claim(account_user_id, target_id, first_claim)
+            schedule_retry(
+                row_id,
+                seconds=60,
+                error="peer_resolve_peer_flood_manual_resume_required",
+                status="retry_wait",
+                claim_token=queue_claim,
+            )
+            pause_account(account_user_id, "PeerFlood: ручное возобновление")
+            logger.error(
+                f"[DM account {account_user_id}] PeerFlood while resolving peer; paused"
+            )
+            return "peer_flood"
+        except Exception as exc:
+            delay = _unresolved_backoff(int(row.get("resolve_attempts") or 0))
+            release_first_dm_claim(account_user_id, target_id, first_claim)
+            schedule_retry(
+                row_id,
+                seconds=delay,
+                error=f"peer_resolve_failed: {exc}",
+                status="unresolved_peer",
+                claim_token=queue_claim,
+            )
+            logger.warning(
+                f"[DM {task_id}] unresolved peer user={target_id}; retry in {delay}s"
+            )
+            return "unresolved"
+
+        outgoing_text = (
+            choose_first_dm_text(task["post_text"] or "")
+            or (task["post_text"] or "Привет 👋")
+        )
+        if not mark_sending(row_id, queue_claim):
+            release_first_dm_claim(account_user_id, target_id, first_claim)
+            return "lost_race"
+
+        partial_delivery = False
+        try:
+            if task["photo_url"]:
+                if outgoing_text and len(outgoing_text) <= 1024:
+                    await client.send_file(
+                        target_peer, task["photo_url"], caption=outgoing_text
+                    )
+                else:
+                    await client.send_file(target_peer, task["photo_url"])
+                    partial_delivery = True
+                    if outgoing_text:
+                        await client.send_message(target_peer, outgoing_text)
+            else:
+                await client.send_message(target_peer, outgoing_text)
+        except UserPrivacyRestrictedError:
+            if partial_delivery:
+                mark_uncertain(row_id, "photo_delivered_text_privacy_error")
+                mark_account_send_completed(account_user_id)
+                _safe_log_event(task_id, target_id, "uncertain")
+                return "uncertain"
+            release_first_dm_claim(account_user_id, target_id, first_claim)
+            _safe_log_event(task_id, target_id, "privacy")
+            cancel_row(row_id, "privacy_restricted", claim_token=queue_claim)
+            return "known_failure"
+        except (UserIsBlockedError, InputUserDeactivatedError):
+            if partial_delivery:
+                mark_uncertain(row_id, "photo_delivered_text_blocked_error")
+                mark_account_send_completed(account_user_id)
+                _safe_log_event(task_id, target_id, "uncertain")
+                return "uncertain"
+            release_first_dm_claim(account_user_id, target_id, first_claim)
+            _safe_log_event(task_id, target_id, "blocked")
+            cancel_row(row_id, "blocked_or_deactivated", claim_token=queue_claim)
+            return "known_failure"
+        except FloodWaitError as exc:
+            wait_seconds = max(1, int(exc.seconds))
+            set_account_cooldown(account_user_id, wait_seconds, "FloodWait")
+            if partial_delivery:
+                mark_uncertain(row_id, f"photo_delivered_then_flood_wait_{wait_seconds}")
+                mark_account_send_completed(account_user_id)
+                _safe_log_event(task_id, target_id, "uncertain")
+                logger.warning(
+                    f"[DM account {account_user_id}] partial first DM then FloodWait {wait_seconds}s"
+                )
+                return "uncertain"
+            release_first_dm_claim(account_user_id, target_id, first_claim)
+            schedule_retry(
+                row_id,
+                seconds=wait_seconds,
+                error=f"flood_wait_{wait_seconds}",
+                status="retry_wait",
+                claim_token=queue_claim,
+            )
+            logger.warning(
+                f"[DM account {account_user_id}] FloodWait {wait_seconds}s; all first DMs paused"
+            )
+            return "flood_wait"
+        except PeerFloodError:
+            pause_account(account_user_id, "PeerFlood: ручное возобновление")
+            if partial_delivery:
+                mark_uncertain(row_id, "photo_delivered_then_peer_flood")
+                mark_account_send_completed(account_user_id)
+                _safe_log_event(task_id, target_id, "uncertain")
+                logger.error(
+                    f"[DM account {account_user_id}] partial first DM then PeerFlood; paused"
+                )
+                return "uncertain"
+            release_first_dm_claim(account_user_id, target_id, first_claim)
+            schedule_retry(
+                row_id,
+                seconds=60,
+                error="peer_flood_manual_resume_required",
+                status="retry_wait",
+                claim_token=queue_claim,
+            )
+            logger.error(
+                f"[DM account {account_user_id}] PeerFlood; first DMs paused until admin resume"
+            )
+            return "peer_flood"
+        except asyncio.CancelledError:
+            mark_uncertain(row_id, "dispatcher_cancelled_during_send")
+            # The request may already have reached Telegram. Preserve account pacing
+            # across a graceful shutdown/restart as an additional safety margin.
+            mark_account_send_completed(account_user_id)
+            logger.error(
+                f"[DM {task_id}] cancelled during Telegram send user={target_id}; marked uncertain"
+            )
+            raise
+        except Exception as exc:
+            # A network/transport exception can happen after Telegram accepted the
+            # request. Do not blindly retry and risk a duplicate first DM.
+            mark_uncertain(row_id, f"unknown_send_result: {type(exc).__name__}: {exc}")
+            mark_account_send_completed(account_user_id)
+            _safe_log_event(task_id, target_id, "error")
+            logger.exception(
+                f"[DM {task_id}] uncertain first-DM result user={target_id}: {exc}"
+            )
+            return "uncertain"
+
+        try:
+            queue_finalized = finalize_sent(row_id, queue_claim)
+        except Exception as exc:
+            queue_finalized = False
+            logger.exception(
+                f"[DM {task_id}] Telegram accepted first DM but queue finalization failed "
+                f"user={target_id}: {exc}"
+            )
+        if not queue_finalized:
+            mark_uncertain(row_id, "telegram_accepted_queue_finalize_failed")
+        _safe_log_event(task_id, target_id, "sent")
+        contact_cycle_id: Optional[int] = None
+        try:
+            contact_cycle_id = record_contact_first_dm(
+                dm_task_id=task_id,
+                account_user_id=account_user_id,
+                target_user_id=target_id,
+                source_chat_id=row.get("source_chat_id"),
+                source_chat_title=row.get("source_chat_title"),
+                claim_token=first_claim,
+            )
+        except Exception as exc:
+            logger.exception(
+                f"[DM {task_id}] delivered but contact cycle save failed user={target_id}: {exc}"
+            )
+        try:
+            record_first_dm(
+                dm_task_id=task_id,
+                account_user_id=account_user_id,
+                target=_target_snapshot(row),
+                text=outgoing_text,
+                source_chat_id=row.get("source_chat_id"),
+                source_chat_title=row.get("source_chat_title"),
+                contact_cycle_id=contact_cycle_id,
+            )
+        except Exception as exc:
+            logger.exception(
+                f"[DM {task_id}] delivered but AI dialog save failed user={target_id}: {exc}"
+            )
+        pacing = mark_account_send_completed(account_user_id)
+        logger.info(
+            f"[DM {task_id}] first DM delivered user={target_id}; account pacing={pacing}s"
+        )
+        return "sent"
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Ядро мониторинга
-# ══════════════════════════════════════════════════════════════════════════════
+def _account_has_active_tasks(account_user_id: int) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM dm_tasks WHERE user_id=? AND is_active=1 LIMIT 1",
+        (int(account_user_id),),
+    ).fetchone()
+    return bool(row)
+
+
+async def _account_dispatch_loop(account_user_id: int) -> None:
+    account_user_id = int(account_user_id)
+    logger.info(f"[DM dispatcher] account={account_user_id} started")
+    try:
+        while True:
+            state = get_account_dispatch_state(account_user_id)
+            if state.is_paused:
+                await asyncio.sleep(5)
+                continue
+
+            gate_wait = account_gate_wait_seconds(account_user_id)
+            if gate_wait is None:
+                await asyncio.sleep(5)
+                continue
+            if gate_wait > 0:
+                await asyncio.sleep(min(max(gate_wait, 0.25), 30.0))
+                continue
+
+            row = get_due_pending(account_user_id)
+            if row is None:
+                earliest = earliest_due_at(account_user_id)
+                if earliest is None:
+                    if not _account_has_active_tasks(account_user_id):
+                        logger.info(
+                            f"[DM dispatcher] account={account_user_id} has no active tasks; exiting"
+                        )
+                        return
+                    await asyncio.sleep(2)
+                else:
+                    wait = max(
+                        0.25,
+                        (
+                            earliest
+                            - datetime.datetime.now(datetime.timezone.utc)
+                        ).total_seconds(),
+                    )
+                    await asyncio.sleep(min(wait, 30.0))
+                continue
+
+            await _send_pending_row(row)
+            await asyncio.sleep(0.25)
+    except asyncio.CancelledError:
+        logger.info(f"[DM dispatcher] account={account_user_id} stopped")
+        raise
+    except Exception as exc:
+        logger.exception(
+            f"[DM dispatcher] account={account_user_id} crashed: {exc}"
+        )
+    finally:
+        current = dm_account_dispatcher_tasks.get(account_user_id)
+        if current is asyncio.current_task():
+            dm_account_dispatcher_tasks.pop(account_user_id, None)
+
+
+def ensure_account_dispatcher(account_user_id: int) -> None:
+    account_user_id = int(account_user_id)
+    existing = dm_account_dispatcher_tasks.get(account_user_id)
+    if existing and not existing.done():
+        return
+    dm_account_dispatcher_tasks[account_user_id] = bot.loop.create_task(
+        _account_dispatch_loop(account_user_id),
+        name=f"dm-account-dispatch-{account_user_id}",
+    )
+
 
 async def _monitor_loop(task_id: int) -> None:
     task = _get_task(task_id)
-    if not task or not task["is_active"]:
+    if not task or not task["is_active"] or not task.get("session_string"):
         return
-
     client = TelegramClient(StringSession(task["session_string"]), API_ID, API_HASH)
-    worker: Optional[asyncio.Task] = None
-
     try:
         await client.connect()
         if not await client.is_user_authorized():
-            logger.error(f"[DM task {task_id}] сессия не авторизована")
+            logger.error(f"[DM task {task_id}] session is not authorized")
             return
+        try:
+            save_account_profile(await client.get_me())
+        except Exception as exc:
+            logger.warning(f"[DM task {task_id}] profile refresh failed: {exc}")
 
-        watched_chat_ids = _get_watched_chats(task_id)
-        watched_chats = await _resolve_watched_chats(client, task["user_id"], watched_chat_ids)
-        if not watched_chats:
-            logger.warning(f"[DM task {task_id}] нет доступных групп для мониторинга")
+        watched_ids = _get_watched_chats(task_id)
+        watched = await _resolve_watched_chats(client, task["user_id"], watched_ids)
+        if not watched:
+            logger.warning(f"[DM task {task_id}] no available watched chats")
             return
-
-        logger.info(f"[DM task {task_id}] запуск мониторинга, групп: {len(watched_chats)}")
 
         dm_monitor_clients[task_id] = client
-        dm_send_queues[task_id] = deque()
-
-        # Запускаем воркер отправки
-        worker = asyncio.create_task(_send_worker(task_id, client), name=f"dm-send-{task_id}")
+        ensure_account_dispatcher(task["user_id"])
+        logger.info(f"[DM task {task_id}] monitoring {len(watched)} chats")
 
         @client.on(events.NewMessage(incoming=True))
         async def on_private_message(event):
-            # AI-слой отвечает только на входящие личные сообщения от людей,
-            # которым уже был отправлен первый DM и для которых есть active dialog.
             if not event.is_private:
                 return
             try:
                 sender = await event.get_sender()
             except Exception:
                 return
-            if not isinstance(sender, User):
-                return
-            if sender.bot or sender.is_self:
+            if not isinstance(sender, User) or sender.bot or sender.is_self:
                 return
             await handle_private_incoming(
                 dm_task_id=task_id,
@@ -572,7 +720,7 @@ async def _monitor_loop(task_id: int) -> None:
                 message_id=getattr(event, "id", None),
             )
 
-        @client.on(events.NewMessage(chats=watched_chats, incoming=True))
+        @client.on(events.NewMessage(chats=watched, incoming=True))
         async def on_chat_message(event):
             if not event.is_group and not event.is_channel:
                 return
@@ -580,16 +728,13 @@ async def _monitor_loop(task_id: int) -> None:
                 sender = await event.get_sender()
             except Exception:
                 return
-            if not isinstance(sender, User):
-                return
-            if sender.bot or sender.is_self:
+            if not isinstance(sender, User) or sender.bot or sender.is_self:
                 return
 
-            target_id = sender.id
-            t = _get_task(task_id)
-            if not t or not t["is_active"]:
+            current_task = _get_task(task_id)
+            if not current_task or not current_task["is_active"]:
                 return
-
+            target_id = int(sender.id)
             source_chat_id = None
             source_chat_title = None
             try:
@@ -599,13 +744,13 @@ async def _monitor_loop(task_id: int) -> None:
                 source_chat_title = getattr(source_chat, "title", None)
             except Exception as exc:
                 logger.debug(
-                    f"[DM {task_id}] не удалось получить исходный чат для user={target_id}: {exc}"
+                    f"[DM {task_id}] source chat unavailable user={target_id}: {exc}"
                 )
 
             if source_chat_id is not None:
                 try:
                     record_source_seen(
-                        account_user_id=t["user_id"],
+                        account_user_id=current_task["user_id"],
                         target_user_id=target_id,
                         source_chat_id=source_chat_id,
                         source_chat_title=(
@@ -613,102 +758,149 @@ async def _monitor_loop(task_id: int) -> None:
                         ),
                     )
                 except Exception as exc:
-                    # Analytics must never break the original group-message trigger.
                     logger.error(
-                        f"[DM {task_id}] не удалось сохранить источник для "
-                        f"user={target_id}: {exc}"
+                        f"[DM {task_id}] source analytics failed user={target_id}: {exc}"
                     )
 
-            # Глобальный постоянный opt-out действует для всех аккаунтов и задач.
             if is_opted_out(target_id):
-                logger.debug(f"[DM {task_id}] {target_id} в постоянном opt-out, в очередь не добавлен")
                 return
-            # Утверждённое правило: завершённый контакт блокирует повторный первый DM
-            # только для того подключённого аккаунта, который уже завершил диалог.
-            if is_completed_contact(t["user_id"], target_id):
-                logger.debug(f"[DM {task_id}] {target_id}: завершённый контакт этого аккаунта")
+            if is_completed_contact(current_task["user_id"], target_id):
                 return
-            if is_contact_in_progress(t["user_id"], target_id):
-                logger.debug(f"[DM {task_id}] {target_id}: диалог этого аккаунта уже активен")
+            if is_contact_in_progress(current_task["user_id"], target_id):
                 return
             if _is_blacklisted(task_id, target_id):
                 return
-            if _already_sent_recently(task_id, target_id, t["interval_minutes"]):
-                return
 
-            # Проверяем, не в очереди ли уже
-            queue = dm_send_queues.setdefault(task_id, deque())
-            if any(uid == target_id for uid, _ in queue):
-                return
+            created, pending_id = enqueue_pending(
+                dm_task_id=task_id,
+                account_user_id=current_task["user_id"],
+                target_user_id=target_id,
+                target_access_hash=getattr(sender, "access_hash", None),
+                target_username=getattr(sender, "username", None),
+                target_first_name=getattr(sender, "first_name", None),
+                target_last_name=getattr(sender, "last_name", None),
+                source_chat_id=source_chat_id,
+                source_chat_title=(
+                    str(source_chat_title) if source_chat_title else None
+                ),
+                delay_min=int(current_task.get("delay_min") or 0),
+                delay_max=int(current_task.get("delay_max") or 0),
+            )
+            ensure_account_dispatcher(current_task["user_id"])
+            logger.debug(
+                f"[DM {task_id}] queue user={target_id} pending={pending_id} created={created}"
+            )
 
-            if source_chat_title:
-                dm_source_chat_titles[(task_id, target_id)] = str(source_chat_title)
-            if source_chat_id is not None:
-                dm_source_chat_ids[(task_id, target_id)] = source_chat_id
-
-            queue.append((target_id, sender))
-            logger.debug(f"[DM {task_id}] добавлен в очередь: {target_id}, размер очереди: {len(queue)}")
-
-        # Держим клиент живым
         while True:
-            t = _get_task(task_id)
-            if not t or not t["is_active"]:
-                logger.info(f"[DM task {task_id}] задача остановлена")
-                if worker and not worker.done():
-                    worker.cancel()
+            current_task = _get_task(task_id)
+            if not current_task or not current_task["is_active"]:
                 break
             if not client.is_connected():
-                logger.warning(f"[DM task {task_id}] реконнект...")
                 await client.connect()
+            ensure_account_dispatcher(task["user_id"])
             await asyncio.sleep(15)
-
     except asyncio.CancelledError:
-        logger.info(f"[DM task {task_id}] отменена")
-    except Exception as e:
-        logger.error(f"[DM task {task_id}] критическая ошибка: {e}")
+        logger.info(f"[DM task {task_id}] monitor cancelled")
+        raise
+    except Exception as exc:
+        logger.exception(f"[DM task {task_id}] monitor crashed: {exc}")
     finally:
-        if worker and not worker.done():
-            worker.cancel()
-            try:
-                await worker
-            except asyncio.CancelledError:
-                pass
-            except Exception as exc:
-                logger.debug(f"[DM task {task_id}] ошибка завершения worker: {exc}")
+        dm_monitor_clients.pop(task_id, None)
         try:
             await client.disconnect()
-        except Exception as exc:
-            logger.debug(f"[DM task {task_id}] ошибка отключения клиента: {exc}")
-        dm_monitor_clients.pop(task_id, None)
+        except Exception:
+            pass
         current = dm_monitor_tasks.get(task_id)
         if current is asyncio.current_task():
             dm_monitor_tasks.pop(task_id, None)
-        dm_send_queues.pop(task_id, None)
-        for key in [key for key in dm_source_chat_titles if key[0] == task_id]:
-            dm_source_chat_titles.pop(key, None)
-        for key in [key for key in dm_source_chat_ids if key[0] == task_id]:
-            dm_source_chat_ids.pop(key, None)
 
 
 def _launch_monitor(task_id: int) -> None:
+    task_id = int(task_id)
     existing = dm_monitor_tasks.get(task_id)
     if existing and not existing.done():
-        logger.debug(f"[DM task {task_id}] монитор уже запущен")
         return
-    task = bot.loop.create_task(_monitor_loop(task_id), name=f"dm-monitor-{task_id}")
-    dm_monitor_tasks[task_id] = task
+    dm_monitor_tasks[task_id] = bot.loop.create_task(
+        _monitor_loop(task_id), name=f"dm-monitor-{task_id}"
+    )
+
+
+async def stop_dm_task_runtime(task_id: int, *, preserve_queue: bool = True) -> bool:
+    task_id = int(task_id)
+    lock = get_dm_task_operation_lock(task_id)
+    async with lock:
+        with conn:
+            cursor = conn.execute(
+                "UPDATE dm_tasks SET is_active=0 WHERE id=?", (task_id,)
+            )
+        if int(cursor.rowcount or 0) != 1:
+            return False
+        if preserve_queue:
+            reassign_task_pending_to_active_sources(task_id)
+        else:
+            clear_task_pending(task_id, "task_stopped_and_queue_cleared")
+        monitor = dm_monitor_tasks.get(task_id)
+        if monitor and not monitor.done():
+            monitor.cancel()
+            await asyncio.gather(monitor, return_exceptions=True)
+    return True
+
+
+async def start_dm_task_runtime(task_id: int) -> bool:
+    task_id = int(task_id)
+    lock = get_dm_task_operation_lock(task_id)
+    async with lock:
+        task = _get_task(task_id)
+        if not task or not task.get("session_string") or not _get_watched_chats(task_id):
+            return False
+        with conn:
+            conn.execute("UPDATE dm_tasks SET is_active=1 WHERE id=?", (task_id,))
+    _launch_monitor(task_id)
+    return True
+
+
+async def restart_dm_task_runtime(task_id: int) -> bool:
+    task_id = int(task_id)
+    lock = get_dm_task_operation_lock(task_id)
+    async with lock:
+        task = _get_task(task_id)
+        if not task:
+            return False
+        monitor = dm_monitor_tasks.get(task_id)
+        if monitor and not monitor.done():
+            monitor.cancel()
+            await asyncio.gather(monitor, return_exceptions=True)
+        current = _get_task(task_id)
+        if current and current["is_active"]:
+            _launch_monitor(task_id)
+    return True
+
+
+async def delete_dm_task_runtime(task_id: int) -> bool:
+    task_id = int(task_id)
+    if not _get_task(task_id):
+        return False
+    await stop_dm_task_runtime(task_id, preserve_queue=True)
+    lock = get_dm_task_operation_lock(task_id)
+    async with lock:
+        prepare_tasks_for_deletion([task_id])
+        with conn:
+            conn.execute("DELETE FROM dm_watched_chats WHERE dm_task_id=?", (task_id,))
+            cursor = conn.execute("DELETE FROM dm_tasks WHERE id=?", (task_id,))
+    return int(cursor.rowcount or 0) == 1
 
 
 async def restore_dm_tasks() -> None:
     create_dm_tables()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id FROM dm_tasks WHERE is_active = 1")
-    rows = cursor.fetchall()
-    cursor.close()
-    logger.info(f"[DM restore] активных задач: {len(rows)}")
-    for (task_id,) in rows:
-        _launch_monitor(task_id)
-
+    recovery = recover_stale_queue()
+    if recovery["claimed_recovered"] or recovery["sending_uncertain"]:
+        logger.warning(f"[DM restore] queue recovery: {recovery}")
+    rows = conn.execute(
+        "SELECT id, user_id FROM dm_tasks WHERE is_active=1 ORDER BY id"
+    ).fetchall()
+    logger.info(f"[DM restore] active tasks: {len(rows)}")
+    for task_id, _account_user_id in rows:
+        _launch_monitor(int(task_id))
 
 # ══════════════════════════════════════════════════════════════════════════════
 # UI настройки
@@ -719,15 +911,40 @@ async def cmd_dm_post(event: callback_message) -> None:
     if event.sender_id not in ADMIN_ID_LIST:
         return
     cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM sessions")
+    cursor.execute("SELECT user_id, session_string FROM sessions ORDER BY user_id")
     sessions = cursor.fetchall()
     cursor.close()
     if not sessions:
         await render_menu(event, "⚠ Нет добавленных аккаунтов. Сначала добавьте через /start.", buttons=[[Button.inline("🏠 Главное меню", b"menu_home")]])
         return
+
+    active_clients: dict[int, TelegramClient] = {}
+    for task_id, client in list(dm_monitor_clients.items()):
+        task = _get_task(task_id)
+        if not task or not client.is_connected():
+            continue
+        active_clients.setdefault(int(task["user_id"]), client)
+
+    try:
+        await refresh_stale_account_profiles(
+            [(int(uid), str(session_string)) for uid, session_string in sessions],
+            active_clients=active_clients,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        # Telegram profile refresh is display-only. A temporary failure must not
+        # prevent the administrator from opening the DM setup menu.
+        logger.warning(f"Не удалось обновить подписи аккаунтов для DM-меню: {exc}")
+
     buttons = [
-        [Button.inline(f"👤 Аккаунт #{uid}", f"dm_acc_{uid}".encode())]
-        for (uid,) in sessions
+        [
+            Button.inline(
+                f"👤 {format_account_label(int(uid), include_id=True, max_length=42)}",
+                f"dm_acc_{uid}".encode(),
+            )
+        ]
+        for uid, _session_string in sessions
     ]
     buttons.append([Button.inline("🏠 Главное меню", b"menu_home")])
     await render_menu(event, "📩 **DM Автопостер**\n\nВыберите аккаунт:", buttons=buttons)
@@ -824,23 +1041,21 @@ async def dm_chats_done(event: callback_query) -> None:
         await event.answer("⚠ Выберите хотя бы один чат!", alert=True)
         return
     if is_random_first_dm_enabled():
-        # В случайном режиме ручной текст не нужен: при каждой отправке
-        # choose_first_dm_text() выберет один из встроенных/пользовательских шаблонов.
         st["post_text"] = ""
-        st["step"] = "interval"
+        st["step"] = "delay_min"
         await render_menu(
             event,
             f"✅ Выбрано чатов: {len(st['selected_chats'])}\n\n"
             "🎲 Случайное первое сообщение включено. Ручной текст вводить не нужно.\n\n"
-            "⏱ **Интервал повтора** (минуты) — через сколько минут можно снова написать "
-            "одному и тому же человеку:\n_(например: `60`)_",
+            "⏱ **Минимальная задержка после сообщения пользователя** (секунды):\n"
+            "_(например: `30`)_",
         )
     else:
         st["step"] = "text"
         await render_menu(
             event,
             f"✅ Выбрано чатов: {len(st['selected_chats'])}\n\n"
-            "📝 Введите текст сообщения для ЛС:",
+            "📝 Введите текст первого сообщения для ЛС:",
         )
     await event.answer()
 
@@ -848,32 +1063,16 @@ async def dm_chats_done(event: callback_query) -> None:
 @bot.on(New_Message(func=lambda e: e.sender_id in dm_setup_state and
                     not is_command_event(e) and
                     dm_setup_state[e.sender_id].get("step") in
-                    ("text", "interval", "delay_min", "delay_max", "photo")))
+                    ("text", "delay_min", "delay_max", "photo")))
 async def dm_dialog(event: callback_message) -> None:
     admin_id = event.sender_id
     st = dm_setup_state[admin_id]
 
     if st["step"] == "text":
         st["post_text"] = event.raw_text.strip()
-        st["step"] = "interval"
-        await event.respond(
-            "⏱ **Интервал повтора** (минуты) — через сколько минут можно снова написать "
-            "одному и тому же человеку:\n_(например: `60`)_"
-        )
-        return
-
-    if st["step"] == "interval":
-        try:
-            minutes = int(event.raw_text.strip())
-            if minutes <= 0:
-                raise ValueError
-        except ValueError:
-            await event.respond("⚠ Введите положительное целое число.")
-            return
-        st["interval_minutes"] = minutes
         st["step"] = "delay_min"
         await event.respond(
-            "🎲 **Минимальная задержка** между отправками разным людям (секунды):\n"
+            "⏱ **Минимальная задержка после сообщения пользователя** (секунды):\n"
             "_(например: `30`)_"
         )
         return
@@ -881,26 +1080,28 @@ async def dm_dialog(event: callback_message) -> None:
     if st["step"] == "delay_min":
         try:
             val = int(event.raw_text.strip())
-            if val < 5:
+            if val < 0 or val > MAX_DELAY_SECONDS:
                 raise ValueError
         except ValueError:
-            await event.respond("⚠ Минимум 5 секунд.")
+            await event.respond("⚠ Введите число от 0 до 2 592 000 секунд (30 дней).")
             return
         st["delay_min"] = val
         st["step"] = "delay_max"
         await event.respond(
-            "🎲 **Максимальная задержка** между отправками (секунды):\n"
-            "_(должна быть больше минимальной, например: `90`)_"
+            "⏱ **Максимальная задержка после сообщения пользователя** (секунды):\n"
+            "_(может быть равна минимальной, например: `90`)_"
         )
         return
 
     if st["step"] == "delay_max":
         try:
             val = int(event.raw_text.strip())
-            if val <= st["delay_min"]:
+            if val < st["delay_min"] or val > MAX_DELAY_SECONDS:
                 raise ValueError
         except ValueError:
-            await event.respond(f"⚠ Должно быть больше {st['delay_min']}.")
+            await event.respond(
+                f"⚠ Значение должно быть от {st['delay_min']} до 2 592 000 секунд."
+            )
             return
         st["delay_max"] = val
         st["step"] = "photo"
@@ -956,7 +1157,7 @@ async def _save_and_launch(event, admin_id: int, st: dict) -> None:
         (
             admin_id, st["user_id"], st["session_string"],
             st["post_text"], st.get("photo_url"),
-            st["interval_minutes"], _now_iso(),
+            0, _now_iso(),
             st.get("delay_min", 30), st.get("delay_max", 90),
         ),
     )
@@ -974,8 +1175,8 @@ async def _save_and_launch(event, admin_id: int, st: dict) -> None:
     await render_menu(event, 
         f"🚀 **DM-задача #{task_id} запущена!**\n\n"
         f"👥 Чатов: {len(st['selected_chats'])}\n"
-        f"⏱ Интервал повтора: {st['interval_minutes']} мин\n"
-        f"🎲 Задержка: {st.get('delay_min', 30)}–{st.get('delay_max', 90)} сек (рандом)\n"
+        f"⏱ Задержка после сообщения: {st.get('delay_min', 30)}–{st.get('delay_max', 90)} сек\n"
+        "🧭 Пауза между фактическими первыми DM настраивается отдельно для аккаунта.\n"
         f"📸 Фото: {'да' if st.get('photo_url') else 'нет'}\n\n"
         f"🔒 Закрытый ЛС → blacklist на 24ч\n\n"
         f"/dm_list — список | /dm_stop {task_id} — стоп"
@@ -986,46 +1187,68 @@ async def _save_and_launch(event, admin_id: int, st: dict) -> None:
 async def cmd_dm_list(event: callback_message) -> None:
     if event.sender_id not in ADMIN_ID_LIST:
         return
-    cursor = conn.cursor()
-    cursor.execute(
-        """SELECT id, user_id, interval_minutes, is_active, created_at, delay_min, delay_max,
-                  (SELECT COUNT(*) FROM dm_watched_chats WHERE dm_task_id = dm_tasks.id),
-                  (SELECT COUNT(*) FROM dm_sent_log WHERE dm_task_id = dm_tasks.id AND status='sent'),
-                  (SELECT COUNT(*) FROM dm_sent_log WHERE dm_task_id = dm_tasks.id AND status='privacy')
-           FROM dm_tasks ORDER BY id DESC"""
-    )
-    rows = cursor.fetchall()
-    cursor.close()
+    rows = conn.execute(
+        """
+        SELECT id, user_id, is_active, created_at, delay_min, delay_max,
+               (SELECT COUNT(*) FROM dm_watched_chats WHERE dm_task_id=dm_tasks.id),
+               (SELECT COUNT(*) FROM dm_sent_log WHERE dm_task_id=dm_tasks.id AND status='sent'),
+               (SELECT COUNT(*) FROM dm_sent_log WHERE dm_task_id=dm_tasks.id AND status='privacy')
+          FROM dm_tasks ORDER BY id DESC
+        """
+    ).fetchall()
     if not rows:
-        await render_menu(event, "📭 Нет DM-задач.", buttons=[[Button.inline("🏠 Главное меню", b"menu_home")]])
-        return
-    lines = ["📋 **DM-задачи:**\n"]
-    for tid, uid, interval, active, created, dmin, dmax, chats, sent, blocked in rows:
-        running = tid in dm_monitor_tasks and not dm_monitor_tasks[tid].done()
-        queue_size = len(dm_send_queues.get(tid, []))
-        status = "🟢 активна" if active and running else ("🟡 не запущена" if active else "🔴 остановлена")
-        lines.append(
-            f"**#{tid}** | акк: {uid} | {status}\n"
-            f"  Чатов: {chats} | ✅ отправлено: {sent} | 🔒 закрытых ЛС: {blocked}\n"
-            f"  Интервал повтора: {interval} мин | Задержка: {dmin}–{dmax}с\n"
-            f"  В очереди сейчас: {queue_size} чел.\n"
-            f"  Создана: {(created or '')[:16]}"
+        await render_menu(
+            event,
+            "📭 Нет DM-задач.",
+            buttons=[[Button.inline("🏠 Главное меню", b"menu_home")]],
         )
-    # Считаем напрямую из БД и всегда показываем кнопку очистки.
-    # Так кнопка не зависит от типа значения is_active в уже существующей базе
-    # и остаётся видимой даже когда неактуальных задач временно нет.
+        return
+
     inactive_count = count_inactive_dm_tasks(conn)
-    lines.insert(1, f"🧹 Неактуальных задач: **{inactive_count}**")
-    buttons = [
+    lines = ["📋 **DM-задачи:**", f"🧹 Неактуальных задач: **{inactive_count}**"]
+    buttons = []
+    for task_id, account_id, active, created, low, high, chats, sent, privacy in rows:
+        running_task = dm_monitor_tasks.get(int(task_id))
+        running = bool(running_task and not running_task.done())
+        if active and running:
+            status = "🟢 активна"
+            status_icon = "🟢"
+        elif active:
+            status = "🟡 ожидает запуска"
+            status_icon = "🟡"
+        else:
+            status = "🔴 остановлена"
+            status_icon = "🔴"
+        queue_size = count_pending(int(task_id))
+        account_label = format_account_label(
+            int(account_id), include_id=True, max_length=44
+        )
+        lines.append(
+            f"**#{task_id}** | {account_label} | {status}\n"
+            f"Чатов: {chats} | ✅ отправлено: {sent} | 🔒 закрытых ЛС: {privacy}\n"
+            f"Задержка после сообщения: {int(low or 0)}–{int(high or 0)}с\n"
+            f"В очереди: {queue_size} чел. | Создана: {(created or '')[:16]}"
+        )
+        buttons.append(
+            [
+                Button.inline(
+                    f"⚙️ #{task_id} • {account_label} • {status_icon}",
+                    f"dm_task_{task_id}".encode(),
+                )
+            ]
+        )
+    buttons.extend(
         [
-            Button.inline(
-                f"🧹 Очистить неактуальные ({inactive_count})",
-                b"menu_dm_cleanup",
-            )
-        ],
-        [Button.inline("🔄 Обновить список", b"menu_dm_list")],
-        [Button.inline("🏠 Главное меню", b"menu_home")],
-    ]
+            [
+                Button.inline(
+                    f"🧹 Очистить неактуальные ({inactive_count})",
+                    b"menu_dm_cleanup",
+                )
+            ],
+            [Button.inline("🔄 Обновить список", b"menu_dm_list")],
+            [Button.inline("🏠 Главное меню", b"menu_home")],
+        ]
+    )
     await render_menu(event, "\n\n".join(lines), buttons=buttons)
 
 
@@ -1077,20 +1300,17 @@ async def cmd_dm_cleanup(event: callback_message) -> None:
 
 @bot.on(Query(data=b"menu_dm_cleanup_confirm"))
 async def menu_dm_cleanup_confirm(event: callback_query) -> None:
-    """Delete only stopped DM tasks and their task-local technical rows."""
     if event.sender_id not in ADMIN_ID_LIST:
         await event.answer("Недоступно", alert=True)
         return
 
     task_ids = delete_inactive_dm_tasks(conn)
-    deleted_count = len(task_ids)
-
-    # Remove only stale in-memory references belonging to deleted tasks.
     for task_id in task_ids:
-        running_task = dm_monitor_tasks.pop(task_id, None)
-        if running_task and not running_task.done():
-            running_task.cancel()
-        stale_client = dm_monitor_clients.pop(task_id, None)
+        monitor = dm_monitor_tasks.get(int(task_id))
+        if monitor and not monitor.done():
+            monitor.cancel()
+            await asyncio.gather(monitor, return_exceptions=True)
+        stale_client = dm_monitor_clients.pop(int(task_id), None)
         if stale_client is not None:
             try:
                 await stale_client.disconnect()
@@ -1098,19 +1318,13 @@ async def menu_dm_cleanup_confirm(event: callback_query) -> None:
                 logger.warning(
                     f"Не удалось отключить клиент удалённой DM-задачи #{task_id}: {exc}"
                 )
-        dm_send_queues.pop(task_id, None)
-        for key in [key for key in dm_source_chat_titles if key[0] == task_id]:
-            dm_source_chat_titles.pop(key, None)
-        for key in [key for key in dm_source_chat_ids if key[0] == task_id]:
-            dm_source_chat_ids.pop(key, None)
-
-    active_count = count_active_dm_tasks(conn)
 
     await render_menu(
         event,
         f"✅ Неактуальные DM-задачи очищены.\n\n"
-        f"Удалено: **{deleted_count}**\n"
-        f"Активных задач осталось: **{active_count}**",
+        f"Удалено: **{len(task_ids)}**\n"
+        f"Активных задач осталось: **{count_active_dm_tasks(conn)}**\n\n"
+        "История отправок, завершённые контакты и opt-out сохранены.",
         buttons=[
             [Button.inline("📋 Открыть DM-задачи", b"menu_dm_list")],
             [Button.inline("🏠 Главное меню", b"menu_home")],
@@ -1128,18 +1342,12 @@ async def cmd_dm_stop(event: callback_message) -> None:
         await event.respond("Использование: /dm_stop <id>\nСписок: /dm_list")
         return
     task_id = int(match)
-    cursor = conn.cursor()
-    cursor.execute("UPDATE dm_tasks SET is_active = 0 WHERE id = ?", (task_id,))
-    affected = cursor.rowcount
-    conn.commit()
-    cursor.close()
-    if not affected:
+    if await stop_dm_task_runtime(task_id, preserve_queue=True):
+        await event.respond(
+            f"⏸ Задача #{task_id} остановлена. Очередь сохранена."
+        )
+    else:
         await event.respond(f"⚠ Задача #{task_id} не найдена.")
-        return
-    t = dm_monitor_tasks.get(task_id)
-    if t and not t.done():
-        t.cancel()
-    await event.respond(f"⛔ Задача #{task_id} остановлена.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1186,7 +1394,12 @@ async def menu_dm_stop(event: callback_query) -> None:
         return
 
     buttons = [
-        [Button.inline(f"⛔ Остановить #{task_id} | аккаунт {user_id}", f"menu_dm_stop_{task_id}".encode())]
+        [
+            Button.inline(
+                f"⏸ #{task_id} | {format_account_label(int(user_id), include_id=True, max_length=40)}",
+                f"menu_dm_stop_{task_id}".encode(),
+            )
+        ]
         for task_id, user_id in rows
     ]
     buttons.append([Button.inline("🏠 Главное меню", b"menu_home")])
@@ -1199,26 +1412,18 @@ async def menu_dm_stop_selected(event: callback_query) -> None:
     if event.sender_id not in ADMIN_ID_LIST:
         await event.answer("Недоступно", alert=True)
         return
-
     try:
         task_id = int(event.data.decode().rsplit("_", 1)[1])
     except (ValueError, IndexError):
         await event.answer("Некорректный ID задачи", alert=True)
         return
-
-    cursor = conn.cursor()
-    cursor.execute("UPDATE dm_tasks SET is_active = 0 WHERE id = ? AND is_active = 1", (task_id,))
-    affected = cursor.rowcount
-    conn.commit()
-    cursor.close()
-
-    if not affected:
+    if not await stop_dm_task_runtime(task_id, preserve_queue=True):
         await event.answer("Задача уже остановлена или не найдена", alert=True)
         return
-
-    running_task = dm_monitor_tasks.get(task_id)
-    if running_task and not running_task.done():
-        running_task.cancel()
-
-    await render_menu(event, f"⛔ DM-задача #{task_id} остановлена.", buttons=[[Button.inline("🏠 Главное меню", b"menu_home")]])
+    await render_menu(
+        event,
+        f"⏸ DM-задача #{task_id} остановлена. Очередь сохранена.",
+        buttons=[[Button.inline("📋 К DM-задачам", b"menu_dm_list")]],
+    )
     await event.answer("Остановлено")
+

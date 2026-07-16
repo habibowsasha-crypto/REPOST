@@ -27,6 +27,7 @@ from config import (
     user_states,
 )
 from services.admin_state import clear_admin_interaction_state, is_command_event
+from services.account_profiles import save_account_profile
 from services.menu_ui import render_menu
 
 
@@ -53,12 +54,17 @@ async def _save_authorized_account(admin_id: int, client: TelegramClient) -> int
     with conn:
         conn.execute(
             """
-            INSERT INTO sessions (user_id, session_string)
-            VALUES (?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET session_string = excluded.session_string
+            INSERT INTO sessions (
+                user_id, session_string, username, first_name, last_name,
+                profile_updated_at
+            )
+            VALUES (?, ?, NULL, NULL, NULL, NULL)
+            ON CONFLICT(user_id) DO UPDATE SET
+                session_string = excluded.session_string
             """,
             (me.id, session_string),
         )
+    save_account_profile(me)
     return int(me.id)
 
 
