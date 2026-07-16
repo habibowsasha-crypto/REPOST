@@ -66,6 +66,7 @@ from services.dm_task_queue import (
     account_gate_wait_seconds,
     cancel_row,
     cancel_target_globally,
+    count_all_pending,
     count_pending,
     claim_pending,
     clear_task_pending,
@@ -73,15 +74,20 @@ from services.dm_task_queue import (
     enqueue_pending,
     finalize_sent,
     get_account_dispatch_state,
+    get_global_first_dm_state,
     get_due_pending,
     mark_account_send_completed,
     mark_sending,
     mark_uncertain,
+    is_global_first_dm_paused,
     MAX_DELAY_SECONDS,
     pause_account,
+    pause_all_first_dms,
     prepare_tasks_for_deletion,
     reassign_task_pending_to_active_sources,
     recover_stale_queue,
+    release_pending_claim,
+    resume_all_first_dms,
     schedule_retry,
     set_account_cooldown,
 )
@@ -353,6 +359,9 @@ async def _send_pending_row(row: dict) -> str:
     target_id = int(row["target_user_id"])
     task_lock = get_dm_task_operation_lock(task_id)
 
+    if is_global_first_dm_paused():
+        return "global_paused"
+
     async with task_lock:
         task = _get_task(task_id)
         if not task or not task["is_active"]:
@@ -363,6 +372,9 @@ async def _send_pending_row(row: dict) -> str:
         queue_claim = claim_pending(row_id)
         if not queue_claim:
             return "lost_race"
+        if is_global_first_dm_paused():
+            release_pending_claim(row_id, queue_claim, "global_pause_after_claim")
+            return "global_paused"
 
         client = dm_monitor_clients.get(task_id)
         if client is None or not client.is_connected():
@@ -448,9 +460,18 @@ async def _send_pending_row(row: dict) -> str:
             choose_first_dm_text(task["post_text"] or "")
             or (task["post_text"] or "Привет 👋")
         )
+        if is_global_first_dm_paused():
+            release_first_dm_claim(account_user_id, target_id, first_claim)
+            release_pending_claim(row_id, queue_claim, "global_pause_before_sending")
+            return "global_paused"
         if not mark_sending(row_id, queue_claim):
             release_first_dm_claim(account_user_id, target_id, first_claim)
             return "lost_race"
+
+        if is_global_first_dm_paused():
+            release_first_dm_claim(account_user_id, target_id, first_claim)
+            release_pending_claim(row_id, queue_claim, "global_pause_final_guard")
+            return "global_paused"
 
         # Final global guard immediately before the Telegram request. Another
         # account may have completed the dialog while this peer was resolving.
@@ -617,6 +638,9 @@ async def _account_dispatch_loop(account_user_id: int) -> None:
     logger.info(f"[DM dispatcher] account={account_user_id} started")
     try:
         while True:
+            if is_global_first_dm_paused():
+                await asyncio.sleep(2)
+                continue
             state = get_account_dispatch_state(account_user_id)
             if state.is_paused:
                 await asyncio.sleep(5)
@@ -1240,12 +1264,22 @@ async def cmd_dm_list(event: callback_message) -> None:
         return
 
     inactive_count = count_inactive_dm_tasks(conn)
-    lines = ["📋 **DM-задачи:**", f"🧹 Неактуальных задач: **{inactive_count}**"]
+    global_pause = get_global_first_dm_state()
+    lines = ["📋 **DM-задачи:**"]
+    if global_pause.is_paused:
+        lines.append(
+            "⏸ **ГЛОБАЛЬНАЯ ПАУЗА ПЕРВЫХ DM**\n"
+            "Новые первые сообщения не отправляются. Пользователи продолжают добавляться в очередь."
+        )
+    lines.append(f"🧹 Неактуальных задач: **{inactive_count}**")
     buttons = []
     for task_id, account_id, active, created, low, high, chats, sent, privacy in rows:
         running_task = dm_monitor_tasks.get(int(task_id))
         running = bool(running_task and not running_task.done())
-        if active and running:
+        if active and global_pause.is_paused:
+            status = "⏸ глобальная пауза"
+            status_icon = "⏸"
+        elif active and running:
             status = "🟢 активна"
             status_icon = "🟢"
         elif active:
@@ -1272,8 +1306,14 @@ async def cmd_dm_list(event: callback_message) -> None:
                 )
             ]
         )
+    global_control_button = (
+        [Button.inline("▶️ Возобновить первые DM", b"dm_global_resume_ask")]
+        if global_pause.is_paused
+        else [Button.inline("⏸ Пауза всех первых DM", b"dm_global_pause")]
+    )
     buttons.extend(
         [
+            global_control_button,
             [
                 Button.inline(
                     f"🧹 Очистить неактуальные ({inactive_count})",
@@ -1408,6 +1448,78 @@ async def menu_dm_list(event: callback_query) -> None:
         return
     await cmd_dm_list(event)
     await event.answer()
+
+
+@bot.on(Query(data=b"dm_global_pause"))
+async def dm_global_pause(event: callback_query) -> None:
+    if event.sender_id not in ADMIN_ID_LIST:
+        await event.answer("Недоступно", alert=True)
+        return
+    pause_all_first_dms(event.sender_id)
+    active_tasks = count_active_dm_tasks(conn)
+    pending = count_all_pending()
+    await render_menu(
+        event,
+        "⏸ **Первые DM приостановлены**\n\n"
+        f"Активных задач: **{active_tasks}**\n"
+        f"Людей в очереди: **{pending}**\n\n"
+        "Ни один новый первый DM не будет отправлен, пока администратор не возобновит работу.\n"
+        "Пользователи продолжат добавляться в очередь, а начатые диалоги Максима продолжат работать.",
+        buttons=[
+            [Button.inline("📋 К DM-задачам", b"menu_dm_list")],
+            [Button.inline("🏠 Главное меню", b"menu_home")],
+        ],
+    )
+    await event.answer("Первые DM поставлены на паузу")
+
+
+@bot.on(Query(data=b"dm_global_resume_ask"))
+async def dm_global_resume_ask(event: callback_query) -> None:
+    if event.sender_id not in ADMIN_ID_LIST:
+        await event.answer("Недоступно", alert=True)
+        return
+    state = get_global_first_dm_state()
+    if not state.is_paused:
+        await event.answer("Глобальная пауза уже выключена", alert=True)
+        await cmd_dm_list(event)
+        return
+    active_tasks = count_active_dm_tasks(conn)
+    pending = count_all_pending()
+    await render_menu(
+        event,
+        "▶️ **Возобновить первые DM?**\n\n"
+        f"Активных задач: **{active_tasks}**\n"
+        f"В очереди: **{pending}** пользователей\n\n"
+        "Отправка продолжится постепенно по задержкам задач, паузам аккаунтов и ограничениям Telegram.",
+        buttons=[
+            [Button.inline("✅ Возобновить", b"dm_global_resume_yes")],
+            [Button.inline("❌ Отмена", b"menu_dm_list")],
+        ],
+    )
+    await event.answer()
+
+
+@bot.on(Query(data=b"dm_global_resume_yes"))
+async def dm_global_resume_yes(event: callback_query) -> None:
+    if event.sender_id not in ADMIN_ID_LIST:
+        await event.answer("Недоступно", alert=True)
+        return
+    resume_all_first_dms(event.sender_id)
+    accounts = conn.execute(
+        "SELECT DISTINCT user_id FROM dm_tasks WHERE is_active=1"
+    ).fetchall()
+    for (account_user_id,) in accounts:
+        ensure_account_dispatcher(int(account_user_id))
+    await render_menu(
+        event,
+        "▶️ **Первые DM возобновлены**\n\n"
+        "Очередь будет обрабатываться постепенно по прежним настройкам каждой задачи и аккаунта.",
+        buttons=[
+            [Button.inline("📋 К DM-задачам", b"menu_dm_list")],
+            [Button.inline("🏠 Главное меню", b"menu_home")],
+        ],
+    )
+    await event.answer("Первые DM возобновлены")
 
 
 @bot.on(Query(data=b"menu_dm_stop"))

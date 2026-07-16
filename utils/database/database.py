@@ -463,6 +463,24 @@ def create_dm_tables() -> None:
         )
         cursor.execute(
             """
+            CREATE TABLE IF NOT EXISTS dm_global_first_dm_control (
+                id INTEGER PRIMARY KEY CHECK (id=1),
+                is_paused INTEGER NOT NULL DEFAULT 0,
+                paused_at TEXT,
+                paused_by_admin_id INTEGER,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO dm_global_first_dm_control (
+                id, is_paused, paused_at, paused_by_admin_id, updated_at
+            ) VALUES (1, 0, NULL, NULL, datetime('now'))
+            """
+        )
+        cursor.execute(
+            """
             CREATE TABLE IF NOT EXISTS dm_account_dispatch (
                 account_user_id INTEGER PRIMARY KEY,
                 pacing_min INTEGER NOT NULL DEFAULT 30,

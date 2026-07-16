@@ -33,6 +33,14 @@ _db_lock = threading.RLock()
 
 
 @dataclass(frozen=True)
+class GlobalFirstDmState:
+    is_paused: bool
+    paused_at: Optional[str]
+    paused_by_admin_id: Optional[int]
+    updated_at: str
+
+
+@dataclass(frozen=True)
 class AccountDispatchState:
     account_user_id: int
     pacing_min: int
@@ -97,6 +105,72 @@ def random_delay_seconds(low: int, high: int) -> int:
 
 def _active_status_sql() -> str:
     return ",".join("?" for _ in NONTERMINAL_STATUSES)
+
+
+def ensure_global_first_dm_control() -> None:
+    now = iso(utc_now())
+    with _db_lock, conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO dm_global_first_dm_control (
+                id, is_paused, paused_at, paused_by_admin_id, updated_at
+            ) VALUES (1, 0, NULL, NULL, ?)
+            """,
+            (now,),
+        )
+
+
+def get_global_first_dm_state() -> GlobalFirstDmState:
+    ensure_global_first_dm_control()
+    row = conn.execute(
+        """
+        SELECT is_paused, paused_at, paused_by_admin_id, updated_at
+          FROM dm_global_first_dm_control
+         WHERE id=1
+        """
+    ).fetchone()
+    assert row is not None
+    return GlobalFirstDmState(
+        is_paused=bool(row[0]),
+        paused_at=row[1],
+        paused_by_admin_id=int(row[2]) if row[2] is not None else None,
+        updated_at=str(row[3] or ""),
+    )
+
+
+def is_global_first_dm_paused() -> bool:
+    return get_global_first_dm_state().is_paused
+
+
+def pause_all_first_dms(admin_id: int) -> GlobalFirstDmState:
+    now = iso(utc_now())
+    ensure_global_first_dm_control()
+    with _db_lock, conn:
+        conn.execute(
+            """
+            UPDATE dm_global_first_dm_control
+               SET is_paused=1, paused_at=COALESCE(paused_at, ?),
+                   paused_by_admin_id=?, updated_at=?
+             WHERE id=1
+            """,
+            (now, int(admin_id), now),
+        )
+    return get_global_first_dm_state()
+
+
+def resume_all_first_dms(admin_id: int) -> GlobalFirstDmState:
+    now = iso(utc_now())
+    ensure_global_first_dm_control()
+    with _db_lock, conn:
+        conn.execute(
+            """
+            UPDATE dm_global_first_dm_control
+               SET is_paused=0, paused_at=NULL, paused_by_admin_id=?, updated_at=?
+             WHERE id=1
+            """,
+            (int(admin_id), now),
+        )
+    return get_global_first_dm_state()
 
 
 def ensure_account_settings(account_user_id: int) -> None:
@@ -251,6 +325,8 @@ def resume_account(account_user_id: int) -> None:
 
 
 def account_gate_wait_seconds(account_user_id: int) -> Optional[float]:
+    if is_global_first_dm_paused():
+        return None
     state = get_account_dispatch_state(account_user_id)
     if state.is_paused:
         return None
@@ -413,6 +489,8 @@ def enqueue_pending(
 
 
 def get_due_pending(account_user_id: int) -> Optional[dict[str, Any]]:
+    if is_global_first_dm_paused():
+        return None
     now_iso = iso(utc_now())
     row = conn.execute(
         """
@@ -483,6 +561,26 @@ def claim_pending(row_id: int) -> Optional[str]:
             (token, now_iso, now_iso, int(row_id), now_iso),
         )
         return token if int(cursor.rowcount or 0) == 1 else None
+
+
+def release_pending_claim(row_id: int, claim_token: str, reason: str = "global_pause") -> bool:
+    """Return a claimed/sending row to pending before Telegram is called.
+
+    This is used by the global first-DM pause.  It does not increment retry
+    counters or change the original eligibility time.
+    """
+    now_iso = iso(utc_now())
+    with _db_lock, conn:
+        cursor = conn.execute(
+            """
+            UPDATE dm_pending_queue
+               SET status='pending', claim_token=NULL, claimed_at=NULL,
+                   send_started_at=NULL, last_error=?, updated_at=?
+             WHERE id=? AND claim_token=? AND status IN ('claimed','sending')
+            """,
+            (clean_text(reason), now_iso, int(row_id), str(claim_token)),
+        )
+        return int(cursor.rowcount or 0) == 1
 
 
 def mark_sending(row_id: int, claim_token: str) -> bool:
@@ -667,6 +765,17 @@ def count_account_pending(account_user_id: int) -> int:
          WHERE account_user_id=? AND status IN ({_active_status_sql()})
         """,
         (int(account_user_id), *NONTERMINAL_STATUSES),
+    ).fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+def count_all_pending() -> int:
+    row = conn.execute(
+        f"""
+        SELECT COUNT(*) FROM dm_pending_queue
+         WHERE status IN ({_active_status_sql()})
+        """,
+        NONTERMINAL_STATUSES,
     ).fetchone()
     return int(row[0] or 0) if row else 0
 

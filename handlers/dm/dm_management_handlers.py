@@ -19,6 +19,7 @@ from services.dm_task_queue import (
     count_pending,
     format_pending_target,
     get_account_dispatch_state,
+    get_global_first_dm_state,
     list_pending_page,
     parse_iso,
     remove_chat_source,
@@ -169,10 +170,15 @@ async def _show_task(event, task_id: int) -> None:
         format_account_label(int(task["user_id"]), include_id=True, max_length=60)
     )
     dispatch = get_account_dispatch_state(int(task["user_id"]))
+    global_pause = get_global_first_dm_state()
+    if active and global_pause.is_paused:
+        status = "⏸ глобальная пауза первых DM"
     queue_count = count_pending(int(task_id))
     photo = "да" if task["photo_url"] else "нет"
     created = html.escape(str(task["created_at"] or "")[:19])
     gate_lines: list[str] = []
+    if global_pause.is_paused:
+        gate_lines.append("⏸ Все новые первые DM: <b>глобальная пауза</b>")
     if dispatch.is_paused:
         gate_lines.append(
             f"⛔ Первые DM аккаунта: <b>на паузе</b> ({html.escape(dispatch.pause_reason or 'без причины')})"

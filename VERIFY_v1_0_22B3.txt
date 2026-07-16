@@ -1,0 +1,44 @@
+TgBlaster v1.0.22b3 — VERIFY
+Date: 2026-07-16
+Base: TgBlaster v1.0.22b2
+
+FEATURE
+- Persistent global pause for all new first DMs.
+- While paused, monitored users continue to be added to the persistent queue.
+- No queued first DM is selected or sent until an administrator resumes.
+- Existing Maxim AI conversations continue normally.
+- Resume does not clear account-level PeerFlood/manual pauses or Telegram FloodWait cooldowns.
+- Pause survives process/Railway restarts.
+- Task list and task cards clearly show the global pause state.
+
+SAFETY GUARDS
+- Global pause is checked in the account dispatcher.
+- Global pause is checked before selecting a due queue row.
+- Global pause is checked before queue claim.
+- Global pause is checked after claim.
+- Global pause is checked before status=sending.
+- Global pause is checked again immediately before the Telegram request.
+- A claimed row is returned to pending without changing eligible_at or incrementing retry_count.
+
+VERIFICATION RESULTS
+- Python compileall: PASS
+- unittest: 106/106 PASS
+- pytest: 106 tests + 38 subtests PASS
+- pyflakes on changed modules/tests: PASS
+- v1.0.22b2 database migration: PASS
+- Existing task and pending queue preservation: PASS
+- Pause persistence after a fresh process restart: PASS
+- Users still enqueue while paused: PASS
+- Telegram fake client receives zero sends while paused: PASS
+- Resume restores normal sending: PASS
+- Account PeerFlood pause survives global resume: PASS
+- services/first_message.py unchanged: PASS
+  SHA-256: a34f2613c338b1f89284335d2462cc1ed1b1e43b3063dcdf4a511a3b7f0f32aa
+
+LIMITATION
+If Telegram already received a send request at the exact instant the administrator presses pause,
+that in-flight request cannot be recalled. All later first-DM sends are blocked. Live Telegram,
+OpenAI and Railway network calls were not performed during offline verification.
+
+NEW RAILWAY VARIABLES
+None.

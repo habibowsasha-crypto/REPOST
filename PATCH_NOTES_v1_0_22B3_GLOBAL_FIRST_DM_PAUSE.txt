@@ -1,0 +1,16 @@
+TgBlaster v1.0.22b3 — GLOBAL FIRST-DM PAUSE
+
+Base: v1.0.22b2.
+
+Added:
+- Global persistent pause for all new first DMs across every account and task.
+- Users continue to be discovered and queued while paused.
+- Existing Maxim AI conversations continue.
+- One-click pause and confirmation before resume.
+- Pause survives Railway restart.
+- Resume preserves task delays, account pacing, FloodWait, PeerFlood, completed contacts and opt-out.
+- Multiple guards prevent a claimed row from reaching Telegram after pause is detected.
+
+Unchanged:
+- services/first_message.py and first-DM text selection.
+- Existing queues, tasks, completed contacts and opt-out data.
