@@ -29,6 +29,7 @@ from services.maxim_sales_funnel import (
     generate_post_link_plan,
     is_explicit_stop,
     is_human_takeover_request,
+    make_media_reaction_text,
     post_link_final_messages,
     validate_link_access_help,
 )
@@ -999,6 +1000,7 @@ async def handle_private_incoming(
     sender: User,
     text: str,
     message_id: int | None = None,
+    media_kind: str | None = None,
 ) -> None:
     """Handle replies through the Maxim context-aware sales funnel.
 
@@ -1006,6 +1008,8 @@ async def handle_private_incoming(
     This function starts only after the recipient replies to that delivered DM.
     """
     text = (text or "").strip()
+    if not text and media_kind:
+        text = make_media_reaction_text(media_kind)
     if not text:
         return
 

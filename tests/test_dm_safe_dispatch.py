@@ -5,6 +5,7 @@ import datetime as dt
 import os
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 from telethon.errors import FloodWaitError, PeerFloodError, UserPrivacyRestrictedError
 
@@ -175,6 +176,52 @@ class SafeQueueTests(unittest.IsolatedAsyncioTestCase):
             (first[1],),
         ).fetchall()
         self.assertEqual(sources, [(1, 11), (2, 22)])
+
+    def test_private_media_kind_detection(self) -> None:
+        def event_with(**message_fields):
+            defaults = {
+                "media": object(),
+                "sticker": None,
+                "gif": None,
+                "photo": None,
+                "voice": None,
+                "video": None,
+                "audio": None,
+                "poll": None,
+                "contact": None,
+                "geo": None,
+                "venue": None,
+                "document": None,
+            }
+            defaults.update(message_fields)
+            return SimpleNamespace(message=SimpleNamespace(**defaults))
+
+        self.assertEqual(
+            dm_handlers._detect_private_message_kind(event_with(gif=True)), "gif"
+        )
+        self.assertEqual(
+            dm_handlers._detect_private_message_kind(event_with(sticker=True)),
+            "sticker",
+        )
+        self.assertEqual(
+            dm_handlers._detect_private_message_kind(event_with(photo=object())),
+            "photo",
+        )
+        self.assertEqual(
+            dm_handlers._detect_private_message_kind(event_with(voice=True)), "voice"
+        )
+        self.assertEqual(
+            dm_handlers._detect_private_message_kind(event_with(document=object())),
+            "document",
+        )
+        self.assertEqual(
+            dm_handlers._detect_private_message_kind(event_with()), "media"
+        )
+        self.assertIsNone(
+            dm_handlers._detect_private_message_kind(
+                SimpleNamespace(message=SimpleNamespace(media=None))
+            )
+        )
 
     def test_due_query_does_not_scan_future_row_first(self) -> None:
         self._task(task_id=1, account=101)

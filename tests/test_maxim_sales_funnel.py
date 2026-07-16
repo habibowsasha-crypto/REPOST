@@ -46,10 +46,12 @@ from services.maxim_sales_funnel import (
     LINK_ACCESS_HELP_VARIANTS,
     build_local_plan,
     classify_intent,
+    is_emoji_only_reaction,
     is_explicit_stop,
     is_soft_decline,
     generate_post_link_plan,
     is_human_takeover_request,
+    make_media_reaction_text,
     validate_link_access_help,
 )
 from utils.database.database import create_dm_tables
@@ -105,6 +107,18 @@ class MaximSalesFunnelTests(unittest.IsolatedAsyncioTestCase):
             message_id=self.message_id,
         )
 
+    async def reply_media(self, media_kind: str) -> None:
+        self.message_id += 1
+        await handle_private_incoming(
+            dm_task_id=15,
+            account_user_id=9001,
+            client=self.client,
+            sender=self.sender,
+            text="",
+            message_id=self.message_id,
+            media_kind=media_kind,
+        )
+
     async def test_full_context_funnel_reaches_link(self) -> None:
         self.open_cycle()
         await self.reply("Да, иногда торгую")
@@ -136,6 +150,71 @@ class MaximSalesFunnelTests(unittest.IsolatedAsyncioTestCase):
         before_late_message = len(self.client.sent)
         await self.reply("А ещё вопрос")
         self.assertEqual(len(self.client.sent), before_late_message)
+
+    async def test_media_only_reply_advances_from_vip_first_dm(self) -> None:
+        self.open_cycle("Привет. А ты знаешь, что такое VIP-каналы в трейдинге?")
+        await self.reply_media("gif")
+        combined = " ".join(self.client.sent).lower()
+        self.assertIn("бесплатный telegram-канал", combined)
+        self.assertIn("софт моментально копирует", combined)
+        self.assertNotIn("вижу", combined)
+        dialog = _get_dialog_by_target(9001, self.sender.id)
+        self.assertEqual(dialog.status, "active")
+        self.assertEqual(dialog.stage, "offer_explained")
+
+    async def test_media_only_reply_advances_to_link_after_explanation(self) -> None:
+        self.open_cycle("Ты сам торгуешь или просто наблюдаешь?")
+        await self.reply("Да, сам")
+        await self.reply_media("sticker")
+        self.assertTrue(any("бесплатный Telegram-канал" in item for item in self.client.sent))
+        before = len(self.client.sent)
+        await self.reply_media("photo")
+        new_messages = self.client.sent[before:]
+        self.assertTrue(any(PIRATE_VIP_LINK in item for item in new_messages))
+        dialog = _get_dialog_by_target(9001, self.sender.id)
+        self.assertEqual(dialog.stage, "post_link_active")
+
+    async def test_media_only_reply_after_link_gets_short_final_reply(self) -> None:
+        self.open_cycle("Привет. А ты знаешь, что такое VIP-каналы в трейдинге?")
+        await self.reply_media("gif")
+        await self.reply("Понятно")
+        self.assertTrue(any(PIRATE_VIP_LINK in item for item in self.client.sent))
+        before = len(self.client.sent)
+        await self.reply_media("voice")
+        final_messages = self.client.sent[before:]
+        self.assertEqual(len(final_messages), 1)
+        self.assertIn("сам глянь", final_messages[0].lower())
+        self.assertNotIn(PIRATE_VIP_LINK, final_messages[0])
+        self.assertNotIn("голос", final_messages[0].lower())
+        dialog = _get_dialog_by_target(9001, self.sender.id)
+        self.assertEqual(dialog.status, "completed")
+
+    async def test_emoji_only_reply_is_a_reaction_and_advances(self) -> None:
+        self.assertTrue(is_emoji_only_reaction("😂🔥"))
+        self.assertEqual(classify_intent("😂🔥"), "reaction")
+        self.assertFalse(is_emoji_only_reaction("...?"))
+        self.open_cycle("Привет. А ты знаешь, что такое VIP-каналы в трейдинге?")
+        await self.reply("😂")
+        self.assertTrue(any("бесплатный telegram-канал" in item.lower() for item in self.client.sent))
+
+    async def test_media_marker_is_internal_reaction(self) -> None:
+        marker = make_media_reaction_text("video")
+        self.assertEqual(marker, "[[media_reaction:video]]")
+        self.assertEqual(classify_intent(marker), "reaction")
+
+    async def test_empty_text_without_media_is_still_ignored(self) -> None:
+        self.open_cycle()
+        before = len(self.client.sent)
+        self.message_id += 1
+        await handle_private_incoming(
+            dm_task_id=15,
+            account_user_id=9001,
+            client=self.client,
+            sender=self.sender,
+            text="",
+            message_id=self.message_id,
+        )
+        self.assertEqual(len(self.client.sent), before)
 
     async def test_benefit_question_gets_transparent_model_and_link(self) -> None:
         self.open_cycle()

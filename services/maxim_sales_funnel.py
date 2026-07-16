@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import random
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
@@ -24,6 +25,87 @@ DEFAULT_PAID_SOURCE_COUNT = 50
 DESTINATION_KIND = "бесплатный Telegram-канал"
 DESTINATION_PURPOSE = "со сливами VIP-каналов"
 COPY_MECHANISM = "софт моментально копирует туда новые посты"
+MEDIA_REACTION_PREFIX = "[[media_reaction:"
+
+
+_MEDIA_KIND_LABELS = {
+    "gif": "GIF без текста",
+    "sticker": "стикер без текста",
+    "photo": "фото без подписи",
+    "video": "видео без подписи",
+    "voice": "голосовое сообщение без распознанного текста",
+    "audio": "аудио без подписи",
+    "document": "файл без подписи",
+    "poll": "опрос без текстовой реплики",
+    "contact": "контакт без текстовой реплики",
+    "location": "геолокацию без текстовой реплики",
+    "media": "медиа без текста",
+}
+
+
+def make_media_reaction_text(media_kind: str | None) -> str:
+    """Build a safe internal marker for a media-only Telegram reply.
+
+    The marker is stored in the dialog history so the message counts as a real
+    reply and advances the funnel, while making it explicit that Maxim did not
+    inspect or understand the media contents.
+    """
+    raw = re.sub(r"[^a-z0-9_]+", "_", (media_kind or "media").strip().lower())
+    kind = raw.strip("_") or "media"
+    return f"{MEDIA_REACTION_PREFIX}{kind}]]"
+
+
+def media_reaction_kind(text: str) -> str | None:
+    """Return the internal media kind or ``None`` for ordinary text."""
+    value = (text or "").strip().lower()
+    match = re.fullmatch(r"\[\[media_reaction:([a-z0-9_]+)\]\]", value)
+    return match.group(1) if match else None
+
+
+def media_reaction_label(text: str) -> str | None:
+    kind = media_reaction_kind(text)
+    if kind is None:
+        return None
+    return _MEDIA_KIND_LABELS.get(kind, _MEDIA_KIND_LABELS["media"])
+
+
+def is_emoji_only_reaction(text: str) -> bool:
+    """Recognize a reply made only of emoji, including ZWJ combinations.
+
+    Punctuation-only messages such as ``?`` or ``...`` are deliberately not
+    treated as emoji reactions.
+    """
+    value = (text or "").strip()
+    if not value or any(char.isalnum() for char in value):
+        return False
+
+    has_emoji = False
+    for char in value:
+        if char.isspace() or char in {"\u200d", "\ufe0e", "\ufe0f", "\u20e3"}:
+            continue
+        if char in "!?.,:;…()[]{}<>«»\"'`~_-":
+            continue
+        codepoint = ord(char)
+        category = unicodedata.category(char)
+        if (
+            0x1F000 <= codepoint <= 0x1FAFF
+            or 0x2600 <= codepoint <= 0x27BF
+            or 0x2300 <= codepoint <= 0x23FF
+            or 0x1F1E6 <= codepoint <= 0x1F1FF
+            or 0x1F3FB <= codepoint <= 0x1F3FF
+            or category == "So"
+        ):
+            has_emoji = True
+            continue
+        # Combining marks are allowed only as part of an emoji sequence.
+        if category in {"Mn", "Me"}:
+            continue
+        return False
+    return has_emoji
+
+
+def is_reaction_only_message(text: str) -> bool:
+    return media_reaction_kind(text) is not None or is_emoji_only_reaction(text)
 
 
 def canonical_project_explanation(source_count: int = DEFAULT_FREE_SOURCE_COUNT) -> str:
@@ -421,6 +503,8 @@ def is_human_takeover_request(
 
 def classify_intent(text: str) -> str:
     normalized = _normalize(text)
+    if is_reaction_only_message(text):
+        return "reaction"
     # An explicit request to resend wins over a simultaneous access complaint.
     # Example: «ссылка не открывается, скинь ещё раз».
     if _has_any(text, _RESEND_LINK_MARKERS):
@@ -576,6 +660,24 @@ def choose_action(
         if action == "payment_answer" and _all_core_project_facts_explained(state):
             return "concise_link", "completed", True
         return action, next_stage, close_after
+
+    # A GIF, sticker, photo, voice note or emoji-only reply is a real response,
+    # but its meaning is unknown. Advance one safe step without pretending to
+    # understand what the media contains.
+    if intent == "reaction":
+        if stage == "first_dm_sent":
+            if state.first_dm_mentions_vip or state.vip_question_asked:
+                return "project_explanation", "offer_explained", False
+            return "vip_question", "vip_question_sent", False
+        if stage in {"vip_question_sent", "pain_point_sent"}:
+            return "project_explanation", "offer_explained", False
+        if stage in {"offer_explained", "scam_reassured", "reassured"}:
+            return "concise_link", "completed", True
+        return (
+            "concise_link" if _all_core_project_facts_explained(state) else "link_offer",
+            "completed",
+            True,
+        )
 
     if followup_count >= max(0, max_followups - 1):
         return "concise_link" if _all_core_project_facts_explained(state) else "link_offer", "completed", True
@@ -733,6 +835,8 @@ def post_link_final_messages(
 
     if intent == "soft_decline":
         return ["Понял, без проблем. Не буду навязывать."]
+    if intent == "reaction":
+        return ["Да, сам глянь и реши 🙂 Ничего покупать не обязан."]
     if intent == "link_access_issue":
         return [
             "Сверху над чатом закрой крестиком плашку «Заблокировать / Добавить». "
@@ -804,6 +908,12 @@ def _history_text(history: Sequence[tuple[str, str]]) -> str:
     for direction, message in history[-16:]:
         speaker = PERSONA_NAME if direction == "outgoing" else "Пользователь"
         compact = " ".join((message or "").split()).strip()
+        label = media_reaction_label(compact)
+        if label:
+            compact = (
+                f"[{label}. Содержимое не анализировалось; это только реакция "
+                "пользователя без текста.]"
+            )
         if compact:
             lines.append(f"{speaker}: {compact}")
     return "\n".join(lines)
@@ -918,6 +1028,20 @@ def _validate_generated(
     normalized = _normalize(combined)
     if any(_normalize(marker) in normalized for marker in _FORBIDDEN_GENERATED_MARKERS):
         return False, "использована запрещённая рекламная или неточная формулировка"
+    if is_reaction_only_message(state.last_user_text) and any(
+        marker in normalized
+        for marker in (
+            "вижу что ты отправ",
+            "вижу тво",
+            "на фото",
+            "на гиф",
+            "на gif",
+            "стикер означает",
+            "красивая фотограф",
+            "смешная гиф",
+        )
+    ):
+        return False, "нельзя выдумывать содержание медиа без текста"
     if action != "source_answer" and _uses_wrong_destination_term(combined):
         return False, "предлагаемый канал ошибочно назван группой или чатом"
     if any(len(message.split()) > 42 for message in messages):
@@ -1101,6 +1225,7 @@ async def generate_plan(
 13. Если человек говорит, что ссылка не нажимается, не кликается или по ней не получается перейти, объясни конкретно: сверху над чатом может висеть плашка «Заблокировать / Добавить»; нужно нажать крестик справа. Если не помогло — скопировать ссылку и вставить её в Telegram. Не гадай про приложение или устройство.
 14. Не называй предлагаемый проект «бесплатной группой» или «бесплатным чатом». Это бесплатный Telegram-канал со сливами VIP-каналов. Слово «чат» допустимо только для исходного чата, где был найден пользователь.
 15. На «нет, спасибо» и похожий вежливый отказ ответь один раз: понял, без проблем, не будешь навязывать. Не давай ссылку и не продолжай воронку.
+16. Если последнее сообщение состоит только из эмодзи либо в истории стоит пометка о GIF, стикере, фото, видео, голосовом или другом медиа без текста, считай это нейтральной реакцией пользователя и выполни текущую задачу следующего шага. Не утверждай, что понял содержание медиа, не описывай изображение и не пиши «вижу, что ты отправил».
 
 Точная ссылка, когда текущая задача разрешает её отправить: {PIRATE_VIP_LINK}
 Текущий этап: {stage}
@@ -1213,6 +1338,20 @@ def _validate_post_link_generated(
         message, DEFAULT_FREE_SOURCE_COUNT
     ):
         return False, "после непонимания не дана конкретная суть канала"
+    if intent == "reaction" and any(
+        marker in normalized
+        for marker in (
+            "вижу что ты отправ",
+            "вижу тво",
+            "на фото",
+            "на гиф",
+            "на gif",
+            "стикер означает",
+            "красивая фотограф",
+            "смешная гиф",
+        )
+    ):
+        return False, "нельзя выдумывать содержание медиа без текста"
 
     # A final answer should not simply replay the previous pitch.
     for previous in _outgoing_messages(history)[-4:]:
@@ -1262,7 +1401,7 @@ async def generate_post_link_plan(
     )
 
     post_link_intent = classify_intent(state.last_user_text)
-    if post_link_intent in {"link_access_issue", "soft_decline"}:
+    if post_link_intent in {"link_access_issue", "soft_decline", "reaction"}:
         return local_plan
 
     api_key = config("OPENAI_API_KEY", default="").strip()
@@ -1303,6 +1442,10 @@ async def generate_post_link_plan(
 «по ней торговать проще», «почти моментально» и похожие формулировки.
 Если вопрос о боте - честно скажи, что часть ответов автоматизирована.
 Если человек сомневается - не спорь и не дави.
+Если последнее сообщение состоит только из эмодзи или является пометкой о
+медиа без текста, считай его нейтральной реакцией. Ответь коротко и заверши
+текущий диалог, не делая вид, что понял содержание GIF, фото, стикера, видео
+или голосового сообщения.
 Не называй предлагаемый проект группой или чатом: это бесплатный Telegram-канал со сливами VIP-каналов.
 {link_rule}
 Название исходного чата: {title}

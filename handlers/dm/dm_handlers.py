@@ -676,6 +676,39 @@ def ensure_account_dispatcher(account_user_id: int) -> None:
     )
 
 
+def _detect_private_message_kind(event) -> str | None:
+    """Return a coarse media kind for a private message without reading it.
+
+    Maxim does not inspect media contents. The value only prevents an empty
+    caption from silently ending the AI flow and lets the service treat the
+    message as a neutral reaction.
+    """
+    message = getattr(event, "message", None)
+    if message is None or getattr(message, "media", None) is None:
+        return None
+
+    checks = (
+        ("sticker", "sticker"),
+        ("gif", "gif"),
+        ("photo", "photo"),
+        ("voice", "voice"),
+        ("video", "video"),
+        ("audio", "audio"),
+        ("poll", "poll"),
+        ("contact", "contact"),
+        ("geo", "location"),
+        ("venue", "location"),
+        ("document", "document"),
+    )
+    for attribute, kind in checks:
+        try:
+            if getattr(message, attribute, None):
+                return kind
+        except Exception:
+            continue
+    return "media"
+
+
 async def _monitor_loop(task_id: int) -> None:
     task = _get_task(task_id)
     if not task or not task["is_active"] or not task.get("session_string"):
@@ -718,6 +751,7 @@ async def _monitor_loop(task_id: int) -> None:
                 sender=sender,
                 text=event.raw_text or "",
                 message_id=getattr(event, "id", None),
+                media_kind=_detect_private_message_kind(event),
             )
 
         @client.on(events.NewMessage(chats=watched, incoming=True))
