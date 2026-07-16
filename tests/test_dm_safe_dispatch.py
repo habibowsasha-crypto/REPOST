@@ -22,7 +22,10 @@ from config import conn
 from handlers.dm import dm_handlers
 from services.dm_contact_analytics import (
     create_contact_tables,
+    is_completed_contact,
     is_contact_in_progress,
+    mark_completed,
+    record_first_dm as record_contact_first_dm,
     try_claim_first_dm,
 )
 from services.dm_task_queue import (
@@ -176,6 +179,26 @@ class SafeQueueTests(unittest.IsolatedAsyncioTestCase):
             (first[1],),
         ).fetchall()
         self.assertEqual(sources, [(1, 11), (2, 22)])
+
+    def test_completion_cancels_pending_rows_for_every_account(self) -> None:
+        self._task(task_id=1, account=100)
+        self._task(task_id=2, account=101)
+        _, first_id = self._enqueue(task_id=1, account=100, user=505, chat=11)
+        _, second_id = self._enqueue(task_id=2, account=101, user=505, chat=22)
+        cycle = record_contact_first_dm(
+            dm_task_id=1,
+            account_user_id=100,
+            target_user_id=505,
+            source_chat_id=11,
+            source_chat_title="A",
+        )
+        mark_completed(cycle, "natural_finish_after_link")
+        rows = conn.execute(
+            "SELECT id,status FROM dm_pending_queue WHERE id IN (?,?) ORDER BY id",
+            (first_id, second_id),
+        ).fetchall()
+        self.assertEqual(rows, [(first_id, "cancelled"), (second_id, "cancelled")])
+        self.assertTrue(is_completed_contact(101, 505))
 
     def test_private_media_kind_detection(self) -> None:
         def event_with(**message_fields):

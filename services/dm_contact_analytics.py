@@ -13,7 +13,7 @@ from loguru import logger
 from config import conn
 
 
-CompletedQueuePurger = Callable[[int, int], int]
+CompletedQueuePurger = Callable[[int], int]
 _completed_queue_purgers: list[CompletedQueuePurger] = []
 _table_ready = False
 _db_lock = threading.RLock()
@@ -47,22 +47,126 @@ def dialog_timeout_settings() -> dict[str, int]:
 
 
 def register_completed_queue_purger(callback: CompletedQueuePurger) -> None:
-    """Register a same-account live-queue cleanup callback once."""
+    """Register a global live-queue cleanup callback once."""
     if callback not in _completed_queue_purgers:
         _completed_queue_purgers.append(callback)
 
 
-def _purge_completed_contact_from_queues(account_user_id: int, target_user_id: int) -> int:
+def _purge_completed_contact_from_queues(target_user_id: int) -> int:
+    """Remove a globally completed user from every live/persistent first-DM queue."""
     removed = 0
     for callback in tuple(_completed_queue_purgers):
         try:
-            removed += max(0, int(callback(int(account_user_id), int(target_user_id)) or 0))
+            removed += max(0, int(callback(int(target_user_id)) or 0))
         except Exception as exc:
             logger.error(
-                "[DM analytics] completed-contact queue purge failed: "
-                f"account={account_user_id}, user={target_user_id}, error={exc}"
+                "[DM analytics] global completed-contact queue purge failed: "
+                f"user={target_user_id}, error={exc}"
             )
     return removed
+
+
+def _create_global_completed_contacts_table(cur: sqlite3.Cursor, table_name: str) -> None:
+    cur.execute(
+        f"""
+        CREATE TABLE {table_name} (
+            target_user_id INTEGER PRIMARY KEY,
+            account_user_id INTEGER NOT NULL,
+            source_chat_id INTEGER,
+            source_chat_title TEXT,
+            cycle_id INTEGER,
+            completed_at TEXT NOT NULL,
+            completion_reason TEXT
+        )
+        """
+    )
+
+
+def _migrate_completed_contacts_to_global(cur: sqlite3.Cursor) -> None:
+    """Migrate the old account-scoped registry to one global row per user.
+
+    For users completed by several accounts in older versions, the earliest
+    completion becomes the global origin record. Historical cycles stay intact.
+    """
+    table = cur.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='dm_completed_contacts'"
+    ).fetchone()
+    if not table:
+        _create_global_completed_contacts_table(cur, "dm_completed_contacts")
+        return
+
+    columns = cur.execute("PRAGMA table_info(dm_completed_contacts)").fetchall()
+    pk_by_name = {str(row[1]): int(row[5] or 0) for row in columns}
+    if pk_by_name.get("target_user_id") == 1 and pk_by_name.get("account_user_id", 0) == 0:
+        return
+
+    cur.execute("DROP TABLE IF EXISTS dm_completed_contacts_global_new")
+    _create_global_completed_contacts_table(cur, "dm_completed_contacts_global_new")
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO dm_completed_contacts_global_new
+            (target_user_id, account_user_id, source_chat_id, source_chat_title,
+             cycle_id, completed_at, completion_reason)
+        SELECT target_user_id, account_user_id, source_chat_id, source_chat_title,
+               cycle_id, completed_at, completion_reason
+          FROM dm_completed_contacts
+         ORDER BY completed_at ASC, rowid ASC
+        """
+    )
+    cur.execute("DROP INDEX IF EXISTS idx_dm_completed_chat")
+    cur.execute("DROP TABLE dm_completed_contacts")
+    cur.execute(
+        "ALTER TABLE dm_completed_contacts_global_new RENAME TO dm_completed_contacts"
+    )
+
+
+def _create_global_first_dm_claims_table(cur: sqlite3.Cursor, table_name: str) -> None:
+    cur.execute(
+        f"""
+        CREATE TABLE {table_name} (
+            target_user_id INTEGER PRIMARY KEY,
+            account_user_id INTEGER NOT NULL,
+            claim_token TEXT NOT NULL UNIQUE,
+            dm_task_id INTEGER,
+            source_chat_id INTEGER,
+            claimed_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def _migrate_first_dm_claims_to_global(cur: sqlite3.Cursor) -> None:
+    """Allow only one in-flight first-DM claim for a user across all accounts."""
+    table = cur.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='dm_first_dm_claims'"
+    ).fetchone()
+    if not table:
+        _create_global_first_dm_claims_table(cur, "dm_first_dm_claims")
+        return
+
+    columns = cur.execute("PRAGMA table_info(dm_first_dm_claims)").fetchall()
+    pk_by_name = {str(row[1]): int(row[5] or 0) for row in columns}
+    if pk_by_name.get("target_user_id") == 1 and pk_by_name.get("account_user_id", 0) == 0:
+        return
+
+    cur.execute("DROP TABLE IF EXISTS dm_first_dm_claims_global_new")
+    _create_global_first_dm_claims_table(cur, "dm_first_dm_claims_global_new")
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO dm_first_dm_claims_global_new
+            (target_user_id, account_user_id, claim_token, dm_task_id,
+             source_chat_id, claimed_at)
+        SELECT target_user_id, account_user_id, claim_token, dm_task_id,
+               source_chat_id, claimed_at
+          FROM dm_first_dm_claims
+         ORDER BY claimed_at ASC, rowid ASC
+        """
+    )
+    cur.execute("DROP INDEX IF EXISTS idx_dm_first_claims_at")
+    cur.execute("DROP TABLE dm_first_dm_claims")
+    cur.execute(
+        "ALTER TABLE dm_first_dm_claims_global_new RENAME TO dm_first_dm_claims"
+    )
 
 
 def create_contact_tables() -> None:
@@ -93,20 +197,7 @@ def create_contact_tables() -> None:
                 )
                 """
             )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS dm_completed_contacts (
-                    account_user_id INTEGER NOT NULL,
-                    target_user_id INTEGER NOT NULL,
-                    source_chat_id INTEGER,
-                    source_chat_title TEXT,
-                    cycle_id INTEGER,
-                    completed_at TEXT NOT NULL,
-                    completion_reason TEXT,
-                    PRIMARY KEY (account_user_id, target_user_id)
-                )
-                """
-            )
+            _migrate_completed_contacts_to_global(cur)
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS dm_contact_sources (
@@ -120,20 +211,7 @@ def create_contact_tables() -> None:
                 )
                 """
             )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS dm_first_dm_claims (
-                    account_user_id INTEGER NOT NULL,
-                    target_user_id INTEGER NOT NULL,
-                    claim_token TEXT NOT NULL,
-                    dm_task_id INTEGER,
-                    source_chat_id INTEGER,
-                    claimed_at TEXT NOT NULL,
-                    PRIMARY KEY (account_user_id, target_user_id),
-                    UNIQUE (claim_token)
-                )
-                """
-            )
+            _migrate_first_dm_claims_to_global(cur)
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_dm_cycles_chat "
                 "ON dm_contact_cycles(source_chat_id, status)"
@@ -218,21 +296,26 @@ def record_source_seen(
 
 
 def is_completed_contact(account_user_id: int, target_user_id: int) -> bool:
+    """Return global completed-contact protection for the Telegram user.
+
+    ``account_user_id`` is kept in the signature for backward compatibility; a
+    completion by any connected account blocks every account until admin cleanup.
+    """
+    del account_user_id
     create_contact_tables()
     with _db_lock:
         row = conn.execute(
-            "SELECT 1 FROM dm_completed_contacts "
-            "WHERE account_user_id=? AND target_user_id=? LIMIT 1",
-            (int(account_user_id), int(target_user_id)),
+            "SELECT 1 FROM dm_completed_contacts WHERE target_user_id=? LIMIT 1",
+            (int(target_user_id),),
         ).fetchone()
     return row is not None
 
 
 def is_contact_in_progress(account_user_id: int, target_user_id: int) -> bool:
-    """Return True while the same account already has a live contact cycle."""
+    """Return True while any connected account has a live contact cycle."""
+    del account_user_id
     create_contact_tables()
     expire_stale_dialogs(
-        account_user_id=int(account_user_id),
         target_user_id=int(target_user_id),
         log_result=False,
     )
@@ -244,11 +327,11 @@ def is_contact_in_progress(account_user_id: int, target_user_id: int) -> bool:
         row = conn.execute(
             """
             SELECT 1 FROM dm_contact_cycles
-            WHERE account_user_id=? AND target_user_id=?
+            WHERE target_user_id=?
               AND status IN ('first_dm_sent','active','post_link_active')
             LIMIT 1
             """,
-            (int(account_user_id), int(target_user_id)),
+            (int(target_user_id),),
         ).fetchone()
         if row is not None:
             return True
@@ -262,12 +345,11 @@ def is_contact_in_progress(account_user_id: int, target_user_id: int) -> bool:
         if sent_table and conn.execute(
             """
             SELECT 1 FROM dm_sent_log AS log
-            JOIN dm_tasks AS task ON task.id=log.dm_task_id
-            WHERE task.user_id=? AND log.target_user_id=?
+            WHERE log.target_user_id=?
               AND log.status='sent' AND log.sent_at>=?
             LIMIT 1
             """,
-            (int(account_user_id), int(target_user_id), cutoff),
+            (int(target_user_id), cutoff),
         ).fetchone():
             return True
 
@@ -281,12 +363,12 @@ def is_contact_in_progress(account_user_id: int, target_user_id: int) -> bool:
         row = conn.execute(
             """
             SELECT 1 FROM ai_dialogs
-            WHERE account_user_id=? AND target_user_id=?
+            WHERE target_user_id=?
               AND status='active'
               AND COALESCE(updated_at, created_at, '') >= ?
             LIMIT 1
             """,
-            (int(account_user_id), int(target_user_id), cutoff),
+            (int(target_user_id), cutoff),
         ).fetchone()
     return row is not None
 
@@ -298,11 +380,10 @@ def try_claim_first_dm(
     dm_task_id: int,
     source_chat_id: Optional[int],
 ) -> Optional[str]:
-    """Atomically reserve one sender-account/recipient pair before Telegram send.
+    """Atomically reserve one recipient globally before Telegram send.
 
-    The persistent claim complements the in-memory asyncio lock. It prevents two
-    tasks or two process instances from delivering the same first DM concurrently.
-    A stale claim expires after a short crash-recovery window.
+    The persistent claim prevents two tasks, accounts or process instances from
+    delivering concurrent first DMs to the same Telegram user.
     """
     create_contact_tables()
     now = _utc_now()
@@ -316,19 +397,18 @@ def try_claim_first_dm(
                     (cutoff,),
                 )
                 if conn.execute(
-                    "SELECT 1 FROM dm_completed_contacts "
-                    "WHERE account_user_id=? AND target_user_id=? LIMIT 1",
-                    (int(account_user_id), int(target_user_id)),
+                    "SELECT 1 FROM dm_completed_contacts WHERE target_user_id=? LIMIT 1",
+                    (int(target_user_id),),
                 ).fetchone():
                     return None
                 if conn.execute(
                     """
                     SELECT 1 FROM dm_contact_cycles
-                    WHERE account_user_id=? AND target_user_id=?
+                    WHERE target_user_id=?
                       AND status IN ('first_dm_sent','active','post_link_active')
                     LIMIT 1
                     """,
-                    (int(account_user_id), int(target_user_id)),
+                    (int(target_user_id),),
                 ).fetchone():
                     return None
                 sent_table = conn.execute(
@@ -344,12 +424,11 @@ def try_claim_first_dm(
                 if sent_table and conn.execute(
                     """
                     SELECT 1 FROM dm_sent_log AS log
-                    JOIN dm_tasks AS task ON task.id=log.dm_task_id
-                    WHERE task.user_id=? AND log.target_user_id=?
+                    WHERE log.target_user_id=?
                       AND log.status='sent' AND log.sent_at>=?
                     LIMIT 1
                     """,
-                    (int(account_user_id), int(target_user_id), sent_cutoff),
+                    (int(target_user_id), sent_cutoff),
                 ).fetchone():
                     return None
                 ai_table = conn.execute(
@@ -366,12 +445,12 @@ def try_claim_first_dm(
                     if conn.execute(
                         """
                         SELECT 1 FROM ai_dialogs
-                        WHERE account_user_id=? AND target_user_id=?
+                        WHERE target_user_id=?
                           AND status='active'
                           AND COALESCE(updated_at, created_at, '') >= ?
                         LIMIT 1
                         """,
-                        (int(account_user_id), int(target_user_id), ai_cutoff),
+                        (int(target_user_id), ai_cutoff),
                     ).fetchone():
                         return None
                 if conn.execute(
@@ -616,9 +695,8 @@ def _finish_cycle(
                     return None
                 if current_status == "completed":
                     if cur.execute(
-                        "SELECT 1 FROM dm_completed_contacts "
-                        "WHERE account_user_id=? AND target_user_id=? LIMIT 1",
-                        (account_user_id, target_user_id),
+                        "SELECT 1 FROM dm_completed_contacts WHERE target_user_id=? LIMIT 1",
+                        (target_user_id,),
                     ).fetchone():
                         conn.rollback()
                         return None
@@ -668,9 +746,8 @@ def _finish_cycle(
 
             # A terminal cycle must not leave an old first-DM reservation behind.
             cur.execute(
-                "DELETE FROM dm_first_dm_claims "
-                "WHERE account_user_id=? AND target_user_id=?",
-                (account_user_id, target_user_id),
+                "DELETE FROM dm_first_dm_claims WHERE target_user_id=?",
+                (target_user_id,),
             )
 
             if block_repeat:
@@ -681,12 +758,7 @@ def _finish_cycle(
                          source_chat_title, cycle_id, completed_at,
                          completion_reason)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(account_user_id,target_user_id) DO UPDATE SET
-                        source_chat_id=excluded.source_chat_id,
-                        source_chat_title=excluded.source_chat_title,
-                        cycle_id=excluded.cycle_id,
-                        completed_at=excluded.completed_at,
-                        completion_reason=excluded.completion_reason
+                    ON CONFLICT(target_user_id) DO NOTHING
                     """,
                     (
                         account_user_id,
@@ -720,7 +792,7 @@ def _complete_contact_without_cycle(
     This is a recovery path for the narrow failure window after Telegram accepts
     the first message but before ``dm_contact_cycles`` is persisted. Historical
     counters cannot be reconstructed safely, but the user must still be protected
-    from another first DM by the same connected account.
+    from another first DM by any connected account.
     """
     create_contact_tables()
     now = _now_iso()
@@ -737,11 +809,7 @@ def _complete_contact_without_cycle(
                      source_chat_title, cycle_id, completed_at,
                      completion_reason)
                 VALUES (?, ?, ?, ?, NULL, ?, ?)
-                ON CONFLICT(account_user_id,target_user_id) DO UPDATE SET
-                    source_chat_id=COALESCE(excluded.source_chat_id, dm_completed_contacts.source_chat_id),
-                    source_chat_title=COALESCE(excluded.source_chat_title, dm_completed_contacts.source_chat_title),
-                    completed_at=excluded.completed_at,
-                    completion_reason=excluded.completion_reason
+                ON CONFLICT(target_user_id) DO NOTHING
                 """,
                 (
                     account_user_id,
@@ -753,9 +821,8 @@ def _complete_contact_without_cycle(
                 ),
             )
             cur.execute(
-                "DELETE FROM dm_first_dm_claims "
-                "WHERE account_user_id=? AND target_user_id=?",
-                (account_user_id, target_user_id),
+                "DELETE FROM dm_first_dm_claims WHERE target_user_id=?",
+                (target_user_id,),
             )
             conn.commit()
         except Exception:
@@ -793,11 +860,11 @@ def mark_completed(
     else:
         return
     if pair:
-        removed = _purge_completed_contact_from_queues(*pair)
+        removed = _purge_completed_contact_from_queues(pair[1])
         if removed:
             logger.info(
                 "[DM analytics] completed contact removed from live queues: "
-                f"account={pair[0]}, user={pair[1]}, removed={removed}"
+                f"user={pair[1]}, removed={removed}"
             )
 
 
@@ -916,11 +983,11 @@ def expire_stale_dialogs(
         )
         if pair:
             completed += 1
-            removed = _purge_completed_contact_from_queues(*pair)
+            removed = _purge_completed_contact_from_queues(pair[1])
             if removed:
                 logger.info(
                     "[DM analytics] timeout-completed contact removed from live queues: "
-                    f"account={pair[0]}, user={pair[1]}, removed={removed}"
+                    f"user={pair[1]}, removed={removed}"
                 )
             _sync_ai_terminal_status(int(cycle_id), "completed", after_reason)
 

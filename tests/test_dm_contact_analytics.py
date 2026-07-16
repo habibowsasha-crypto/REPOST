@@ -89,13 +89,43 @@ class DmContactAnalyticsTests(unittest.IsolatedAsyncioTestCase):
             source_chat_title=title,
         )
 
-    async def test_completed_contact_blocks_only_same_account_and_clear_reopens(self) -> None:
+    async def test_completed_contact_blocks_all_accounts_and_clear_reopens(self) -> None:
         cycle = self._cycle()
         mark_completed(cycle, "natural_finish_after_link")
         self.assertTrue(is_completed_contact(100, 500))
-        self.assertFalse(is_completed_contact(101, 500))
+        self.assertTrue(is_completed_contact(101, 500))
         self.assertEqual(clear_completed_for_chat(777), 1)
         self.assertFalse(is_completed_contact(100, 500))
+
+    async def test_active_contact_blocks_other_accounts_until_abandoned(self) -> None:
+        cycle = self._cycle(account=100, user=504)
+        self.assertTrue(is_contact_in_progress(101, 504))
+        self.assertIsNone(
+            try_claim_first_dm(
+                account_user_id=101,
+                target_user_id=504,
+                dm_task_id=2,
+                source_chat_id=778,
+            )
+        )
+        old = (
+            datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(hours=80)
+        ).isoformat()
+        with conn:
+            conn.execute(
+                "UPDATE dm_contact_cycles SET last_activity_at=? WHERE id=?",
+                (old, cycle),
+            )
+        self.assertFalse(is_contact_in_progress(101, 504))
+        self.assertIsNotNone(
+            try_claim_first_dm(
+                account_user_id=101,
+                target_user_id=504,
+                dm_task_id=2,
+                source_chat_id=778,
+            )
+        )
 
     async def test_post_link_timeout_completes_and_before_link_timeout_abandons(self) -> None:
         old = (
@@ -151,7 +181,7 @@ class DmContactAnalyticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(overall_stats()["opted_out"], 1)
         self.assertTrue(remove_opt_out(610))
 
-    async def test_completed_contact_purges_only_same_account_live_queues(self) -> None:
+    async def test_completed_contact_purges_all_account_live_queues(self) -> None:
         target = SimpleNamespace(id=620)
         dm_handlers.dm_send_queues[1] = deque([(620, target)])
         dm_handlers.dm_send_queues[2] = deque([(620, target)])
@@ -169,15 +199,32 @@ class DmContactAnalyticsTests(unittest.IsolatedAsyncioTestCase):
             dm_handlers._get_task = original_get_task
 
         self.assertEqual(list(dm_handlers.dm_send_queues[1]), [])
-        self.assertEqual(len(dm_handlers.dm_send_queues[2]), 1)
+        self.assertEqual(list(dm_handlers.dm_send_queues[2]), [])
         self.assertNotIn((1, 620), dm_handlers.dm_source_chat_titles)
-        self.assertIn((2, 620), dm_handlers.dm_source_chat_titles)
+        self.assertNotIn((2, 620), dm_handlers.dm_source_chat_titles)
 
         # Admin cleanup cannot resurrect an old queued first DM. A new group
         # message must be observed before the account can enqueue the user again.
         self.assertEqual(clear_completed_for_chat(800), 1)
         self.assertEqual(list(dm_handlers.dm_send_queues[1]), [])
 
+
+    async def test_first_dm_claim_is_global_across_accounts(self) -> None:
+        first = try_claim_first_dm(
+            account_user_id=100,
+            target_user_id=639,
+            dm_task_id=1,
+            source_chat_id=777,
+        )
+        self.assertIsNotNone(first)
+        second = try_claim_first_dm(
+            account_user_id=101,
+            target_user_id=639,
+            dm_task_id=2,
+            source_chat_id=778,
+        )
+        self.assertIsNone(second)
+        self.assertTrue(release_first_dm_claim(100, 639, first))
 
     async def test_persistent_first_dm_claim_is_atomic_and_consumed(self) -> None:
         token = try_claim_first_dm(
@@ -328,7 +375,7 @@ class DmContactAnalyticsTests(unittest.IsolatedAsyncioTestCase):
             """
             SELECT cycle_id, source_chat_id, completion_reason
             FROM dm_completed_contacts
-            WHERE account_user_id=100 AND target_user_id=646
+            WHERE target_user_id=646
             """
         ).fetchone()
         self.assertIsNone(row[0])

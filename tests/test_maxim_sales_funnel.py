@@ -700,7 +700,7 @@ class MaximSalesFunnelTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("браузер", answer)
         self.assertNotIn("устройств", answer)
 
-    async def test_soft_decline_closes_for_account_without_global_optout(self) -> None:
+    async def test_soft_decline_closes_globally_without_permanent_optout(self) -> None:
         self.open_cycle()
         self.assertTrue(is_soft_decline("Нет, спасибо"))
         self.assertEqual(classify_intent("Нет, спасибо"), "soft_decline")
@@ -715,9 +715,9 @@ class MaximSalesFunnelTests(unittest.IsolatedAsyncioTestCase):
         row = conn.execute(
             """
             SELECT completion_reason FROM dm_completed_contacts
-            WHERE account_user_id=? AND target_user_id=?
+            WHERE target_user_id=?
             """,
-            (9001, self.sender.id),
+            (self.sender.id,),
         ).fetchone()
         self.assertIsNotNone(row)
         self.assertEqual(row[0], "completed_no_interest")

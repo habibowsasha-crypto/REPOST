@@ -427,7 +427,7 @@ def _set_stage(dialog_id: int, stage: str) -> None:
 
 
 def _finalize_completed_dialog(dialog: DialogRow, reason: str) -> None:
-    """Persist same-account repeat protection before closing the AI row.
+    """Persist global repeat protection before closing the AI row.
 
     The contact table is the source of truth for future first-DM eligibility. It
     is written first so a partial database failure cannot leave a user exposed to

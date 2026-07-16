@@ -64,7 +64,6 @@ from services.dm_task_cleanup import (
 )
 from services.dm_task_queue import (
     account_gate_wait_seconds,
-    cancel_account_target,
     cancel_row,
     cancel_target_globally,
     count_pending,
@@ -293,16 +292,11 @@ def _purge_opted_out_user(target_user_id: int) -> int:
     return removed
 
 
-def _purge_completed_user(account_user_id: int, target_user_id: int) -> int:
-    account_user_id = int(account_user_id)
+def _purge_completed_user(target_user_id: int) -> int:
+    """Remove a globally completed user from every account and task queue."""
     target_user_id = int(target_user_id)
-    removed = cancel_account_target(
-        account_user_id, target_user_id, "completed_contact"
-    )
+    removed = cancel_target_globally(target_user_id, "global_completed_contact")
     for task_id, queue in list(dm_send_queues.items()):
-        task = _get_task(task_id)
-        if not task or int(task.get("user_id") or 0) != account_user_id:
-            continue
         try:
             kept = [item for item in queue if int(item[0]) != target_user_id]
             removed += len(queue) - len(kept)
@@ -457,6 +451,13 @@ async def _send_pending_row(row: dict) -> str:
         if not mark_sending(row_id, queue_claim):
             release_first_dm_claim(account_user_id, target_id, first_claim)
             return "lost_race"
+
+        # Final global guard immediately before the Telegram request. Another
+        # account may have completed the dialog while this peer was resolving.
+        if is_completed_contact(account_user_id, target_id):
+            release_first_dm_claim(account_user_id, target_id, first_claim)
+            cancel_row(row_id, "global_completed_contact", claim_token=queue_claim)
+            return "cancelled"
 
         partial_delivery = False
         try:
