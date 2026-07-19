@@ -92,6 +92,13 @@ from services.dm_task_queue import (
     set_account_cooldown,
 )
 from services.first_message import choose_first_dm_text, is_random_first_dm_enabled
+from services.first_dm_modules import (
+    DEFAULT_FIRST_DM_MODULE,
+    KIRILL_VIP_MODULE,
+    first_dm_module_label,
+    normalize_first_dm_module,
+)
+from services.first_message_kirill_vip import choose_kirill_vip_first_dm_text
 from services.menu_ui import render_menu
 from utils.database.database import create_dm_tables
 from utils.telegram import gid_key
@@ -189,7 +196,7 @@ def _get_task(task_id: int) -> Optional[dict]:
         SELECT t.id, t.admin_id, t.user_id,
                COALESCE(s.session_string, t.session_string),
                t.post_text, t.photo_url, t.interval_minutes, t.is_active,
-               t.delay_min, t.delay_max
+               t.delay_min, t.delay_max, COALESCE(t.first_dm_module, 'default')
           FROM dm_tasks AS t
           LEFT JOIN sessions AS s ON s.user_id=t.user_id
          WHERE t.id=?
@@ -209,6 +216,7 @@ def _get_task(task_id: int) -> Optional[dict]:
         "is_active",
         "delay_min",
         "delay_max",
+        "first_dm_module",
     )
     return dict(zip(keys, row))
 
@@ -456,10 +464,14 @@ async def _send_pending_row(row: dict) -> str:
             )
             return "unresolved"
 
-        outgoing_text = (
-            choose_first_dm_text(task["post_text"] or "")
-            or (task["post_text"] or "Привет 👋")
-        )
+        first_dm_module = normalize_first_dm_module(task.get("first_dm_module"))
+        if first_dm_module == KIRILL_VIP_MODULE:
+            outgoing_text = choose_kirill_vip_first_dm_text()
+        else:
+            outgoing_text = (
+                choose_first_dm_text(task["post_text"] or "")
+                or (task["post_text"] or "Привет 👋")
+            )
         if is_global_first_dm_paused():
             release_first_dm_claim(account_user_id, target_id, first_claim)
             release_pending_claim(row_id, queue_claim, "global_pause_before_sending")
@@ -613,6 +625,7 @@ async def _send_pending_row(row: dict) -> str:
                 source_chat_id=row.get("source_chat_id"),
                 source_chat_title=row.get("source_chat_title"),
                 contact_cycle_id=contact_cycle_id,
+                dialog_module=first_dm_module,
             )
         except Exception as exc:
             logger.exception(
@@ -1042,15 +1055,22 @@ async def dm_pick_account(event: callback_query) -> None:
         await render_menu(event, "⚠ Нет доступных групп. Откройте аккаунт и нажмите «Найти группы аккаунта».", buttons=[[Button.inline("🔎 Найти группы", f"sync_groups_{user_id}".encode()), Button.inline("🏠 Меню", b"menu_home")]])
         return
     dm_setup_state[admin_id] = {
-        "step": "pick_chats",
+        "step": "pick_module",
         "user_id": user_id,
         "session_string": row[0],
         "selected_chats": [],
         "all_groups": groups,
+        "first_dm_module": DEFAULT_FIRST_DM_MODULE,
     }
-    await render_menu(event, 
-        "📋 **Выберите чаты для мониторинга:**",
-        buttons=_build_chat_buttons(groups, []),
+    await render_menu(
+        event,
+        "💬 **Выберите модуль первого сообщения:**\n\n"
+        "Модуль сохраняется отдельно для этой DM-задачи.",
+        buttons=[
+            [Button.inline("🧩 Текущие фразы", b"dm_module_default")],
+            [Button.inline("👑 VIP Кирилла", b"dm_module_kirill_vip")],
+            [Button.inline("◀️ Назад", b"menu_dm_post")],
+        ],
     )
     await event.answer()
 
@@ -1065,6 +1085,30 @@ def _build_chat_buttons(groups, selected):
     ]
     buttons.append([Button.inline("▶️ Готово", b"dm_chats_done")])
     return buttons
+
+
+@bot.on(Query(data=lambda d: d in {b"dm_module_default", b"dm_module_kirill_vip"}))
+async def dm_pick_first_message_module(event: callback_query) -> None:
+    if event.sender_id not in ADMIN_ID_LIST:
+        return
+    st = dm_setup_state.get(event.sender_id)
+    if not st or st.get("step") != "pick_module":
+        await event.answer("Начните заново через /dm_post", alert=True)
+        return
+    module = (
+        KIRILL_VIP_MODULE
+        if event.data == b"dm_module_kirill_vip"
+        else DEFAULT_FIRST_DM_MODULE
+    )
+    st["first_dm_module"] = module
+    st["step"] = "pick_chats"
+    await render_menu(
+        event,
+        f"💬 Модуль: **{first_dm_module_label(module)}**\n\n"
+        "📋 **Выберите чаты для мониторинга:**",
+        buttons=_build_chat_buttons(st["all_groups"], st["selected_chats"]),
+    )
+    await event.answer()
 
 
 @bot.on(Query(data=lambda d: d.decode().startswith("dm_tog_")))
@@ -1099,13 +1143,15 @@ async def dm_chats_done(event: callback_query) -> None:
     if not st["selected_chats"]:
         await event.answer("⚠ Выберите хотя бы один чат!", alert=True)
         return
-    if is_random_first_dm_enabled():
+    selected_module = normalize_first_dm_module(st.get("first_dm_module"))
+    if selected_module == KIRILL_VIP_MODULE or is_random_first_dm_enabled():
         st["post_text"] = ""
         st["step"] = "delay_min"
         await render_menu(
             event,
             f"✅ Выбрано чатов: {len(st['selected_chats'])}\n\n"
-            "🎲 Случайное первое сообщение включено. Ручной текст вводить не нужно.\n\n"
+            f"💬 Модуль: **{first_dm_module_label(selected_module)}**\n"
+            "Ручной текст первого сообщения вводить не нужно.\n\n"
             "⏱ **Минимальная задержка после сообщения пользователя** (секунды):\n"
             "_(например: `30`)_",
         )
@@ -1211,13 +1257,14 @@ async def _save_and_launch(event, admin_id: int, st: dict) -> None:
     cursor.execute(
         """INSERT INTO dm_tasks
            (admin_id, user_id, session_string, post_text, photo_url,
-            interval_minutes, is_active, created_at, delay_min, delay_max)
-           VALUES (?,?,?,?,?,?,1,?,?,?)""",
+            interval_minutes, is_active, created_at, delay_min, delay_max, first_dm_module)
+           VALUES (?,?,?,?,?,?,1,?,?,?,?)""",
         (
             admin_id, st["user_id"], st["session_string"],
             st["post_text"], st.get("photo_url"),
             0, _now_iso(),
             st.get("delay_min", 30), st.get("delay_max", 90),
+            normalize_first_dm_module(st.get("first_dm_module")),
         ),
     )
     task_id = cursor.lastrowid
@@ -1235,6 +1282,7 @@ async def _save_and_launch(event, admin_id: int, st: dict) -> None:
         f"🚀 **DM-задача #{task_id} запущена!**\n\n"
         f"👥 Чатов: {len(st['selected_chats'])}\n"
         f"⏱ Задержка после сообщения: {st.get('delay_min', 30)}–{st.get('delay_max', 90)} сек\n"
+        f"💬 Модуль первого DM: {first_dm_module_label(st.get('first_dm_module'))}\n"
         "🧭 Пауза между фактическими первыми DM настраивается отдельно для аккаунта.\n"
         f"📸 Фото: {'да' if st.get('photo_url') else 'нет'}\n\n"
         f"🔒 Закрытый ЛС → blacklist на 24ч\n\n"
@@ -1249,6 +1297,7 @@ async def cmd_dm_list(event: callback_message) -> None:
     rows = conn.execute(
         """
         SELECT id, user_id, is_active, created_at, delay_min, delay_max,
+               COALESCE(first_dm_module, 'default'),
                (SELECT COUNT(*) FROM dm_watched_chats WHERE dm_task_id=dm_tasks.id),
                (SELECT COUNT(*) FROM dm_sent_log WHERE dm_task_id=dm_tasks.id AND status='sent'),
                (SELECT COUNT(*) FROM dm_sent_log WHERE dm_task_id=dm_tasks.id AND status='privacy')
@@ -1273,7 +1322,7 @@ async def cmd_dm_list(event: callback_message) -> None:
         )
     lines.append(f"🧹 Неактуальных задач: **{inactive_count}**")
     buttons = []
-    for task_id, account_id, active, created, low, high, chats, sent, privacy in rows:
+    for task_id, account_id, active, created, low, high, first_dm_module, chats, sent, privacy in rows:
         running_task = dm_monitor_tasks.get(int(task_id))
         running = bool(running_task and not running_task.done())
         if active and global_pause.is_paused:
@@ -1295,6 +1344,7 @@ async def cmd_dm_list(event: callback_message) -> None:
         lines.append(
             f"**#{task_id}** | {account_label} | {status}\n"
             f"Чатов: {chats} | ✅ отправлено: {sent} | 🔒 закрытых ЛС: {privacy}\n"
+            f"Модуль: {first_dm_module_label(first_dm_module)}\n"
             f"Задержка после сообщения: {int(low or 0)}–{int(high or 0)}с\n"
             f"В очереди: {queue_size} чел. | Создана: {(created or '')[:16]}"
         )

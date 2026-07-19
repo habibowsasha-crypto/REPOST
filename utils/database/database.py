@@ -397,7 +397,8 @@ def create_dm_tables() -> None:
                 is_active BOOLEAN DEFAULT 1,
                 created_at TEXT,
                 delay_min INTEGER DEFAULT 30,
-                delay_max INTEGER DEFAULT 90
+                delay_max INTEGER DEFAULT 90,
+                first_dm_module TEXT NOT NULL DEFAULT 'default'
             )
             """
         )
@@ -507,6 +508,16 @@ def create_dm_tables() -> None:
     _add_column_if_missing(
         "dm_tasks", "delay_max", "ALTER TABLE dm_tasks ADD COLUMN delay_max INTEGER DEFAULT 90"
     )
+    _add_column_if_missing(
+        "dm_tasks",
+        "first_dm_module",
+        "ALTER TABLE dm_tasks ADD COLUMN first_dm_module TEXT NOT NULL DEFAULT 'default'",
+    )
+    with conn:
+        conn.execute(
+            "UPDATE dm_tasks SET first_dm_module='default' "
+            "WHERE first_dm_module IS NULL OR TRIM(first_dm_module)=''"
+        )
     _add_column_if_missing(
         "dm_sent_log", "status", "ALTER TABLE dm_sent_log ADD COLUMN status TEXT DEFAULT 'sent'"
     )

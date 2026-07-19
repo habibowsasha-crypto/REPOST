@@ -1,0 +1,31 @@
+TgBlaster v1.0.22b4 — OFFLINE VERIFICATION
+Date: 2026-07-19
+Base: TgBlaster v1.0.22b3
+
+FEATURE
+- Optional per-task first-DM module «VIP Кирилла».
+- Original module remains the default for every migrated task.
+- Dedicated Кирилл first-message pool and deterministic follow-up tree.
+- Per-dialog module persistence prevents a later task setting change from switching an active conversation.
+
+SOURCE VERIFICATION BEFORE PACKAGING
+- Python compileall: PASS.
+- pytest: 114 tests + 38 subtests PASS.
+- unittest discover: 114 tests PASS.
+- pyflakes on all changed runtime/test files: PASS.
+- Legacy v1.0.22b3-style SQLite migration: PASS.
+- Existing task preserved with first_dm_module='default': PASS.
+- Existing dialog preserved with dialog_module='default': PASS.
+- Kirill dispatcher selector isolation: PASS.
+- Original/default dispatcher selector isolation: PASS.
+- «Да, есть» branch: source explanation + price question + free alternative + exact link: PASS.
+- «Нет, не покупал» branch: free alternative + exact link: PASS.
+- Automatic Telegram link-help message: PASS.
+- Honest answer that the destination is not official Кирилл access: PASS.
+- Soft refusal closes without sending the link: PASS.
+- All 24 first-DM variants are unique and explicitly mention Кирилл: PASS.
+- services/first_message.py byte-identical to v1.0.22b3: PASS.
+  SHA-256: a34f2613c338b1f89284335d2462cc1ed1b1e43b3063dcdf4a511a3b7f0f32aa
+
+HONEST LIMITATION
+No real Telegram message, real OpenAI request or live Railway deployment was performed during offline verification.

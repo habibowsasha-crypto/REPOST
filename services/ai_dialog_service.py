@@ -33,6 +33,15 @@ from services.maxim_sales_funnel import (
     post_link_final_messages,
     validate_link_access_help,
 )
+from services.first_dm_modules import (
+    DEFAULT_FIRST_DM_MODULE,
+    KIRILL_VIP_MODULE,
+    normalize_first_dm_module,
+)
+from services.kirill_vip_funnel import (
+    build_kirill_vip_plan,
+    build_kirill_vip_post_link_plan,
+)
 from services.dm_opt_out import (
     add_opt_out,
     is_opted_out,
@@ -163,6 +172,7 @@ class DialogRow:
     source_chat_id: Optional[int]
     source_chat_title: Optional[str]
     contact_cycle_id: Optional[int]
+    dialog_module: str
     stage: str
     status: str
     message_count: int
@@ -182,6 +192,7 @@ def create_ai_tables() -> None:
             source_chat_id INTEGER,
             source_chat_title TEXT,
             contact_cycle_id INTEGER,
+            dialog_module TEXT NOT NULL DEFAULT 'default',
             stage TEXT DEFAULT 'new_contact',
             status TEXT DEFAULT 'active',
             message_count INTEGER DEFAULT 0,
@@ -277,6 +288,7 @@ def create_ai_tables() -> None:
         ("ai_dialogs", "source_chat_id", "ALTER TABLE ai_dialogs ADD COLUMN source_chat_id INTEGER"),
         ("ai_dialogs", "source_chat_title", "ALTER TABLE ai_dialogs ADD COLUMN source_chat_title TEXT"),
         ("ai_dialogs", "contact_cycle_id", "ALTER TABLE ai_dialogs ADD COLUMN contact_cycle_id INTEGER"),
+        ("ai_dialogs", "dialog_module", "ALTER TABLE ai_dialogs ADD COLUMN dialog_module TEXT NOT NULL DEFAULT 'default'"),
         ("ai_messages", "tokens_used", "ALTER TABLE ai_messages ADD COLUMN tokens_used INTEGER DEFAULT 0"),
     ]:
         try:
@@ -299,7 +311,7 @@ def _get_dialog_by_target(account_user_id: int, target_user_id: int) -> Optional
     cursor = conn.cursor()
     cursor.execute(
         """SELECT id, dm_task_id, account_user_id, target_user_id, username, first_name,
-                  source_chat_id, source_chat_title, contact_cycle_id, stage, status, message_count, stopped_reason
+                  source_chat_id, source_chat_title, contact_cycle_id, COALESCE(dialog_module, 'default'), stage, status, message_count, stopped_reason
            FROM ai_dialogs WHERE account_user_id = ? AND target_user_id = ?""",
         (account_user_id, target_user_id),
     )
@@ -312,7 +324,7 @@ def _get_dialog_by_id(dialog_id: int) -> Optional[DialogRow]:
     cursor = conn.cursor()
     cursor.execute(
         """SELECT id, dm_task_id, account_user_id, target_user_id, username, first_name,
-                  source_chat_id, source_chat_title, contact_cycle_id, stage, status, message_count, stopped_reason
+                  source_chat_id, source_chat_title, contact_cycle_id, COALESCE(dialog_module, 'default'), stage, status, message_count, stopped_reason
            FROM ai_dialogs WHERE id = ?""",
         (dialog_id,),
     )
@@ -331,6 +343,7 @@ def _upsert_dialog(
     source_chat_id: Optional[int] = None,
     source_chat_title: Optional[str] = None,
     contact_cycle_id: Optional[int] = None,
+    dialog_module: str = DEFAULT_FIRST_DM_MODULE,
 ) -> DialogRow:
     existing = _get_dialog_by_target(account_user_id, target_user_id)
     now = _now_iso()
@@ -341,7 +354,8 @@ def _upsert_dialog(
                       first_name = COALESCE(?, first_name),
                       source_chat_id = COALESCE(?, source_chat_id),
                       source_chat_title = COALESCE(?, source_chat_title),
-                      contact_cycle_id = COALESCE(?, contact_cycle_id), updated_at = ?
+                      contact_cycle_id = COALESCE(?, contact_cycle_id),
+                      dialog_module = ?, updated_at = ?
                WHERE id = ?""",
             (
                 dm_task_id,
@@ -350,6 +364,7 @@ def _upsert_dialog(
                 source_chat_id,
                 source_chat_title,
                 contact_cycle_id,
+                normalize_first_dm_module(dialog_module),
                 now,
                 existing.id,
             ),
@@ -361,9 +376,9 @@ def _upsert_dialog(
     cursor.execute(
         """INSERT INTO ai_dialogs
            (dm_task_id, account_user_id, target_user_id, username, first_name,
-            source_chat_id, source_chat_title, contact_cycle_id, stage,
+            source_chat_id, source_chat_title, contact_cycle_id, dialog_module, stage,
             status, message_count, created_at, updated_at)
-           VALUES (?,?,?,?,?,?,?,?,'new_contact','active',0,?,?)""",
+           VALUES (?,?,?,?,?,?,?,?,?,'new_contact','active',0,?,?)""",
         (
             dm_task_id,
             account_user_id,
@@ -373,6 +388,7 @@ def _upsert_dialog(
             source_chat_id,
             source_chat_title,
             contact_cycle_id,
+            normalize_first_dm_module(dialog_module),
             now,
             now,
         ),
@@ -474,6 +490,7 @@ def record_first_dm(
     source_chat_id: Optional[int] = None,
     source_chat_title: Optional[str] = None,
     contact_cycle_id: Optional[int] = None,
+    dialog_module: str = DEFAULT_FIRST_DM_MODULE,
 ) -> None:
     """Create a new AI response cycle after a real first DM was delivered.
 
@@ -500,6 +517,7 @@ def record_first_dm(
         source_chat_id=source_chat_id,
         source_chat_title=source_chat_title,
         contact_cycle_id=contact_cycle_id,
+        dialog_module=dialog_module,
     )
     _save_message(dialog.id, "outgoing", text, provider="dm_first", model="first_dm")
 
@@ -522,12 +540,14 @@ def record_first_dm(
                        source_chat_id = COALESCE(?, source_chat_id),
                        source_chat_title = COALESCE(?, source_chat_title),
                        contact_cycle_id = COALESCE(?, contact_cycle_id),
+                       dialog_module = ?,
                        last_outgoing_at = ?, updated_at = ?
                    WHERE id = ?""",
                 (
                     source_chat_id,
                     source_chat_title,
                     contact_cycle_id,
+                    normalize_first_dm_module(dialog_module),
                     _now_iso(),
                     _now_iso(),
                     dialog.id,
@@ -1170,24 +1190,36 @@ async def handle_private_incoming(
 
             history = _current_cycle_history(dialog.id)
             try:
-                plan = await generate_post_link_plan(
-                    history=history,
-                    source_chat_title=dialog.source_chat_title,
-                )
+                if normalize_first_dm_module(dialog.dialog_module) == KIRILL_VIP_MODULE:
+                    plan = build_kirill_vip_post_link_plan(
+                        history=history,
+                        source_chat_title=dialog.source_chat_title,
+                    )
+                else:
+                    plan = await generate_post_link_plan(
+                        history=history,
+                        source_chat_title=dialog.source_chat_title,
+                    )
             except Exception as exc:
                 logger.error(
                     f"[AI DM] post-link generation error for dialog={dialog.id}, "
                     f"user={sender.id}: {exc}"
                 )
-                plan = FunnelPlan(
-                    action="post_link_final",
-                    next_stage="completed",
-                    close_after=True,
-                    messages=post_link_final_messages(
-                        text, source_chat_title=dialog.source_chat_title
-                    ),
-                    model="local_post_link_fallback",
-                )
+                if normalize_first_dm_module(dialog.dialog_module) == KIRILL_VIP_MODULE:
+                    plan = build_kirill_vip_post_link_plan(
+                        history=history,
+                        source_chat_title=dialog.source_chat_title,
+                    )
+                else:
+                    plan = FunnelPlan(
+                        action="post_link_final",
+                        next_stage="completed",
+                        close_after=True,
+                        messages=post_link_final_messages(
+                            text, source_chat_title=dialog.source_chat_title
+                        ),
+                        model="local_post_link_fallback",
+                    )
             sent = await _send_maxim_plan(
                 dialog=dialog, client=client, sender=sender, plan=plan
             )
@@ -1227,24 +1259,42 @@ async def handle_private_incoming(
 
         history = _current_cycle_history(dialog.id)
         try:
-            plan = await generate_plan(
-                stage=dialog.stage,
-                history=history,
-                source_chat_title=dialog.source_chat_title,
-                followup_count=effective_followup_count,
-                max_followups=max_followups,
-            )
+            if normalize_first_dm_module(dialog.dialog_module) == KIRILL_VIP_MODULE:
+                plan = build_kirill_vip_plan(
+                    stage=dialog.stage,
+                    history=history,
+                    source_chat_title=dialog.source_chat_title,
+                    followup_count=effective_followup_count,
+                    max_followups=max_followups,
+                )
+            else:
+                plan = await generate_plan(
+                    stage=dialog.stage,
+                    history=history,
+                    source_chat_title=dialog.source_chat_title,
+                    followup_count=effective_followup_count,
+                    max_followups=max_followups,
+                )
         except Exception as exc:
             logger.error(
                 f"[AI DM] Maxim generation error for dialog={dialog.id}, user={sender.id}: {exc}"
             )
-            plan = build_local_plan(
-                stage=dialog.stage,
-                history=history,
-                source_chat_title=dialog.source_chat_title,
-                followup_count=effective_followup_count,
-                max_followups=max_followups,
-            )
+            if normalize_first_dm_module(dialog.dialog_module) == KIRILL_VIP_MODULE:
+                plan = build_kirill_vip_plan(
+                    stage=dialog.stage,
+                    history=history,
+                    source_chat_title=dialog.source_chat_title,
+                    followup_count=effective_followup_count,
+                    max_followups=max_followups,
+                )
+            else:
+                plan = build_local_plan(
+                    stage=dialog.stage,
+                    history=history,
+                    source_chat_title=dialog.source_chat_title,
+                    followup_count=effective_followup_count,
+                    max_followups=max_followups,
+                )
 
         remaining = max(1, max_followups - followup_count)
         plan = _fit_plan_to_remaining(plan, remaining)

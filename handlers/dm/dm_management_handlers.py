@@ -10,6 +10,10 @@ from telethon import Button
 
 from config import ADMIN_ID_LIST, New_Message, Query, bot, callback_message, callback_query, conn
 from services.account_profiles import format_account_label
+from services.first_dm_modules import (
+    first_dm_module_label,
+    normalize_first_dm_module,
+)
 from services.admin_state import is_command_event
 from services.dm_task_queue import (
     MAX_DELAY_SECONDS,
@@ -47,7 +51,7 @@ def _task_row(task_id: int) -> Optional[dict[str, Any]]:
     row = conn.execute(
         """
         SELECT id, user_id, post_text, photo_url, is_active, created_at,
-               delay_min, delay_max,
+               delay_min, delay_max, COALESCE(first_dm_module, 'default'),
                (SELECT COUNT(*) FROM dm_watched_chats WHERE dm_task_id=dm_tasks.id),
                (SELECT COUNT(*) FROM dm_sent_log WHERE dm_task_id=dm_tasks.id AND status='sent'),
                (SELECT COUNT(*) FROM dm_sent_log WHERE dm_task_id=dm_tasks.id AND status='privacy'),
@@ -60,7 +64,7 @@ def _task_row(task_id: int) -> Optional[dict[str, Any]]:
         return None
     keys = (
         "id", "user_id", "post_text", "photo_url", "is_active", "created_at",
-        "delay_min", "delay_max", "chat_count", "sent_count", "privacy_count",
+        "delay_min", "delay_max", "first_dm_module", "chat_count", "sent_count", "privacy_count",
         "error_count",
     )
     return dict(zip(keys, row))
@@ -197,6 +201,7 @@ async def _show_task(event, task_id: int) -> None:
         f"👤 Аккаунт: <b>{account}</b>\n"
         f"📍 Статус: <b>{status}</b>\n"
         f"💬 Отслеживаемых чатов: <b>{int(task['chat_count'])}</b>\n"
+        f"🧩 Модуль первого DM: <b>{html.escape(first_dm_module_label(task.get('first_dm_module')))}</b>\n"
         f"⏱ Задержка после сообщения: "
         f"<b>{int(task['delay_min'] or 0)}–{int(task['delay_max'] or 0)} сек</b>\n"
         f"🧭 Пауза аккаунта между первыми DM: "
@@ -210,6 +215,7 @@ async def _show_task(event, task_id: int) -> None:
         "Повторный контакт защищён активным диалогом, завершённым контактом и opt-out."
     )
     buttons = [
+        [Button.inline("💬 Изменить модуль первого DM", f"dm_module_manage_{task_id}".encode())],
         [Button.inline("⏱ Изменить задержку задачи", f"dm_delay_{task_id}".encode())],
         [Button.inline("🧭 Пауза аккаунта между DM", f"dm_pacing_{task_id}".encode())],
         [Button.inline("💬 Управление чатами", f"dm_chats_manage_{task_id}".encode())],
@@ -251,6 +257,58 @@ async def dm_task_card(event: callback_query) -> None:
     await _show_task(event, task_id)
     await event.answer()
 
+
+
+@bot.on(Query(data=lambda d: d.decode(errors="ignore").startswith("dm_module_manage_") and d.decode(errors="ignore")[17:].isdigit()))
+async def dm_module_manage(event: callback_query) -> None:
+    if event.sender_id not in ADMIN_ID_LIST:
+        await event.answer("Недоступно", alert=True)
+        return
+    task_id = _parse_suffix(event.data, "dm_module_manage_")
+    task = _task_row(task_id or -1)
+    if task_id is None or not task:
+        await event.answer("Задача не найдена", alert=True)
+        return
+    current = first_dm_module_label(task.get("first_dm_module"))
+    await render_menu(
+        event,
+        f"💬 <b>Модуль первого DM задачи #{task_id}</b>\n\n"
+        f"Сейчас: <b>{html.escape(current)}</b>\n\n"
+        "Изменение применяется только к будущим первым DM, включая людей, "
+        "которые уже ожидают отправки в очереди. Уже начатые диалоги не переключаются.",
+        buttons=[
+            [Button.inline("🧩 Текущие фразы", f"dm_module_set_{task_id}_default".encode())],
+            [Button.inline("👑 VIP Кирилла", f"dm_module_set_{task_id}_kirill_vip".encode())],
+            [Button.inline("◀️ Назад", f"dm_task_{task_id}".encode())],
+        ],
+        parse_mode="html",
+    )
+    await event.answer()
+
+
+@bot.on(Query(data=lambda d: d.decode(errors="ignore").startswith("dm_module_set_")))
+async def dm_module_set(event: callback_query) -> None:
+    if event.sender_id not in ADMIN_ID_LIST:
+        await event.answer("Недоступно", alert=True)
+        return
+    raw = event.data.decode(errors="ignore")[len("dm_module_set_"):]
+    try:
+        task_raw, module_raw = raw.split("_", 1)
+        task_id = int(task_raw)
+    except (TypeError, ValueError):
+        await event.answer("Некорректные данные", alert=True)
+        return
+    if not _task_row(task_id):
+        await event.answer("Задача не найдена", alert=True)
+        return
+    module = normalize_first_dm_module(module_raw)
+    with conn:
+        conn.execute(
+            "UPDATE dm_tasks SET first_dm_module=? WHERE id=?",
+            (module, task_id),
+        )
+    await event.answer(f"Установлен модуль: {first_dm_module_label(module)}")
+    await _show_task(event, task_id)
 
 
 @bot.on(Query(data=lambda d: d.decode(errors="ignore").startswith("dm_pacing_") and d.decode(errors="ignore")[10:].isdigit()))
