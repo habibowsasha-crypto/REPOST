@@ -1,0 +1,35 @@
+TgBlaster v1.0.22b5 — verification report
+
+Base archive:
+TgBlaster-dm-ai-dialog-v1_0_22b4_kirill_vip_module.zip
+
+Feature:
+- admin command /dm_queue TASK_ID;
+- aliases /queue TASK_ID, очередь TASK_ID, кто в очереди TASK_ID;
+- command without ID opens task picker;
+- direct queue button for every task in DM list;
+- paginated queue identities with full Telegram ID and @username/name;
+- source chat, queue status and readiness are shown;
+- read-only view: no queue mutation.
+
+Checks:
+- compileall: PASS
+- pyflakes for changed Python files: PASS
+- pytest: 118 passed + 38 subtests passed
+- unittest discover: 118 passed
+- dedicated queue identity tests: PASS
+- full numeric Telegram ID is never shortened: PASS
+- missing username is marked explicitly: PASS
+- command patterns and aliases: PASS
+- queue status/eligible_at unchanged after view: PASS
+- services/first_message.py unchanged SHA-256:
+  a34f2613c338b1f89284335d2462cc1ed1b1e43b3063dcdf4a511a3b7f0f32aa
+
+Security/scope:
+- admin-only;
+- no new Railway Variables;
+- no database/session/log/cache/secret files included;
+- first-DM templates, recipient rules, dispatcher, completed and opt-out unchanged.
+
+Offline limitation:
+Real Telegram, OpenAI and Railway calls were not executed during verification.

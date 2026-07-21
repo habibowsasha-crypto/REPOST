@@ -21,7 +21,6 @@ from services.dm_task_queue import (
     clear_task_pending,
     count_clearable_pending,
     count_pending,
-    format_pending_target,
     get_account_dispatch_state,
     get_global_first_dm_state,
     list_pending_page,
@@ -45,6 +44,8 @@ from .dm_handlers import (
 
 dm_manage_state: dict[int, dict[str, Any]] = {}
 _QUEUE_PAGE_SIZE = 8
+_DM_QUEUE_COMMAND_PATTERN = r"^/(?:dm_queue|queue)(?:@\w+)?(?:\s+#?(\d+))?\s*$"
+_DM_QUEUE_RU_PATTERN = r"(?i)^(?:очередь|кто в очереди)(?:\s+(?:задача\s*)?#?(\d+))?\s*$"
 
 
 def _task_row(task_id: int) -> Optional[dict[str, Any]]:
@@ -106,6 +107,148 @@ def _format_duration(seconds: int) -> str:
         return f"{hours} ч" + (f" {minutes} мин" if minutes else "")
     days, hours = divmod(hours, 24)
     return f"{days} дн" + (f" {hours} ч" if hours else "")
+
+
+def _format_queue_target_html(row: dict[str, Any]) -> str:
+    """Render username/name and always preserve the complete numeric Telegram ID."""
+    username = " ".join(str(row.get("target_username") or "").split()).strip().lstrip("@")
+    first_name = " ".join(str(row.get("target_first_name") or "").split()).strip()
+    last_name = " ".join(str(row.get("target_last_name") or "").split()).strip()
+    full_name = " ".join(part for part in (first_name, last_name) if part).strip()
+    user_id = int(row["target_user_id"])
+
+    if username:
+        identity = f"👤 <b>@{html.escape(username)}</b>"
+        if full_name:
+            identity += f" — {html.escape(_short(full_name, 48))}"
+    else:
+        identity = (
+            f"👤 <b>{html.escape(_short(full_name or 'Без имени', 48))}</b> "
+            "<i>(без @username)</i>"
+        )
+    return f"{identity}\n🆔 <code>{user_id}</code>"
+
+
+async def _show_queue_task_picker(event) -> None:
+    rows = conn.execute(
+        """
+        SELECT id, user_id, is_active
+          FROM dm_tasks
+         ORDER BY id DESC
+        """
+    ).fetchall()
+    if not rows:
+        await render_menu(
+            event,
+            "📭 DM-задач пока нет.",
+            buttons=[[Button.inline("🏠 Главное меню", b"menu_home")]],
+        )
+        return
+
+    lines = [
+        "👥 <b>Кто находится в очереди</b>",
+        "",
+        "Выберите DM-задачу или используйте команду:",
+        "<code>/dm_queue 25</code>",
+    ]
+    buttons = []
+    for task_id, account_user_id, is_active in rows:
+        count = count_pending(int(task_id))
+        account = format_account_label(
+            int(account_user_id), include_id=True, max_length=42
+        )
+        icon = "🟢" if bool(is_active) else "🔴"
+        buttons.append(
+            [
+                Button.inline(
+                    f"👥 {icon} #{int(task_id)} • {account} • {count}",
+                    f"dm_queue_{int(task_id)}_0".encode(),
+                )
+            ]
+        )
+    buttons.append([Button.inline("📋 К DM-задачам", b"menu_dm_list")])
+    await render_menu(event, "\n".join(lines), buttons=buttons, parse_mode="html")
+
+
+async def _show_queue_page(event, task_id: int, page: int = 0) -> bool:
+    task = _task_row(task_id)
+    if not task:
+        await render_menu(
+            event,
+            f"⚠ DM-задача #{int(task_id)} не найдена.",
+            buttons=[[Button.inline("👥 Выбрать задачу", b"dm_queue_pick")]],
+        )
+        return False
+
+    total = count_pending(task_id)
+    pages = max(1, math.ceil(total / _QUEUE_PAGE_SIZE))
+    page = max(0, min(int(page), pages - 1))
+    rows = list_pending_page(
+        task_id,
+        offset=page * _QUEUE_PAGE_SIZE,
+        limit=_QUEUE_PAGE_SIZE,
+    )
+    account = html.escape(
+        format_account_label(int(task["user_id"]), include_id=True, max_length=60)
+    )
+    lines = [
+        f"👥 <b>Очередь DM-задачи #{task_id}</b>",
+        f"👤 Аккаунт: <b>{account}</b>",
+        f"Всего записей: <b>{total}</b>",
+    ]
+    now = dt.datetime.now(dt.timezone.utc)
+    status_names = {
+        "pending": "ожидает",
+        "claimed": "подготовка",
+        "sending": "отправляется",
+        "retry_wait": "повтор после Telegram-паузы",
+        "unresolved_peer": "ожидает восстановления Telegram-получателя",
+        "uncertain_delivery": "неизвестен результат отправки — без автоповтора",
+    }
+    for index, row in enumerate(rows, start=page * _QUEUE_PAGE_SIZE + 1):
+        target = _format_queue_target_html(row)
+        source = html.escape(
+            _short(
+                row.get("source_chat_title")
+                or row.get("source_chat_id")
+                or "Источник не определён",
+                45,
+            )
+        )
+        due_at = parse_iso(row.get("eligible_at"))
+        if due_at is None or due_at <= now:
+            due_text = "готов"
+        else:
+            due_text = f"через {_format_duration(math.ceil((due_at - now).total_seconds()))}"
+        status = status_names.get(str(row.get("status")), str(row.get("status")))
+        lines.append(
+            f"\n<b>{index}.</b>\n{target}\n"
+            f"Источник: {source}\n"
+            f"Статус: <b>{html.escape(status)}</b> | {due_text}"
+        )
+    if not rows:
+        lines.append("\nОчередь пуста.")
+
+    buttons = []
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(Button.inline("⬅️", f"dm_queue_{task_id}_{page - 1}".encode()))
+        nav.append(Button.inline(f"{page + 1}/{pages}", f"dm_queue_{task_id}_{page}".encode()))
+        if page + 1 < pages:
+            nav.append(Button.inline("➡️", f"dm_queue_{task_id}_{page + 1}".encode()))
+        buttons.append(nav)
+    if total:
+        buttons.append([Button.inline("🧹 Очистить очередь", f"dm_queue_clear_ask_{task_id}".encode())])
+    buttons.extend(
+        [
+            [Button.inline("🔄 Обновить", f"dm_queue_{task_id}_{page}".encode())],
+            [Button.inline("👥 Другая задача", b"dm_queue_pick")],
+            [Button.inline("◀️ К задаче", f"dm_task_{task_id}".encode())],
+        ]
+    )
+    await render_menu(event, "\n".join(lines), buttons=buttons, parse_mode="html")
+    return True
 
 
 def _watched_chat_rows(task_id: int) -> list[tuple[int, str]]:
@@ -877,78 +1020,50 @@ def _queue_parse(data: bytes) -> Optional[tuple[int, int]]:
         return None
 
 
-@bot.on(Query(data=lambda d: d.decode(errors="ignore").startswith("dm_queue_") and not d.decode(errors="ignore").startswith("dm_queue_clear_")))
+@bot.on(Query(data=b"dm_queue_pick"))
+async def dm_queue_pick(event: callback_query) -> None:
+    if event.sender_id not in ADMIN_ID_LIST:
+        await event.answer("Недоступно", alert=True)
+        return
+    await _show_queue_task_picker(event)
+    await event.answer()
+
+
+@bot.on(New_Message(pattern=_DM_QUEUE_COMMAND_PATTERN))
+async def cmd_dm_queue(event: callback_message) -> None:
+    if event.sender_id not in ADMIN_ID_LIST:
+        return
+    match = getattr(event, "pattern_match", None)
+    task_raw = match.group(1) if match else None
+    if not task_raw:
+        await _show_queue_task_picker(event)
+        return
+    await _show_queue_page(event, int(task_raw), 0)
+
+
+@bot.on(New_Message(pattern=_DM_QUEUE_RU_PATTERN))
+async def cmd_dm_queue_ru(event: callback_message) -> None:
+    if event.sender_id not in ADMIN_ID_LIST:
+        return
+    match = getattr(event, "pattern_match", None)
+    task_raw = match.group(1) if match else None
+    if not task_raw:
+        await _show_queue_task_picker(event)
+        return
+    await _show_queue_page(event, int(task_raw), 0)
+
+
+@bot.on(Query(data=lambda d: re.fullmatch(rb"dm_queue_\d+_\d+", d) is not None))
 async def dm_queue_view(event: callback_query) -> None:
     if event.sender_id not in ADMIN_ID_LIST:
+        await event.answer("Недоступно", alert=True)
         return
     parsed = _queue_parse(event.data)
     if parsed is None:
         await event.answer("Некорректные данные", alert=True)
         return
     task_id, page = parsed
-    if not _task_row(task_id):
-        await event.answer("Задача не найдена", alert=True)
-        return
-    total = count_pending(task_id)
-    pages = max(1, math.ceil(total / _QUEUE_PAGE_SIZE))
-    page = max(0, min(page, pages - 1))
-    rows = list_pending_page(
-        task_id,
-        offset=page * _QUEUE_PAGE_SIZE,
-        limit=_QUEUE_PAGE_SIZE,
-    )
-    lines = [
-        f"📋 <b>Очередь DM-задачи #{task_id}</b>",
-        f"\nВсего ожидают: <b>{total}</b>",
-    ]
-    now = dt.datetime.now(dt.timezone.utc)
-    status_names = {
-        "pending": "ожидает",
-        "claimed": "подготовка",
-        "sending": "отправляется",
-        "retry_wait": "повтор после Telegram-паузы",
-        "unresolved_peer": "ожидает восстановления Telegram-получателя",
-        "uncertain_delivery": "неизвестен результат отправки — без автоповтора",
-    }
-    for index, row in enumerate(rows, start=page * _QUEUE_PAGE_SIZE + 1):
-        target = html.escape(_short(format_pending_target(row), 48))
-        source = html.escape(
-            _short(
-                row.get("source_chat_title")
-                or row.get("source_chat_id")
-                or "Источник не определён",
-                45,
-            )
-        )
-        due_at = parse_iso(row.get("eligible_at"))
-        if due_at is None or due_at <= now:
-            due_text = "готов"
-        else:
-            due_text = f"через {_format_duration(math.ceil((due_at - now).total_seconds()))}"
-        status = status_names.get(str(row.get("status")), str(row.get("status")))
-        lines.append(
-            f"\n<b>{index}.</b> {target}\n"
-            f"Источник: {source}\n"
-            f"Статус: <b>{html.escape(status)}</b> | {due_text}"
-        )
-    buttons = []
-    if pages > 1:
-        nav = []
-        if page > 0:
-            nav.append(Button.inline("⬅️", f"dm_queue_{task_id}_{page - 1}".encode()))
-        nav.append(Button.inline(f"{page + 1}/{pages}", f"dm_queue_{task_id}_{page}".encode()))
-        if page + 1 < pages:
-            nav.append(Button.inline("➡️", f"dm_queue_{task_id}_{page + 1}".encode()))
-        buttons.append(nav)
-    if total:
-        buttons.append([Button.inline("🧹 Очистить очередь", f"dm_queue_clear_ask_{task_id}".encode())])
-    buttons.extend(
-        [
-            [Button.inline("🔄 Обновить", f"dm_queue_{task_id}_{page}".encode())],
-            [Button.inline("◀️ К задаче", f"dm_task_{task_id}".encode())],
-        ]
-    )
-    await render_menu(event, "\n".join(lines), buttons=buttons, parse_mode="html")
+    await _show_queue_page(event, task_id, page)
     await event.answer()
 
 

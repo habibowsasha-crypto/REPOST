@@ -1321,6 +1321,7 @@ async def cmd_dm_list(event: callback_message) -> None:
             "Новые первые сообщения не отправляются. Пользователи продолжают добавляться в очередь."
         )
     lines.append(f"🧹 Неактуальных задач: **{inactive_count}**")
+    lines.append("👥 Команда очереди: `/dm_queue ID` — показать @username и Telegram ID")
     buttons = []
     for task_id, account_id, active, created, low, high, first_dm_module, chats, sent, privacy in rows:
         running_task = dm_monitor_tasks.get(int(task_id))
@@ -1353,6 +1354,14 @@ async def cmd_dm_list(event: callback_message) -> None:
                 Button.inline(
                     f"⚙️ #{task_id} • {account_label} • {status_icon}",
                     f"dm_task_{task_id}".encode(),
+                )
+            ]
+        )
+        buttons.append(
+            [
+                Button.inline(
+                    f"👥 Очередь #{task_id} ({queue_size})",
+                    f"dm_queue_{task_id}_0".encode(),
                 )
             ]
         )
