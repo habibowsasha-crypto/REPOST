@@ -114,16 +114,22 @@ rows = conn.execute('SELECT id,status,dm_task_id,source_chat_id FROM dm_pending_
 sources = conn.execute('SELECT dm_task_id,source_chat_id FROM dm_pending_sources WHERE pending_id=1 ORDER BY dm_task_id,source_chat_id').fetchall()
 source_columns = conn.execute('PRAGMA table_info(dm_pending_sources)').fetchall()
 source_pk = [row[1] for row in sorted(source_columns, key=lambda row: row[5] or 0) if row[5]]
+source_names = {row[1] for row in source_columns}
+queue_names = {row[1] for row in conn.execute('PRAGMA table_info(dm_pending_queue)').fetchall()}
 schema = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='dm_pending_queue'").fetchone()[0]
 assert rows == [(1,'pending',2,22),(2,'cancelled',2,22)], rows
 assert sources == [(1,11),(2,22)], sources
 assert source_pk == ['pending_id','dm_task_id','source_chat_id'], source_pk
+assert {'source_chat_username','source_message_id'} <= source_names, source_names
+assert {'source_chat_username','source_message_id'} <= queue_names, queue_names
 assert 'UNIQUE(dm_task_id,target_user_id)' not in ''.join(schema.split()), schema
 conn.execute("UPDATE dm_pending_queue SET status='cancelled' WHERE id=1")
 conn.commit()
 from services.dm_task_queue import enqueue_pending
-created, pending_id = enqueue_pending(dm_task_id=1,account_user_id=100,target_user_id=500,target_access_hash=1,target_username='u',target_first_name=None,target_last_name=None,source_chat_id=33,source_chat_title='C',delay_min=0,delay_max=0)
+created, pending_id = enqueue_pending(dm_task_id=1,account_user_id=100,target_user_id=500,target_access_hash=1,target_username='u',target_first_name=None,target_last_name=None,source_chat_id=33,source_chat_title='C',source_chat_username='public_c',source_message_id=777,delay_min=0,delay_max=0)
 assert created and pending_id == 3, (created, pending_id)
+metadata = conn.execute('SELECT source_chat_username,source_message_id FROM dm_pending_queue WHERE id=3').fetchone()
+assert metadata == ('public_c',777), metadata
 """
             result = subprocess.run(
                 [sys.executable, "-c", code],

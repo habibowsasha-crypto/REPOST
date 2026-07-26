@@ -352,6 +352,8 @@ def enqueue_pending(
     source_chat_title: Optional[str],
     delay_min: int,
     delay_max: int,
+    source_chat_username: Optional[str] = None,
+    source_message_id: Optional[int] = None,
 ) -> tuple[bool, int]:
     """Create one account-wide pending contact and record its source.
 
@@ -389,13 +391,16 @@ def enqueue_pending(
                 conn.execute(
                     """
                     UPDATE dm_pending_queue
-                       SET dm_task_id=?, source_chat_id=?, source_chat_title=?, updated_at=?
+                       SET dm_task_id=?, source_chat_id=?, source_chat_title=?,
+                           source_chat_username=?, source_message_id=?, updated_at=?
                      WHERE id=?
                     """,
                     (
                         int(dm_task_id),
                         int(source_chat_id) if source_chat_id is not None else None,
                         clean_text(source_chat_title),
+                        clean_text(source_chat_username),
+                        int(source_message_id) if source_message_id is not None else None,
                         now_iso,
                         pending_id,
                     ),
@@ -430,6 +435,8 @@ def enqueue_pending(
                 clean_text(target_last_name),
                 int(source_chat_id) if source_chat_id is not None else None,
                 clean_text(source_chat_title),
+                clean_text(source_chat_username),
+                int(source_message_id) if source_message_id is not None else None,
                 now_iso,
                 due_iso,
                 now_iso,
@@ -441,9 +448,10 @@ def enqueue_pending(
                         dm_task_id, account_user_id, target_user_id,
                         target_access_hash, target_username, target_first_name,
                         target_last_name, source_chat_id, source_chat_title,
+                        source_chat_username, source_message_id,
                         enqueued_at, eligible_at, status, retry_count,
                         resolve_attempts, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, 0, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, 0, ?)
                     """,
                     values,
                 )
@@ -469,10 +477,12 @@ def enqueue_pending(
                 """
                 INSERT INTO dm_pending_sources (
                     pending_id, dm_task_id, source_chat_id, source_chat_title,
-                    first_seen_at, last_seen_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    source_chat_username, source_message_id, first_seen_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(pending_id, dm_task_id, source_chat_id) DO UPDATE SET
                     source_chat_title=COALESCE(excluded.source_chat_title, dm_pending_sources.source_chat_title),
+                    source_chat_username=COALESCE(excluded.source_chat_username, dm_pending_sources.source_chat_username),
+                    source_message_id=COALESCE(excluded.source_message_id, dm_pending_sources.source_message_id),
                     last_seen_at=excluded.last_seen_at
                 """,
                 (
@@ -480,6 +490,8 @@ def enqueue_pending(
                     int(dm_task_id),
                     int(source_chat_id),
                     clean_text(source_chat_title),
+                    clean_text(source_chat_username),
+                    int(source_message_id) if source_message_id is not None else None,
                     now_iso,
                     now_iso,
                 ),
@@ -497,6 +509,7 @@ def get_due_pending(account_user_id: int) -> Optional[dict[str, Any]]:
         SELECT q.id, q.dm_task_id, q.account_user_id, q.target_user_id,
                q.target_access_hash, q.target_username, q.target_first_name,
                q.target_last_name, q.source_chat_id, q.source_chat_title,
+               q.source_chat_username, q.source_message_id,
                q.enqueued_at, q.eligible_at, q.status, q.retry_count,
                q.resolve_attempts
           FROM dm_pending_queue AS q
@@ -523,6 +536,8 @@ def get_due_pending(account_user_id: int) -> Optional[dict[str, Any]]:
         "target_last_name",
         "source_chat_id",
         "source_chat_title",
+        "source_chat_username",
+        "source_message_id",
         "enqueued_at",
         "eligible_at",
         "status",
@@ -698,27 +713,47 @@ def mark_uncertain(row_id: int, error: str) -> None:
         )
 
 
-def recover_stale_queue() -> dict[str, int]:
-    cutoff = iso(utc_now() - dt.timedelta(seconds=STALE_CLAIM_SECONDS))
+def recover_stale_queue(*, process_start: bool = False) -> dict[str, int]:
+    """Recover dispatcher rows without risking duplicate first DMs.
+
+    At process start there cannot be a live sender from this process. Every
+    ``claimed`` row is therefore safe to return immediately. A ``sending`` row
+    is intentionally moved to ``uncertain_delivery`` because Telegram may have
+    accepted the request immediately before the process stopped. During normal
+    runtime only rows older than the stale threshold are recovered.
+    """
     now_iso = iso(utc_now())
+    cutoff = iso(utc_now() - dt.timedelta(seconds=STALE_CLAIM_SECONDS))
+    claimed_where = "status='claimed'"
+    sending_where = "status='sending'"
+    params: tuple[Any, ...] = (now_iso,)
+    sending_params: tuple[Any, ...] = (now_iso,)
+    claimed_reason = "process_restarted_before_send" if process_start else "stale_claim_recovered"
+    sending_reason = "process_restarted_during_send" if process_start else "stale_send_marked_uncertain"
+    if not process_start:
+        claimed_where += " AND COALESCE(claimed_at, updated_at)<?"
+        sending_where += " AND COALESCE(send_started_at, claimed_at, updated_at)<?"
+        params += (cutoff,)
+        sending_params += (cutoff,)
+
     with _db_lock, conn:
         claimed = conn.execute(
-            """
+            f"""
             UPDATE dm_pending_queue
                SET status='pending', claim_token=NULL, claimed_at=NULL,
-                   last_error='stale_claim_recovered', updated_at=?
-             WHERE status='claimed' AND COALESCE(claimed_at, updated_at)<?
+                   send_started_at=NULL, last_error=?, updated_at=?
+             WHERE {claimed_where}
             """,
-            (now_iso, cutoff),
+            (claimed_reason, *params),
         ).rowcount
         sending = conn.execute(
-            """
+            f"""
             UPDATE dm_pending_queue
-               SET status='uncertain_delivery',
-                   last_error='process_restarted_during_send', updated_at=?
-             WHERE status='sending' AND COALESCE(send_started_at, claimed_at, updated_at)<?
+               SET status='uncertain_delivery', claim_token=NULL,
+                   last_error=?, updated_at=?
+             WHERE {sending_where}
             """,
-            (now_iso, cutoff),
+            (sending_reason, *sending_params),
         ).rowcount
     return {"claimed_recovered": int(claimed or 0), "sending_uncertain": int(sending or 0)}
 
@@ -786,12 +821,32 @@ def list_pending_page(dm_task_id: int, *, offset: int, limit: int) -> list[dict[
     rows = conn.execute(
         f"""
         SELECT id, dm_task_id, account_user_id, target_user_id,
-               target_username, target_first_name, target_last_name,
-               source_chat_id, source_chat_title, enqueued_at, eligible_at,
-               status, retry_count, resolve_attempts, last_error
-          FROM dm_pending_queue
-         WHERE dm_task_id=? AND status IN ({_active_status_sql()})
-         ORDER BY eligible_at, id
+               q.target_username, q.target_first_name, q.target_last_name,
+               COALESCE((
+                   SELECT s.source_chat_id FROM dm_pending_sources AS s
+                    WHERE s.pending_id=q.id AND s.dm_task_id=q.dm_task_id
+                    ORDER BY s.last_seen_at DESC LIMIT 1
+               ), q.source_chat_id) AS source_chat_id,
+               COALESCE((
+                   SELECT s.source_chat_title FROM dm_pending_sources AS s
+                    WHERE s.pending_id=q.id AND s.dm_task_id=q.dm_task_id
+                    ORDER BY s.last_seen_at DESC LIMIT 1
+               ), q.source_chat_title) AS source_chat_title,
+               COALESCE((
+                   SELECT s.source_chat_username FROM dm_pending_sources AS s
+                    WHERE s.pending_id=q.id AND s.dm_task_id=q.dm_task_id
+                    ORDER BY s.last_seen_at DESC LIMIT 1
+               ), q.source_chat_username) AS source_chat_username,
+               COALESCE((
+                   SELECT s.source_message_id FROM dm_pending_sources AS s
+                    WHERE s.pending_id=q.id AND s.dm_task_id=q.dm_task_id
+                    ORDER BY s.last_seen_at DESC LIMIT 1
+               ), q.source_message_id) AS source_message_id,
+               q.enqueued_at, q.eligible_at, q.status, q.retry_count,
+               q.resolve_attempts, q.last_error
+          FROM dm_pending_queue AS q
+         WHERE q.dm_task_id=? AND q.status IN ({_active_status_sql()})
+         ORDER BY q.eligible_at, q.id
          LIMIT ? OFFSET ?
         """,
         (int(dm_task_id), *NONTERMINAL_STATUSES, safe_limit, safe_offset),
@@ -806,6 +861,8 @@ def list_pending_page(dm_task_id: int, *, offset: int, limit: int) -> list[dict[
         "target_last_name",
         "source_chat_id",
         "source_chat_title",
+        "source_chat_username",
+        "source_message_id",
         "enqueued_at",
         "eligible_at",
         "status",
@@ -814,6 +871,83 @@ def list_pending_page(dm_task_id: int, *, offset: int, limit: int) -> list[dict[
         "last_error",
     )
     return [dict(zip(keys, row)) for row in rows]
+
+
+def list_pending_ids(dm_task_id: int) -> list[int]:
+    """Return a stable ordered snapshot of active queue row ids for admin browsing."""
+    rows = conn.execute(
+        f"""
+        SELECT id
+          FROM dm_pending_queue
+         WHERE dm_task_id=? AND status IN ({_active_status_sql()})
+         ORDER BY eligible_at, id
+        """,
+        (int(dm_task_id), *NONTERMINAL_STATUSES),
+    ).fetchall()
+    return [int(row[0]) for row in rows]
+
+
+def list_queue_rows_by_ids(dm_task_id: int, pending_ids: list[int]) -> list[dict[str, Any]]:
+    """Read queue rows by snapshot ids and preserve the snapshot order."""
+    normalized = []
+    seen = set()
+    for raw in pending_ids:
+        try:
+            pending_id = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if pending_id <= 0 or pending_id in seen:
+            continue
+        seen.add(pending_id)
+        normalized.append(pending_id)
+    if not normalized:
+        return []
+
+    placeholders = ",".join("?" for _ in normalized)
+    rows = conn.execute(
+        f"""
+        SELECT id, dm_task_id, account_user_id, target_user_id,
+               q.target_username, q.target_first_name, q.target_last_name,
+               COALESCE((
+                   SELECT s.source_chat_id FROM dm_pending_sources AS s
+                    WHERE s.pending_id=q.id AND s.dm_task_id=q.dm_task_id
+                    ORDER BY s.last_seen_at DESC LIMIT 1
+               ), q.source_chat_id) AS source_chat_id,
+               COALESCE((
+                   SELECT s.source_chat_title FROM dm_pending_sources AS s
+                    WHERE s.pending_id=q.id AND s.dm_task_id=q.dm_task_id
+                    ORDER BY s.last_seen_at DESC LIMIT 1
+               ), q.source_chat_title) AS source_chat_title,
+               COALESCE((
+                   SELECT s.source_chat_username FROM dm_pending_sources AS s
+                    WHERE s.pending_id=q.id AND s.dm_task_id=q.dm_task_id
+                    ORDER BY s.last_seen_at DESC LIMIT 1
+               ), q.source_chat_username) AS source_chat_username,
+               COALESCE((
+                   SELECT s.source_message_id FROM dm_pending_sources AS s
+                    WHERE s.pending_id=q.id AND s.dm_task_id=q.dm_task_id
+                    ORDER BY s.last_seen_at DESC LIMIT 1
+               ), q.source_message_id) AS source_message_id,
+               q.enqueued_at, q.eligible_at, q.status, q.retry_count,
+               q.resolve_attempts, q.last_error
+          FROM dm_pending_queue AS q
+         WHERE q.dm_task_id=? AND q.id IN ({placeholders})
+        """,
+        (int(dm_task_id), *normalized),
+    ).fetchall()
+    keys = (
+        "id", "dm_task_id", "account_user_id", "target_user_id",
+        "target_username", "target_first_name", "target_last_name",
+        "source_chat_id", "source_chat_title", "source_chat_username",
+        "source_message_id", "enqueued_at", "eligible_at", "status",
+        "retry_count", "resolve_attempts", "last_error",
+    )
+    mapped = {int(row[0]): dict(zip(keys, row)) for row in rows}
+    return [mapped[pending_id] for pending_id in normalized if pending_id in mapped]
+
+
+def is_active_queue_status(status: Any) -> bool:
+    return str(status or "") in NONTERMINAL_STATUSES
 
 
 def clear_task_pending(dm_task_id: int, reason: str = "admin_clear") -> int:
@@ -1104,11 +1238,21 @@ def format_pending_target(row: dict[str, Any]) -> str:
 
 
 def queue_status_counts(dm_task_id: int) -> dict[str, int]:
+    """Return exact non-terminal queue counts grouped by status."""
+    counts = {status: 0 for status in NONTERMINAL_STATUSES}
     rows = conn.execute(
-        """
-        SELECT status, COUNT(*) FROM dm_pending_queue
-         WHERE dm_task_id=? GROUP BY status
+        f"""
+        SELECT status, COUNT(*)
+          FROM dm_pending_queue
+         WHERE dm_task_id=? AND status IN ({_active_status_sql()})
+         GROUP BY status
         """,
-        (int(dm_task_id),),
+        (int(dm_task_id), *NONTERMINAL_STATUSES),
     ).fetchall()
-    return {str(status): int(count) for status, count in rows}
+    for status, amount in rows:
+        if str(status) in counts:
+            counts[str(status)] = int(amount or 0)
+    counts["sendable"] = sum(counts[status] for status in SENDABLE_STATUSES)
+    counts["processing"] = counts["claimed"] + counts["sending"]
+    counts["total"] = sum(counts[status] for status in NONTERMINAL_STATUSES)
+    return counts

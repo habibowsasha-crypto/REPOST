@@ -5,14 +5,10 @@ import os
 import sys
 
 from loguru import logger
-from telethon import TelegramClient
-from telethon.sessions import StringSession
 
 # Importing handlers registers Telethon callbacks on the shared bot client.
 from handlers import *  # noqa: F401,F403
 from config import (
-    API_HASH,
-    API_ID,
     BOT_TOKEN,
     DB_PATH,
     bot,
@@ -23,10 +19,12 @@ from handlers.dm.dm_handlers import (
     dm_account_dispatcher_tasks,
     dm_monitor_tasks,
     restore_dm_tasks,
+    set_dm_runtime_shutting_down,
 )
-from services.account_profiles import save_account_profile
+from services.account_profiles import refresh_stale_account_profiles
 from services.ai_dialog_service import create_ai_tables
 from services.dm_contact_analytics import create_contact_tables, expire_stale_dialogs
+from services.dm_task_queue import recover_stale_queue
 from utils.database import create_table, delete_table
 from utils.database.database import create_dm_tables
 
@@ -68,23 +66,18 @@ async def validate_saved_sessions() -> None:
         cursor.close()
 
     logger.info(f"Проверяю {len(sessions)} сохранённых сессий")
-    for user_id, session_string in sessions:
-        client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
-        try:
-            await client.connect()
-            if await client.is_user_authorized():
-                me = await client.get_me()
-                save_account_profile(me)
-                logger.info(f"Сессия аккаунта {user_id} авторизована")
-            else:
-                logger.warning(f"Сессия аккаунта {user_id} больше не авторизована")
-        except Exception as exc:
-            logger.error(f"Ошибка проверки сессии аккаунта {user_id}: {exc}")
-        finally:
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
+    if not sessions:
+        return
+    updated, failed, skipped = await refresh_stale_account_profiles(
+        [(int(user_id), str(session_string)) for user_id, session_string in sessions],
+        force=True,
+        concurrency=3,
+        timeout_seconds=10.0,
+    )
+    logger.info(
+        "Проверка сессий завершена: "
+        f"обновлено={updated}, ошибок/неавторизованных={failed}, пропущено={skipped}"
+    )
 
 
 async def _run_dialog_expiry_job() -> None:
@@ -95,7 +88,29 @@ async def _run_dialog_expiry_job() -> None:
         logger.exception(f"[DM analytics] dialog expiry job failed: {exc}")
 
 
+
+
+async def _run_queue_recovery_job() -> None:
+    """Recover only genuinely stale queue claims during normal runtime."""
+    try:
+        result = recover_stale_queue()
+        if result["claimed_recovered"] or result["sending_uncertain"]:
+            logger.warning(f"[DM queue] periodic recovery: {result}")
+    except Exception as exc:
+        logger.exception(f"[DM queue] periodic recovery failed: {exc}")
+
+
 async def setup_scheduler() -> None:
+    if scheduler.get_job("dm-queue-recovery") is None:
+        scheduler.add_job(
+            _run_queue_recovery_job,
+            "interval",
+            minutes=5,
+            id="dm-queue-recovery",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
     if scheduler.get_job("dm-dialog-expiry") is None:
         scheduler.add_job(
             _run_dialog_expiry_job,
@@ -112,6 +127,7 @@ async def setup_scheduler() -> None:
 
 
 async def shutdown_runtime() -> None:
+    set_dm_runtime_shutting_down(True)
     for task in list(dm_monitor_tasks.values()):
         if not task.done():
             task.cancel()
@@ -139,6 +155,7 @@ def run() -> None:
     delete_table()
 
     logger.info("📱 Запуск бота...")
+    set_dm_runtime_shutting_down(False)
     try:
         bot.start(bot_token=BOT_TOKEN)
         bot.loop.run_until_complete(validate_saved_sessions())

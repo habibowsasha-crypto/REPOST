@@ -1,0 +1,44 @@
+TgBlaster v1.0.22b6 — verification report
+
+Base archive:
+- TgBlaster-dm-ai-dialog-v1_0_22b5_queue_id_username_view.zip
+
+Implemented:
+- parser-style lead cards: username/name, full Telegram ID, source-message link, source chat;
+- 25 leads per batch;
+- stable snapshot pagination: next/previous batches do not shift when dispatcher removes rows;
+- refresh-current and restart-from-beginning controls;
+- source_chat_username/source_message_id persistence for new queue rows;
+- safe SQLite migration for existing v1.0.22b5 queue/source tables;
+- public and private-supergroup Telegram deep links.
+
+Local checks before packaging:
+- compileall: PASS
+- DM/dispatcher/queue/Kirill/account-profile suite: 75 tests PASS
+- funnel/migration/first-message pytest suite: 46 tests + 38 subtests PASS
+- admin contact UI suite: 2 tests PASS
+- total distinct tests: 123 tests + 38 subtests PASS
+- v1.0.22b5 -> v1.0.22b6 SQLite migration: PASS
+- stable 25-item snapshot after live queue mutation: PASS
+- task-specific source metadata isolation: PASS
+- 25 visible cards stay within Telegram 4096-character text limit: PASS
+- queue view remains read-only: PASS
+
+Test environment note:
+- third-party Telethon/APScheduler/decouple packages were unavailable in the container;
+- project tests were executed in an isolated local environment with lightweight dependency stubs and the project's own fake Telegram clients;
+- real Telegram, OpenAI and Railway calls were not executed.
+
+Compatibility:
+- existing tasks and queue rows are preserved;
+- old rows have no historical source_message_id, so their message link displays as unavailable;
+- new/re-seen queued users receive source-message links automatically;
+- no new Railway Variables.
+
+Unchanged first-DM files:
+- services/first_message.py
+  SHA-256 a34f2613c338b1f89284335d2462cc1ed1b1e43b3063dcdf4a511a3b7f0f32aa
+- services/first_message_kirill_vip.py
+  SHA-256 94f8c82b6077af0eefecd3f9dbc927a4adc876680fc0e6ee187a5a8d6f33282b
+- services/kirill_vip_funnel.py
+  SHA-256 dd0d2d215d943914cbe2af3865ae02f4e6900100ab3ab6094f45ae8916326892

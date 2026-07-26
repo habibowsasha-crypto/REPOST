@@ -257,6 +257,35 @@ class SafeQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(row)
         self.assertEqual(row["id"], ready_id)
 
+    def test_due_query_preserves_every_selected_field(self) -> None:
+        self._task(task_id=1, account=120)
+        created, row_id = enqueue_pending(
+            dm_task_id=1,
+            account_user_id=120,
+            target_user_id=777001,
+            target_access_hash=987654321,
+            target_username="field_user",
+            target_first_name="Поле",
+            target_last_name="Проверка",
+            source_chat_id=445566,
+            source_chat_title="Исходный чат",
+            source_chat_username="source_public",
+            source_message_id=321,
+            delay_min=0,
+            delay_max=0,
+        )
+        self.assertTrue(created)
+        row = get_due_pending(120)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["id"], row_id)
+        self.assertEqual(row["source_chat_username"], "source_public")
+        self.assertEqual(row["source_message_id"], 321)
+        self.assertEqual(row["status"], "pending")
+        self.assertEqual(row["retry_count"], 0)
+        self.assertEqual(row["resolve_attempts"], 0)
+        self.assertIsInstance(row["enqueued_at"], str)
+        self.assertIsInstance(row["eligible_at"], str)
+
     def test_claim_is_atomic(self) -> None:
         self._task(task_id=1, account=102)
         _, row_id = self._enqueue(task_id=1, account=102, user=503, chat=11)
@@ -283,6 +312,38 @@ class SafeQueueTests(unittest.IsolatedAsyncioTestCase):
         statuses = dict(conn.execute("SELECT id,status FROM dm_pending_queue"))
         self.assertEqual(statuses[claimed_id], "pending")
         self.assertEqual(statuses[sending_id], "uncertain_delivery")
+
+    def test_process_start_recovers_fresh_claim_and_protects_fresh_send(self) -> None:
+        self._task(task_id=1, account=121)
+        _, claimed_id = self._enqueue(task_id=1, account=121, user=7001, chat=11)
+        _, sending_id = self._enqueue(task_id=1, account=121, user=7002, chat=11)
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        with conn:
+            conn.execute(
+                "UPDATE dm_pending_queue SET status='claimed', claim_token='c1', claimed_at=?, updated_at=? WHERE id=?",
+                (now, now, claimed_id),
+            )
+            conn.execute(
+                "UPDATE dm_pending_queue SET status='sending', claim_token='c2', send_started_at=?, updated_at=? WHERE id=?",
+                (now, now, sending_id),
+            )
+        normal = recover_stale_queue()
+        self.assertEqual(normal, {"claimed_recovered": 0, "sending_uncertain": 0})
+        startup = recover_stale_queue(process_start=True)
+        self.assertEqual(startup, {"claimed_recovered": 1, "sending_uncertain": 1})
+        rows = {
+            row[0]: (row[1], row[2], row[3])
+            for row in conn.execute(
+                "SELECT id,status,claim_token,last_error FROM dm_pending_queue WHERE id IN (?,?)",
+                (claimed_id, sending_id),
+            )
+        }
+        self.assertEqual(rows[claimed_id][0], "pending")
+        self.assertIsNone(rows[claimed_id][1])
+        self.assertEqual(rows[claimed_id][2], "process_restarted_before_send")
+        self.assertEqual(rows[sending_id][0], "uncertain_delivery")
+        self.assertIsNone(rows[sending_id][1])
+        self.assertEqual(rows[sending_id][2], "process_restarted_during_send")
 
     def test_delay_and_pacing_have_safe_bounds(self) -> None:
         self.assertEqual(validate_delay_range(0, MAX_DELAY_SECONDS), (0, MAX_DELAY_SECONDS))

@@ -83,6 +83,7 @@ from services.dm_task_queue import (
     MAX_DELAY_SECONDS,
     pause_account,
     pause_all_first_dms,
+    queue_status_counts,
     prepare_tasks_for_deletion,
     reassign_task_pending_to_active_sources,
     recover_stale_queue,
@@ -111,6 +112,27 @@ dm_setup_state: dict = {}
 dm_monitor_clients: dict[int, TelegramClient] = {}
 dm_monitor_tasks: dict[int, asyncio.Task] = {}
 dm_account_dispatcher_tasks: dict[int, asyncio.Task] = {}
+_dm_runtime_shutting_down = False
+
+
+def set_dm_runtime_shutting_down(value: bool) -> None:
+    global _dm_runtime_shutting_down
+    _dm_runtime_shutting_down = bool(value)
+
+
+def _restart_dispatcher_if_active(account_user_id: int) -> None:
+    if _dm_runtime_shutting_down or not _account_has_active_tasks(int(account_user_id)):
+        return
+    ensure_account_dispatcher(int(account_user_id))
+
+
+def _restart_monitor_if_active(task_id: int) -> None:
+    if _dm_runtime_shutting_down:
+        return
+    task = _get_task(int(task_id))
+    if not task or not task.get("is_active") or not _get_watched_chats(int(task_id)):
+        return
+    _launch_monitor(int(task_id))
 
 # Compatibility-only alias for old imports. The live first-DM queue is now SQLite.
 dm_send_queues: dict[int, tuple] = {}
@@ -648,6 +670,7 @@ def _account_has_active_tasks(account_user_id: int) -> bool:
 
 async def _account_dispatch_loop(account_user_id: int) -> None:
     account_user_id = int(account_user_id)
+    crashed = False
     logger.info(f"[DM dispatcher] account={account_user_id} started")
     try:
         while True:
@@ -694,6 +717,7 @@ async def _account_dispatch_loop(account_user_id: int) -> None:
         logger.info(f"[DM dispatcher] account={account_user_id} stopped")
         raise
     except Exception as exc:
+        crashed = True
         logger.exception(
             f"[DM dispatcher] account={account_user_id} crashed: {exc}"
         )
@@ -701,6 +725,11 @@ async def _account_dispatch_loop(account_user_id: int) -> None:
         current = dm_account_dispatcher_tasks.get(account_user_id)
         if current is asyncio.current_task():
             dm_account_dispatcher_tasks.pop(account_user_id, None)
+        if crashed and not _dm_runtime_shutting_down:
+            logger.warning(
+                f"[DM dispatcher] account={account_user_id} restart scheduled"
+            )
+            bot.loop.call_later(5.0, _restart_dispatcher_if_active, account_user_id)
 
 
 def ensure_account_dispatcher(account_user_id: int) -> None:
@@ -751,6 +780,7 @@ async def _monitor_loop(task_id: int) -> None:
     task = _get_task(task_id)
     if not task or not task["is_active"] or not task.get("session_string"):
         return
+    crashed = False
     client = TelegramClient(StringSession(task["session_string"]), API_ID, API_HASH)
     try:
         await client.connect()
@@ -809,11 +839,13 @@ async def _monitor_loop(task_id: int) -> None:
             target_id = int(sender.id)
             source_chat_id = None
             source_chat_title = None
+            source_chat_username = None
             try:
                 source_chat = await event.get_chat()
                 raw_chat_id = getattr(source_chat, "id", None)
                 source_chat_id = int(raw_chat_id) if raw_chat_id is not None else None
                 source_chat_title = getattr(source_chat, "title", None)
+                source_chat_username = getattr(source_chat, "username", None)
             except Exception as exc:
                 logger.debug(
                     f"[DM {task_id}] source chat unavailable user={target_id}: {exc}"
@@ -857,6 +889,10 @@ async def _monitor_loop(task_id: int) -> None:
                 ),
                 delay_min=int(current_task.get("delay_min") or 0),
                 delay_max=int(current_task.get("delay_max") or 0),
+                source_chat_username=(
+                    str(source_chat_username) if source_chat_username else None
+                ),
+                source_message_id=getattr(event, "id", None),
             )
             ensure_account_dispatcher(current_task["user_id"])
             logger.debug(
@@ -875,6 +911,7 @@ async def _monitor_loop(task_id: int) -> None:
         logger.info(f"[DM task {task_id}] monitor cancelled")
         raise
     except Exception as exc:
+        crashed = True
         logger.exception(f"[DM task {task_id}] monitor crashed: {exc}")
     finally:
         dm_monitor_clients.pop(task_id, None)
@@ -885,6 +922,9 @@ async def _monitor_loop(task_id: int) -> None:
         current = dm_monitor_tasks.get(task_id)
         if current is asyncio.current_task():
             dm_monitor_tasks.pop(task_id, None)
+        if crashed and not _dm_runtime_shutting_down:
+            logger.warning(f"[DM task {task_id}] monitor restart scheduled")
+            bot.loop.call_later(10.0, _restart_monitor_if_active, int(task_id))
 
 
 def _launch_monitor(task_id: int) -> None:
@@ -964,7 +1004,7 @@ async def delete_dm_task_runtime(task_id: int) -> bool:
 
 async def restore_dm_tasks() -> None:
     create_dm_tables()
-    recovery = recover_stale_queue()
+    recovery = recover_stale_queue(process_start=True)
     if recovery["claimed_recovered"] or recovery["sending_uncertain"]:
         logger.warning(f"[DM restore] queue recovery: {recovery}")
     rows = conn.execute(
@@ -1278,7 +1318,7 @@ async def _save_and_launch(event, admin_id: int, st: dict) -> None:
     dm_setup_state.pop(admin_id, None)
     _launch_monitor(task_id)
 
-    await render_menu(event, 
+    await render_menu(event,
         f"🚀 **DM-задача #{task_id} запущена!**\n\n"
         f"👥 Чатов: {len(st['selected_chats'])}\n"
         f"⏱ Задержка после сообщения: {st.get('delay_min', 30)}–{st.get('delay_max', 90)} сек\n"
@@ -1338,7 +1378,8 @@ async def cmd_dm_list(event: callback_message) -> None:
         else:
             status = "🔴 остановлена"
             status_icon = "🔴"
-        queue_size = count_pending(int(task_id))
+        queue_stats = queue_status_counts(int(task_id))
+        queue_size = queue_stats["total"]
         account_label = format_account_label(
             int(account_id), include_id=True, max_length=44
         )
@@ -1347,7 +1388,9 @@ async def cmd_dm_list(event: callback_message) -> None:
             f"Чатов: {chats} | ✅ отправлено: {sent} | 🔒 закрытых ЛС: {privacy}\n"
             f"Модуль: {first_dm_module_label(first_dm_module)}\n"
             f"Задержка после сообщения: {int(low or 0)}–{int(high or 0)}с\n"
-            f"В очереди: {queue_size} чел. | Создана: {(created or '')[:16]}"
+            f"К отправке: {queue_stats['sendable']} | В обработке: {queue_stats['processing']} | "
+            f"Спорных: {queue_stats['uncertain_delivery']}\n"
+            f"Всего незавершённых: {queue_size} чел. | Создана: {(created or '')[:16]}"
         )
         buttons.append(
             [
@@ -1361,7 +1404,7 @@ async def cmd_dm_list(event: callback_message) -> None:
             [
                 Button.inline(
                     f"👥 Очередь #{task_id} ({queue_size})",
-                    f"dm_queue_{task_id}_0".encode(),
+                    f"dm_queue_open_{task_id}".encode(),
                 )
             ]
         )

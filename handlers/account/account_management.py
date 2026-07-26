@@ -1,16 +1,32 @@
 from __future__ import annotations
 
+import asyncio
+
 from loguru import logger
 from telethon import Button, TelegramClient
 from telethon.sessions import StringSession
 
-from config import API_HASH, API_ID, Query, bot, callback_query, conn
+from config import ADMIN_ID_LIST, API_HASH, API_ID, Query, bot, callback_query, conn
+from services.account_profiles import format_account_label, refresh_stale_account_profiles
 from services.menu_ui import render_menu
 from utils.telegram import broadcast_status_emoji, get_active_broadcast_groups
+
+_CONNECT_TIMEOUT = 15.0
+_REQUEST_TIMEOUT = 10.0
+
+
+def _is_admin(sender_id) -> bool:
+    try:
+        return int(sender_id) in ADMIN_ID_LIST
+    except (TypeError, ValueError):
+        return False
 
 
 @bot.on(Query(data=b"my_accounts"))
 async def my_accounts(event: callback_query) -> None:
+    if not _is_admin(event.sender_id):
+        await event.answer("Недоступно", alert=True)
+        return
     cursor = conn.cursor()
     try:
         sessions = cursor.execute(
@@ -30,30 +46,35 @@ async def my_accounts(event: callback_query) -> None:
         )
         return
 
-    buttons = []
-    for user_id, session_string in sessions:
-        client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
-        label = f"Аккаунт {user_id}"
-        try:
-            await client.connect()
-            me = await client.get_me()
-            label = me.first_name or me.username or label
-        except Exception as exc:
-            logger.warning(f"Не удалось загрузить аккаунт {user_id}: {exc}")
-            label = f"⚠ Аккаунт {user_id}"
-        finally:
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-        buttons.append([Button.inline(f"👤 {label}", f"account_info_{user_id}".encode())])
+    try:
+        await refresh_stale_account_profiles(
+            [(int(user_id), str(session_string)) for user_id, session_string in sessions],
+            timeout_seconds=_REQUEST_TIMEOUT,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        # Profile refresh is display-only. Cached labels remain usable.
+        logger.warning(f"Не удалось обновить список аккаунтов: {exc}")
 
+    buttons = [
+        [
+            Button.inline(
+                f"👤 {format_account_label(int(user_id), include_id=True, max_length=42)}",
+                f"account_info_{int(user_id)}".encode(),
+            )
+        ]
+        for user_id, _session_string in sessions
+    ]
     buttons.append([Button.inline("🏠 Главное меню", b"menu_home")])
     await render_menu(event, "📱 **Список ваших аккаунтов:**", buttons=buttons)
 
 
-@bot.on(Query(data=lambda data: data.decode().startswith("account_info_")))
+@bot.on(Query(data=lambda data: data.decode(errors="ignore").startswith("account_info_")))
 async def handle_account_button(event: callback_query) -> None:
+    if not _is_admin(event.sender_id):
+        await event.answer("Недоступно", alert=True)
+        return
     try:
         user_id = int(event.data.decode().rsplit("_", 1)[1])
     except (ValueError, IndexError):
@@ -63,7 +84,7 @@ async def handle_account_button(event: callback_query) -> None:
     cursor = conn.cursor()
     try:
         row = cursor.execute(
-            "SELECT session_string FROM sessions WHERE user_id = ?", (user_id,)
+            "SELECT session_string, account_email FROM sessions WHERE user_id = ?", (user_id,)
         ).fetchone()
         group_rows = cursor.execute(
             """
@@ -87,10 +108,14 @@ async def handle_account_button(event: callback_query) -> None:
         )
         return
 
-    client = TelegramClient(StringSession(row[0]), API_ID, API_HASH)
+    session_string, account_email = row
+    client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
     try:
-        await client.connect()
-        if not await client.is_user_authorized():
+        await asyncio.wait_for(client.connect(), timeout=_CONNECT_TIMEOUT)
+        authorized = await asyncio.wait_for(
+            client.is_user_authorized(), timeout=_REQUEST_TIMEOUT
+        )
+        if not authorized:
             await render_menu(
                 event,
                 "⚠ Сессия аккаунта больше не авторизована.",
@@ -101,9 +126,10 @@ async def handle_account_button(event: callback_query) -> None:
             )
             return
 
-        me = await client.get_me()
+        me = await asyncio.wait_for(client.get_me(), timeout=_REQUEST_TIMEOUT)
         name = me.first_name or me.username or "Без имени"
         phone = me.phone or "Не указан"
+        email = str(account_email).strip() if account_email else "Не указана"
         active_gids = set(get_active_broadcast_groups(user_id))
 
         lines = []
@@ -115,6 +141,7 @@ async def handle_account_button(event: callback_query) -> None:
         mass_active = "🟢 ВКЛ" if active_gids else "🔴 ВЫКЛ"
 
         buttons = [
+            [Button.inline("📧 Изменить почту", f"account_email_edit_{user_id}".encode())],
             [Button.inline("🔎 Найти группы аккаунта", f"sync_groups_{user_id}".encode())],
             [Button.inline("📋 Найденные группы", f"discovered_groups_{user_id}_0".encode())],
             [Button.inline("📋 Рабочий список групп", f"groups_{user_id}".encode())],
@@ -130,9 +157,21 @@ async def handle_account_button(event: callback_query) -> None:
             f"📢 **Меню аккаунта {name}:**\n"
             f"🚀 **Массовая рассылка:** {mass_active}\n\n"
             f"📌 **Имя:** {name}\n"
-            f"📞 **Номер:** `+{phone}`\n\n"
+            f"🆔 **Telegram ID:** `{int(user_id)}`\n"
+            f"📞 **Номер:** `+{phone}`\n"
+            f"📧 **Почта:** `{email}`\n\n"
             f"📝 **Рабочие группы:**\n{group_list}",
             buttons=buttons,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(f"Тайм-аут открытия аккаунта {user_id}")
+        await render_menu(
+            event,
+            "⚠ Telegram временно не ответил. Сохранённые настройки аккаунта не изменены.",
+            buttons=[
+                [Button.inline("🔄 Повторить", f"account_info_{user_id}".encode())],
+                [Button.inline("🏠 Главное меню", b"menu_home")],
+            ],
         )
     except Exception as exc:
         logger.exception(f"Ошибка открытия аккаунта {user_id}: {exc}")
@@ -143,6 +182,6 @@ async def handle_account_button(event: callback_query) -> None:
         )
     finally:
         try:
-            await client.disconnect()
+            await asyncio.wait_for(client.disconnect(), timeout=_CONNECT_TIMEOUT)
         except Exception:
             pass

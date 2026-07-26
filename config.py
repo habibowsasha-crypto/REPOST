@@ -55,6 +55,7 @@ code_waiting: __Dict_int_str = {}
 user_states: __Dict_int_str = {}
 
 password_waiting: __Dict_int_dict = {}
+email_waiting: __Dict_int_dict = {}
 broadcast_all_state: __Dict_int_dict = {}
 broadcast_solo_state: __Dict_int_dict = {}
 broadcast_all_state_account: __Dict_int_dict = {}

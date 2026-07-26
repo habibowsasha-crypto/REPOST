@@ -5,13 +5,16 @@ import asyncio
 from loguru import logger
 from telethon import Button
 
-from config import Query, bot, callback_query, conn
+from config import ADMIN_ID_LIST, Query, bot, callback_query, conn
 from services.broadcast_runtime import stop_account_broadcast_jobs
 from services.menu_ui import render_menu
 
 
 @bot.on(Query(data=lambda data: data.decode().startswith("delete_account_")))
 async def delete_account(event: callback_query) -> None:
+    if event.sender_id not in ADMIN_ID_LIST:
+        await event.answer("Недоступно", alert=True)
+        return
     try:
         user_id = int(event.data.decode().rsplit("_", 1)[1])
     except (ValueError, IndexError):
@@ -49,7 +52,10 @@ async def delete_account(event: callback_query) -> None:
 
     # Stop in-memory monitors after the durable DB flag is already set to inactive.
     try:
-        from handlers.dm.dm_handlers import dm_monitor_tasks
+        from handlers.dm.dm_handlers import (
+            dm_account_dispatcher_tasks,
+            dm_monitor_tasks,
+        )
 
         cancelled = []
         for (task_id,) in task_rows:
@@ -57,10 +63,14 @@ async def delete_account(event: callback_query) -> None:
             if task and not task.done():
                 task.cancel()
                 cancelled.append(task)
+        dispatcher = dm_account_dispatcher_tasks.get(int(user_id))
+        if dispatcher and not dispatcher.done():
+            dispatcher.cancel()
+            cancelled.append(dispatcher)
         if cancelled:
             await asyncio.gather(*cancelled, return_exceptions=True)
     except Exception as exc:
-        logger.debug(f"Не удалось остановить DM-мониторы аккаунта {user_id}: {exc}")
+        logger.debug(f"Не удалось остановить DM-runtime аккаунта {user_id}: {exc}")
 
     logger.info(f"Аккаунт id={user_id} удалён, его активные задачи остановлены")
     await render_menu(

@@ -23,8 +23,11 @@ from services.dm_task_queue import (
     count_pending,
     get_account_dispatch_state,
     get_global_first_dm_state,
-    list_pending_page,
+    is_active_queue_status,
+    list_pending_ids,
+    list_queue_rows_by_ids,
     parse_iso,
+    queue_status_counts,
     remove_chat_source,
     reschedule_task_pending,
     resume_account,
@@ -43,9 +46,13 @@ from .dm_handlers import (
 
 
 dm_manage_state: dict[int, dict[str, Any]] = {}
-_QUEUE_PAGE_SIZE = 8
+_QUEUE_PAGE_SIZE = 25
 _DM_QUEUE_COMMAND_PATTERN = r"^/(?:dm_queue|queue)(?:@\w+)?(?:\s+#?(\d+))?\s*$"
 _DM_QUEUE_RU_PATTERN = r"(?i)^(?:очередь|кто в очереди)(?:\s+(?:задача\s*)?#?(\d+))?\s*$"
+
+
+# A snapshot keeps "Следующие 25" stable even while the live sender removes rows.
+_queue_view_snapshots: dict[tuple[int, int], list[int]] = {}
 
 
 def _task_row(task_id: int) -> Optional[dict[str, Any]]:
@@ -110,7 +117,7 @@ def _format_duration(seconds: int) -> str:
 
 
 def _format_queue_target_html(row: dict[str, Any]) -> str:
-    """Render username/name and always preserve the complete numeric Telegram ID."""
+    """Render one lead in the compact parser-style format requested by admin."""
     username = " ".join(str(row.get("target_username") or "").split()).strip().lstrip("@")
     first_name = " ".join(str(row.get("target_first_name") or "").split()).strip()
     last_name = " ".join(str(row.get("target_last_name") or "").split()).strip()
@@ -118,15 +125,100 @@ def _format_queue_target_html(row: dict[str, Any]) -> str:
     user_id = int(row["target_user_id"])
 
     if username:
-        identity = f"👤 <b>@{html.escape(username)}</b>"
-        if full_name:
-            identity += f" — {html.escape(_short(full_name, 48))}"
+        lead = f"@{html.escape(_short(username, 32))}"
+    elif full_name:
+        lead = f"{html.escape(_short(full_name, 32))} <i>(без @username)</i>"
     else:
-        identity = (
-            f"👤 <b>{html.escape(_short(full_name or 'Без имени', 48))}</b> "
-            "<i>(без @username)</i>"
+        lead = "<i>без @username</i>"
+    return f"👤 <b>Лид:</b> {lead}\n🆔 <b>Айди:</b> <code>{user_id}</code>"
+
+
+def _source_message_url(row: dict[str, Any]) -> Optional[str]:
+    """Build a best-effort Telegram deep link for newly queued source messages."""
+    message_id = row.get("source_message_id")
+    if message_id is None:
+        return None
+    try:
+        message_id = int(message_id)
+    except (TypeError, ValueError):
+        return None
+    if message_id <= 0:
+        return None
+
+    username = " ".join(str(row.get("source_chat_username") or "").split()).strip().lstrip("@")
+    if username:
+        return f"https://t.me/{username}/{message_id}"
+
+    chat_id = row.get("source_chat_id")
+    if chat_id is None:
+        return None
+    try:
+        raw = int(chat_id)
+    except (TypeError, ValueError):
+        return None
+    digits = str(abs(raw))
+    if str(raw).startswith("-100") and digits.startswith("100"):
+        digits = digits[3:]
+    if not digits:
+        return None
+    return f"https://t.me/c/{digits}/{message_id}"
+
+
+def _format_queue_lead_card(row: dict[str, Any]) -> str:
+    target = _format_queue_target_html(row)
+    source = html.escape(
+        _short(
+            row.get("source_chat_title")
+            or row.get("source_chat_username")
+            or row.get("source_chat_id")
+            or "Источник не определён",
+            34,
         )
-    return f"{identity}\n🆔 <code>{user_id}</code>"
+    )
+    url = _source_message_url(row)
+    if url:
+        message_line = f'💬 <b>Сообщение:</b> <a href="{html.escape(url, quote=True)}">Перейти к сообщению</a>'
+    else:
+        message_line = "💬 <b>Сообщение:</b> <i>недоступно</i>"
+    return f"{target}\n{message_line}\n📨 <b>Из чата:</b> {source}"
+
+
+def _utf16_units(value: str) -> int:
+    return len(str(value).encode("utf-16-le")) // 2
+
+
+def _split_html_lines(lines: list[str], *, limit: int = 3500) -> list[str]:
+    """Split admin output below Telegram's UTF-16 message limit."""
+    chunks: list[str] = []
+    current: list[str] = []
+    for line in lines:
+        candidate = "\n".join([*current, line]) if current else line
+        if current and _utf16_units(candidate) > limit:
+            chunks.append("\n".join(current))
+            current = [line]
+        else:
+            current.append(line)
+    if current:
+        chunks.append("\n".join(current))
+    return chunks or [""]
+
+
+def _queue_snapshot_key(event: Any, task_id: int) -> tuple[int, int]:
+    return int(getattr(event, "sender_id", 0) or 0), int(task_id)
+
+
+def _start_queue_snapshot(event: Any, task_id: int) -> list[int]:
+    snapshot = list_pending_ids(int(task_id))
+    _queue_view_snapshots[_queue_snapshot_key(event, task_id)] = snapshot
+    return snapshot
+
+
+def _get_queue_snapshot(event: Any, task_id: int) -> list[int]:
+    key = _queue_snapshot_key(event, task_id)
+    snapshot = _queue_view_snapshots.get(key)
+    if snapshot is None:
+        snapshot = _start_queue_snapshot(event, task_id)
+    return snapshot
 
 
 async def _show_queue_task_picker(event) -> None:
@@ -162,7 +254,7 @@ async def _show_queue_task_picker(event) -> None:
             [
                 Button.inline(
                     f"👥 {icon} #{int(task_id)} • {account} • {count}",
-                    f"dm_queue_{int(task_id)}_0".encode(),
+                    f"dm_queue_open_{int(task_id)}".encode(),
                 )
             ]
         )
@@ -170,7 +262,13 @@ async def _show_queue_task_picker(event) -> None:
     await render_menu(event, "\n".join(lines), buttons=buttons, parse_mode="html")
 
 
-async def _show_queue_page(event, task_id: int, page: int = 0) -> bool:
+async def _show_queue_page(
+    event,
+    task_id: int,
+    page: int = 0,
+    *,
+    restart_snapshot: bool = False,
+) -> bool:
     task = _task_row(task_id)
     if not task:
         await render_menu(
@@ -180,74 +278,95 @@ async def _show_queue_page(event, task_id: int, page: int = 0) -> bool:
         )
         return False
 
-    total = count_pending(task_id)
-    pages = max(1, math.ceil(total / _QUEUE_PAGE_SIZE))
-    page = max(0, min(int(page), pages - 1))
-    rows = list_pending_page(
-        task_id,
-        offset=page * _QUEUE_PAGE_SIZE,
-        limit=_QUEUE_PAGE_SIZE,
+    snapshot = (
+        _start_queue_snapshot(event, task_id)
+        if restart_snapshot
+        else _get_queue_snapshot(event, task_id)
     )
+    snapshot_total = len(snapshot)
+    pages = max(1, math.ceil(snapshot_total / _QUEUE_PAGE_SIZE))
+    page = max(0, min(int(page), pages - 1))
+    start_index = page * _QUEUE_PAGE_SIZE
+    page_ids = snapshot[start_index : start_index + _QUEUE_PAGE_SIZE]
+    snapshot_rows = list_queue_rows_by_ids(task_id, page_ids)
+    rows = [row for row in snapshot_rows if is_active_queue_status(row.get("status"))]
+    processed_count = max(0, len(page_ids) - len(rows))
+    current_stats = queue_status_counts(task_id)
+    current_total = current_stats["total"]
+
     account = html.escape(
         format_account_label(int(task["user_id"]), include_id=True, max_length=60)
     )
+    first_number = start_index + 1 if page_ids else 0
+    last_number = start_index + len(page_ids)
     lines = [
-        f"👥 <b>Очередь DM-задачи #{task_id}</b>",
+        f"📋 <b>Очередь DM-задачи #{task_id}</b>",
         f"👤 Аккаунт: <b>{account}</b>",
-        f"Всего записей: <b>{total}</b>",
+        f"Позиции снимка: <b>{first_number}–{last_number}</b> из <b>{snapshot_total}</b>",
+        f"К отправке: <b>{current_stats['sendable']}</b> | "
+        f"В обработке: <b>{current_stats['processing']}</b> | "
+        f"Спорных: <b>{current_stats['uncertain_delivery']}</b>",
+        f"Всего незавершённых: <b>{current_total}</b>",
     ]
-    now = dt.datetime.now(dt.timezone.utc)
-    status_names = {
-        "pending": "ожидает",
-        "claimed": "подготовка",
-        "sending": "отправляется",
-        "retry_wait": "повтор после Telegram-паузы",
-        "unresolved_peer": "ожидает восстановления Telegram-получателя",
-        "uncertain_delivery": "неизвестен результат отправки — без автоповтора",
-    }
-    for index, row in enumerate(rows, start=page * _QUEUE_PAGE_SIZE + 1):
-        target = _format_queue_target_html(row)
-        source = html.escape(
-            _short(
-                row.get("source_chat_title")
-                or row.get("source_chat_id")
-                or "Источник не определён",
-                45,
-            )
-        )
-        due_at = parse_iso(row.get("eligible_at"))
-        if due_at is None or due_at <= now:
-            due_text = "готов"
-        else:
-            due_text = f"через {_format_duration(math.ceil((due_at - now).total_seconds()))}"
-        status = status_names.get(str(row.get("status")), str(row.get("status")))
+    if processed_count:
         lines.append(
-            f"\n<b>{index}.</b>\n{target}\n"
-            f"Источник: {source}\n"
-            f"Статус: <b>{html.escape(status)}</b> | {due_text}"
+            f"<i>Уже обработано из этой пачки после её открытия: {processed_count}.</i>"
         )
-    if not rows:
+    for row in rows:
+        lines.append("\n" + _format_queue_lead_card(row))
+    if not page_ids:
         lines.append("\nОчередь пуста.")
+    elif not rows:
+        lines.append("\nВсе лиды из этой пачки уже обработаны или удалены из очереди.")
 
     buttons = []
-    if pages > 1:
-        nav = []
-        if page > 0:
-            nav.append(Button.inline("⬅️", f"dm_queue_{task_id}_{page - 1}".encode()))
-        nav.append(Button.inline(f"{page + 1}/{pages}", f"dm_queue_{task_id}_{page}".encode()))
-        if page + 1 < pages:
-            nav.append(Button.inline("➡️", f"dm_queue_{task_id}_{page + 1}".encode()))
+    nav = []
+    if page > 0:
+        nav.append(
+            Button.inline(
+                "⬅️ Предыдущие 25",
+                f"dm_queue_{task_id}_{page - 1}".encode(),
+            )
+        )
+    if page + 1 < pages:
+        nav.append(
+            Button.inline(
+                "Следующие 25 ➡️",
+                f"dm_queue_{task_id}_{page + 1}".encode(),
+            )
+        )
+    if nav:
         buttons.append(nav)
-    if total:
-        buttons.append([Button.inline("🧹 Очистить очередь", f"dm_queue_clear_ask_{task_id}".encode())])
+    buttons.append(
+        [Button.inline(f"📄 Пачка {page + 1}/{pages}", f"dm_queue_{task_id}_{page}".encode())]
+    )
+    buttons.append(
+        [Button.inline("🔄 Обновить текущие", f"dm_queue_{task_id}_{page}".encode())]
+    )
+    buttons.append(
+        [Button.inline("⏮ С начала / обновить список", f"dm_queue_restart_{task_id}".encode())]
+    )
+    if current_total:
+        buttons.append(
+            [Button.inline("🧹 Очистить очередь", f"dm_queue_clear_ask_{task_id}".encode())]
+        )
     buttons.extend(
         [
-            [Button.inline("🔄 Обновить", f"dm_queue_{task_id}_{page}".encode())],
             [Button.inline("👥 Другая задача", b"dm_queue_pick")],
             [Button.inline("◀️ К задаче", f"dm_task_{task_id}".encode())],
         ]
     )
-    await render_menu(event, "\n".join(lines), buttons=buttons, parse_mode="html")
+    chunks = _split_html_lines(lines)
+    responder = getattr(event, "respond", None)
+    if len(chunks) > 1 and callable(responder):
+        for chunk in chunks[:-1]:
+            await responder(chunk, parse_mode="html")
+        final_text = chunks[-1]
+    else:
+        # Test doubles and unusual event wrappers may not expose respond().
+        # Keep the legacy single-message path rather than failing the queue view.
+        final_text = "\n".join(lines)
+    await render_menu(event, final_text, buttons=buttons, parse_mode="html")
     return True
 
 
@@ -320,7 +439,8 @@ async def _show_task(event, task_id: int) -> None:
     global_pause = get_global_first_dm_state()
     if active and global_pause.is_paused:
         status = "⏸ глобальная пауза первых DM"
-    queue_count = count_pending(int(task_id))
+    queue_stats = queue_status_counts(int(task_id))
+    queue_count = queue_stats["total"]
     photo = "да" if task["photo_url"] else "нет"
     created = html.escape(str(task["created_at"] or "")[:19])
     gate_lines: list[str] = []
@@ -349,7 +469,10 @@ async def _show_task(event, task_id: int) -> None:
         f"<b>{int(task['delay_min'] or 0)}–{int(task['delay_max'] or 0)} сек</b>\n"
         f"🧭 Пауза аккаунта между первыми DM: "
         f"<b>{dispatch.pacing_min}–{dispatch.pacing_max} сек</b>{gate_text}\n"
-        f"👥 Сейчас в очереди: <b>{queue_count}</b>\n"
+        f"👥 К отправке: <b>{queue_stats['sendable']}</b> | "
+        f"в обработке: <b>{queue_stats['processing']}</b> | "
+        f"спорных: <b>{queue_stats['uncertain_delivery']}</b>\n"
+        f"📦 Всего незавершённых: <b>{queue_count}</b>\n"
         f"✅ Первых DM отправлено: <b>{int(task['sent_count'])}</b>\n"
         f"🔒 Закрытых ЛС: <b>{int(task['privacy_count'])}</b>\n"
         f"⚠ Ошибок отправки: <b>{int(task['error_count'])}</b>\n"
@@ -1038,7 +1161,7 @@ async def cmd_dm_queue(event: callback_message) -> None:
     if not task_raw:
         await _show_queue_task_picker(event)
         return
-    await _show_queue_page(event, int(task_raw), 0)
+    await _show_queue_page(event, int(task_raw), 0, restart_snapshot=True)
 
 
 @bot.on(New_Message(pattern=_DM_QUEUE_RU_PATTERN))
@@ -1050,7 +1173,33 @@ async def cmd_dm_queue_ru(event: callback_message) -> None:
     if not task_raw:
         await _show_queue_task_picker(event)
         return
-    await _show_queue_page(event, int(task_raw), 0)
+    await _show_queue_page(event, int(task_raw), 0, restart_snapshot=True)
+
+
+@bot.on(Query(data=lambda d: re.fullmatch(rb"dm_queue_open_\d+", d) is not None))
+async def dm_queue_open(event: callback_query) -> None:
+    if event.sender_id not in ADMIN_ID_LIST:
+        await event.answer("Недоступно", alert=True)
+        return
+    task_id = _parse_suffix(event.data, "dm_queue_open_")
+    if task_id is None:
+        await event.answer("Некорректные данные", alert=True)
+        return
+    await _show_queue_page(event, task_id, 0, restart_snapshot=True)
+    await event.answer()
+
+
+@bot.on(Query(data=lambda d: re.fullmatch(rb"dm_queue_restart_\d+", d) is not None))
+async def dm_queue_restart(event: callback_query) -> None:
+    if event.sender_id not in ADMIN_ID_LIST:
+        await event.answer("Недоступно", alert=True)
+        return
+    task_id = _parse_suffix(event.data, "dm_queue_restart_")
+    if task_id is None:
+        await event.answer("Некорректные данные", alert=True)
+        return
+    await _show_queue_page(event, task_id, 0, restart_snapshot=True)
+    await event.answer("Список обновлён с начала")
 
 
 @bot.on(Query(data=lambda d: re.fullmatch(rb"dm_queue_\d+_\d+", d) is not None))
@@ -1092,7 +1241,7 @@ async def dm_queue_clear_ask(event: callback_query) -> None:
         "Это не добавит людей в opt-out, не закроет диалоги и не удалит статистику.",
         buttons=[
             [Button.inline("✅ Да, очистить", f"dm_queue_clear_yes_{task_id}".encode())],
-            [Button.inline("❌ Отмена", f"dm_queue_{task_id}_0".encode())],
+            [Button.inline("❌ Отмена", f"dm_queue_open_{task_id}".encode())],
         ],
         parse_mode="html",
     )

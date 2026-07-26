@@ -92,6 +92,8 @@ def _rebuild_legacy_dm_pending_queue() -> None:
                 target_last_name TEXT,
                 source_chat_id INTEGER,
                 source_chat_title TEXT,
+                source_chat_username TEXT,
+                source_message_id INTEGER,
                 enqueued_at TEXT NOT NULL,
                 eligible_at TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
@@ -121,6 +123,8 @@ def _rebuild_legacy_dm_pending_queue() -> None:
             source("target_last_name", "NULL"),
             source("source_chat_id", "NULL"),
             source("source_chat_title", "NULL"),
+            source("source_chat_username", "NULL"),
+            source("source_message_id", "NULL"),
             source("enqueued_at", "strftime('%Y-%m-%dT%H:%M:%f+00:00','now')"),
             source("eligible_at", "strftime('%Y-%m-%dT%H:%M:%f+00:00','now')"),
             source("status", "'pending'"),
@@ -139,6 +143,7 @@ def _rebuild_legacy_dm_pending_queue() -> None:
                 id, dm_task_id, account_user_id, target_user_id,
                 target_access_hash, target_username, target_first_name,
                 target_last_name, source_chat_id, source_chat_title,
+                source_chat_username, source_message_id,
                 enqueued_at, eligible_at, status, claim_token, claimed_at,
                 send_started_at, sent_at, retry_count, resolve_attempts,
                 last_error, updated_at
@@ -169,6 +174,16 @@ def _ensure_dm_pending_sources_schema() -> None:
         "dm_task_id",
         "source_chat_id",
     ]:
+        _add_column_if_missing(
+            "dm_pending_sources",
+            "source_chat_username",
+            "ALTER TABLE dm_pending_sources ADD COLUMN source_chat_username TEXT",
+        )
+        _add_column_if_missing(
+            "dm_pending_sources",
+            "source_message_id",
+            "ALTER TABLE dm_pending_sources ADD COLUMN source_message_id INTEGER",
+        )
         return
 
     legacy = "dm_pending_sources_legacy_v122b"
@@ -183,6 +198,8 @@ def _ensure_dm_pending_sources_schema() -> None:
                 dm_task_id INTEGER NOT NULL,
                 source_chat_id INTEGER NOT NULL,
                 source_chat_title TEXT,
+                source_chat_username TEXT,
+                source_message_id INTEGER,
                 first_seen_at TEXT NOT NULL,
                 last_seen_at TEXT NOT NULL,
                 PRIMARY KEY (pending_id, dm_task_id, source_chat_id)
@@ -190,14 +207,16 @@ def _ensure_dm_pending_sources_schema() -> None:
             """
         )
         task_expr = "COALESCE(l.dm_task_id, q.dm_task_id)" if has_task else "q.dm_task_id"
+        username_expr = "l.source_chat_username" if "source_chat_username" in columns else "NULL"
+        message_expr = "l.source_message_id" if "source_message_id" in columns else "NULL"
         conn.execute(
             f"""
             INSERT OR IGNORE INTO dm_pending_sources (
                 pending_id, dm_task_id, source_chat_id, source_chat_title,
-                first_seen_at, last_seen_at
+                source_chat_username, source_message_id, first_seen_at, last_seen_at
             )
             SELECT l.pending_id, {task_expr}, l.source_chat_id, l.source_chat_title,
-                   l.first_seen_at, l.last_seen_at
+                   {username_expr}, {message_expr}, l.first_seen_at, l.last_seen_at
               FROM {legacy} AS l
               JOIN dm_pending_queue AS q ON q.id=l.pending_id
              WHERE l.source_chat_id IS NOT NULL
@@ -236,6 +255,7 @@ def create_table() -> None:
                 username TEXT,
                 first_name TEXT,
                 last_name TEXT,
+                account_email TEXT,
                 profile_updated_at TEXT
             )
             """
@@ -365,6 +385,9 @@ def create_table() -> None:
         "sessions", "last_name", "ALTER TABLE sessions ADD COLUMN last_name TEXT"
     )
     _add_column_if_missing(
+        "sessions", "account_email", "ALTER TABLE sessions ADD COLUMN account_email TEXT"
+    )
+    _add_column_if_missing(
         "sessions",
         "profile_updated_at",
         "ALTER TABLE sessions ADD COLUMN profile_updated_at TEXT",
@@ -435,6 +458,8 @@ def create_dm_tables() -> None:
                 target_last_name TEXT,
                 source_chat_id INTEGER,
                 source_chat_title TEXT,
+                source_chat_username TEXT,
+                source_message_id INTEGER,
                 enqueued_at TEXT NOT NULL,
                 eligible_at TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
@@ -456,6 +481,8 @@ def create_dm_tables() -> None:
                 dm_task_id INTEGER NOT NULL,
                 source_chat_id INTEGER NOT NULL,
                 source_chat_title TEXT,
+                source_chat_username TEXT,
+                source_message_id INTEGER,
                 first_seen_at TEXT NOT NULL,
                 last_seen_at TEXT NOT NULL,
                 PRIMARY KEY (pending_id, dm_task_id, source_chat_id)
@@ -533,6 +560,8 @@ def create_dm_tables() -> None:
         "resolve_attempts": "ALTER TABLE dm_pending_queue ADD COLUMN resolve_attempts INTEGER NOT NULL DEFAULT 0",
         "last_error": "ALTER TABLE dm_pending_queue ADD COLUMN last_error TEXT",
         "updated_at": "ALTER TABLE dm_pending_queue ADD COLUMN updated_at TEXT",
+        "source_chat_username": "ALTER TABLE dm_pending_queue ADD COLUMN source_chat_username TEXT",
+        "source_message_id": "ALTER TABLE dm_pending_queue ADD COLUMN source_message_id INTEGER",
     }
     for column, ddl in queue_columns.items():
         _add_column_if_missing("dm_pending_queue", column, ddl)
