@@ -47,8 +47,14 @@ from .dm_handlers import (
 
 dm_manage_state: dict[int, dict[str, Any]] = {}
 _QUEUE_PAGE_SIZE = 25
-_DM_QUEUE_COMMAND_PATTERN = r"^/(?:dm_queue|queue)(?:@\w+)?(?:\s+#?(\d+))?\s*$"
-_DM_QUEUE_RU_PATTERN = r"(?i)^(?:очередь|кто в очереди)(?:\s+(?:задача\s*)?#?(\d+))?\s*$"
+_DM_QUEUE_COMMAND_PATTERN = (
+    r"^/(?:dm_queue|queue)(?:@\w+)?"
+    r"(?:\s+#?(\d+))?(?:\s+(\d+))?\s*$"
+)
+_DM_QUEUE_RU_PATTERN = (
+    r"(?i)^(?:очередь|кто в очереди)"
+    r"(?:\s+(?:задача\s*)?#?(\d+))?(?:\s+(\d+))?\s*$"
+)
 
 
 # A snapshot keeps "Следующие 25" stable even while the live sender removes rows.
@@ -221,6 +227,96 @@ def _get_queue_snapshot(event: Any, task_id: int) -> list[int]:
     return snapshot
 
 
+def _queue_navigation_text(
+    task_id: int,
+    page: int,
+    pages: int,
+    first_number: int,
+    last_number: int,
+    snapshot_total: int,
+) -> str:
+    """Text for a separate bottom navigation message."""
+    lines = [
+        f"🧭 <b>Навигация очереди #{int(task_id)}</b>",
+        f"Пачка: <b>{int(page) + 1}/{int(pages)}</b> | "
+        f"Позиции: <b>{int(first_number)}–{int(last_number)}</b> из <b>{int(snapshot_total)}</b>",
+    ]
+    if page + 1 < pages:
+        lines.extend(
+            [
+                "",
+                "Нажмите <b>«Следующие 25 ➡️»</b>, чтобы получить следующую пачку.",
+                "Резервная команда без кнопок: "
+                f"<code>/dm_queue {int(task_id)} {int(page) + 2}</code>",
+            ]
+        )
+    elif pages > 1:
+        lines.extend(["", "Это последняя пачка очереди."])
+    return "\n".join(lines)
+
+
+async def _send_queue_page_with_bottom_navigation(
+    event: Any,
+    *,
+    task_id: int,
+    page: int,
+    pages: int,
+    first_number: int,
+    last_number: int,
+    snapshot_total: int,
+    chunks: list[str],
+    buttons: list[list[Any]],
+) -> None:
+    """
+    Send lead cards first and a dedicated navigation message last.
+
+    Callback menus are edited only to retire the old keyboard. The fresh keyboard
+    is always sent after the cards, so it cannot remain above a long queue dump.
+    """
+    responder = getattr(event, "respond", None)
+    if not callable(responder):
+        # Lightweight test doubles and unusual wrappers may not expose respond().
+        # Preserve a working single-message fallback.
+        await render_menu(
+            event,
+            "\n".join(chunks),
+            buttons=buttons,
+            parse_mode="html",
+            link_preview=False,
+        )
+        return
+
+    if getattr(event, "query", None) is not None:
+        try:
+            await event.edit(
+                f"✅ Пачка <b>{int(page) + 1}/{int(pages)}</b> открыта ниже. "
+                "Кнопки навигации находятся под последней карточкой.",
+                buttons=None,
+                parse_mode="html",
+                link_preview=False,
+            )
+        except Exception:
+            # The new messages can still be sent even if the old menu cannot be edited.
+            pass
+
+    for chunk in chunks:
+        await responder(chunk, parse_mode="html", link_preview=False)
+
+    await responder(
+        _queue_navigation_text(
+            task_id,
+            page,
+            pages,
+            first_number,
+            last_number,
+            snapshot_total,
+        ),
+        buttons=buttons,
+        parse_mode="html",
+        link_preview=False,
+    )
+
+
 async def _show_queue_task_picker(event) -> None:
     rows = conn.execute(
         """
@@ -241,7 +337,8 @@ async def _show_queue_task_picker(event) -> None:
         "👥 <b>Кто находится в очереди</b>",
         "",
         "Выберите DM-задачу или используйте команду:",
-        "<code>/dm_queue 25</code>",
+        "<code>/dm_queue 25</code> — первая пачка",
+        "<code>/dm_queue 25 2</code> — вторая пачка",
     ]
     buttons = []
     for task_id, account_user_id, is_active in rows:
@@ -357,16 +454,17 @@ async def _show_queue_page(
         ]
     )
     chunks = _split_html_lines(lines)
-    responder = getattr(event, "respond", None)
-    if len(chunks) > 1 and callable(responder):
-        for chunk in chunks[:-1]:
-            await responder(chunk, parse_mode="html")
-        final_text = chunks[-1]
-    else:
-        # Test doubles and unusual event wrappers may not expose respond().
-        # Keep the legacy single-message path rather than failing the queue view.
-        final_text = "\n".join(lines)
-    await render_menu(event, final_text, buttons=buttons, parse_mode="html")
+    await _send_queue_page_with_bottom_navigation(
+        event,
+        task_id=task_id,
+        page=page,
+        pages=pages,
+        first_number=first_number,
+        last_number=last_number,
+        snapshot_total=snapshot_total,
+        chunks=chunks,
+        buttons=buttons,
+    )
     return True
 
 
@@ -1158,10 +1256,12 @@ async def cmd_dm_queue(event: callback_message) -> None:
         return
     match = getattr(event, "pattern_match", None)
     task_raw = match.group(1) if match else None
+    page_raw = match.group(2) if match else None
     if not task_raw:
         await _show_queue_task_picker(event)
         return
-    await _show_queue_page(event, int(task_raw), 0, restart_snapshot=True)
+    page = max(0, int(page_raw or 1) - 1)
+    await _show_queue_page(event, int(task_raw), page, restart_snapshot=True)
 
 
 @bot.on(New_Message(pattern=_DM_QUEUE_RU_PATTERN))
@@ -1170,10 +1270,12 @@ async def cmd_dm_queue_ru(event: callback_message) -> None:
         return
     match = getattr(event, "pattern_match", None)
     task_raw = match.group(1) if match else None
+    page_raw = match.group(2) if match else None
     if not task_raw:
         await _show_queue_task_picker(event)
         return
-    await _show_queue_page(event, int(task_raw), 0, restart_snapshot=True)
+    page = max(0, int(page_raw or 1) - 1)
+    await _show_queue_page(event, int(task_raw), page, restart_snapshot=True)
 
 
 @bot.on(Query(data=lambda d: re.fullmatch(rb"dm_queue_open_\d+", d) is not None))
