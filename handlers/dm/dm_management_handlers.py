@@ -11,6 +11,7 @@ from telethon import Button
 from config import ADMIN_ID_LIST, New_Message, Query, bot, callback_message, callback_query, conn
 from services.account_profiles import format_account_label
 from services.first_dm_modules import (
+    AI_QUICK_OFFER_MODULE,
     first_dm_module_label,
     normalize_first_dm_module,
 )
@@ -643,6 +644,7 @@ async def dm_module_manage(event: callback_query) -> None:
         buttons=[
             [Button.inline("🧩 Текущие фразы", f"dm_module_set_{task_id}_default".encode())],
             [Button.inline("👑 VIP Кирилла", f"dm_module_set_{task_id}_kirill_vip".encode())],
+            [Button.inline("🤖 AI Быстрый оффер", f"dm_module_set_{task_id}_{AI_QUICK_OFFER_MODULE}".encode())],
             [Button.inline("◀️ Назад", f"dm_task_{task_id}".encode())],
         ],
         parse_mode="html",

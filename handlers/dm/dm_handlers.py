@@ -94,11 +94,13 @@ from services.dm_task_queue import (
 )
 from services.first_message import choose_first_dm_text, is_random_first_dm_enabled
 from services.first_dm_modules import (
+    AI_QUICK_OFFER_MODULE,
     DEFAULT_FIRST_DM_MODULE,
     KIRILL_VIP_MODULE,
     first_dm_module_label,
     normalize_first_dm_module,
 )
+from services.first_message_ai_quick_offer import choose_ai_quick_offer_first_dm_text
 from services.first_message_kirill_vip import choose_kirill_vip_first_dm_text
 from services.menu_ui import render_menu
 from utils.database.database import create_dm_tables
@@ -489,6 +491,8 @@ async def _send_pending_row(row: dict) -> str:
         first_dm_module = normalize_first_dm_module(task.get("first_dm_module"))
         if first_dm_module == KIRILL_VIP_MODULE:
             outgoing_text = choose_kirill_vip_first_dm_text()
+        elif first_dm_module == AI_QUICK_OFFER_MODULE:
+            outgoing_text = choose_ai_quick_offer_first_dm_text()
         else:
             outgoing_text = (
                 choose_first_dm_text(task["post_text"] or "")
@@ -1109,6 +1113,7 @@ async def dm_pick_account(event: callback_query) -> None:
         buttons=[
             [Button.inline("🧩 Текущие фразы", b"dm_module_default")],
             [Button.inline("👑 VIP Кирилла", b"dm_module_kirill_vip")],
+            [Button.inline("🤖 AI Быстрый оффер", b"dm_module_ai_quick_offer")],
             [Button.inline("◀️ Назад", b"menu_dm_post")],
         ],
     )
@@ -1127,7 +1132,11 @@ def _build_chat_buttons(groups, selected):
     return buttons
 
 
-@bot.on(Query(data=lambda d: d in {b"dm_module_default", b"dm_module_kirill_vip"}))
+@bot.on(Query(data=lambda d: d in {
+    b"dm_module_default",
+    b"dm_module_kirill_vip",
+    b"dm_module_ai_quick_offer",
+}))
 async def dm_pick_first_message_module(event: callback_query) -> None:
     if event.sender_id not in ADMIN_ID_LIST:
         return
@@ -1135,11 +1144,12 @@ async def dm_pick_first_message_module(event: callback_query) -> None:
     if not st or st.get("step") != "pick_module":
         await event.answer("Начните заново через /dm_post", alert=True)
         return
-    module = (
-        KIRILL_VIP_MODULE
-        if event.data == b"dm_module_kirill_vip"
-        else DEFAULT_FIRST_DM_MODULE
-    )
+    if event.data == b"dm_module_kirill_vip":
+        module = KIRILL_VIP_MODULE
+    elif event.data == b"dm_module_ai_quick_offer":
+        module = AI_QUICK_OFFER_MODULE
+    else:
+        module = DEFAULT_FIRST_DM_MODULE
     st["first_dm_module"] = module
     st["step"] = "pick_chats"
     await render_menu(
@@ -1184,7 +1194,7 @@ async def dm_chats_done(event: callback_query) -> None:
         await event.answer("⚠ Выберите хотя бы один чат!", alert=True)
         return
     selected_module = normalize_first_dm_module(st.get("first_dm_module"))
-    if selected_module == KIRILL_VIP_MODULE or is_random_first_dm_enabled():
+    if selected_module in {KIRILL_VIP_MODULE, AI_QUICK_OFFER_MODULE} or is_random_first_dm_enabled():
         st["post_text"] = ""
         st["step"] = "delay_min"
         await render_menu(
@@ -1675,4 +1685,3 @@ async def menu_dm_stop_selected(event: callback_query) -> None:
         buttons=[[Button.inline("📋 К DM-задачам", b"menu_dm_list")]],
     )
     await event.answer("Остановлено")
-

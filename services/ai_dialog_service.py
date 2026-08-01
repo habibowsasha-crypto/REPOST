@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import hashlib
 import random
 import sqlite3
 from dataclasses import dataclass
@@ -29,14 +30,20 @@ from services.maxim_sales_funnel import (
     generate_post_link_plan,
     is_explicit_stop,
     is_human_takeover_request,
+    is_soft_decline,
     make_media_reaction_text,
     post_link_final_messages,
     validate_link_access_help,
 )
 from services.first_dm_modules import (
+    AI_QUICK_OFFER_MODULE,
     DEFAULT_FIRST_DM_MODULE,
     KIRILL_VIP_MODULE,
     normalize_first_dm_module,
+)
+from services.ai_quick_offer import (
+    QuickOfferGenerationError,
+    generate_quick_offer_plan,
 )
 from services.kirill_vip_funnel import (
     build_kirill_vip_plan,
@@ -121,6 +128,22 @@ def _claim_incoming_message(account_user_id: int, target_user_id: int, telegram_
         cursor.close()
 
 
+def _processed_incoming_count(account_user_id: int, target_user_id: int) -> int:
+    cursor = conn.cursor()
+    try:
+        row = cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM ai_processed_messages
+            WHERE account_user_id = ? AND target_user_id = ?
+            """,
+            (int(account_user_id), int(target_user_id)),
+        ).fetchone()
+        return int((row or [0])[0] or 0)
+    finally:
+        cursor.close()
+
+
 def _daily_dialog_limit_reached() -> bool:
     limit = _safe_int("AI_DAILY_DIALOG_LIMIT", 0, min_value=0)
     if limit <= 0:
@@ -150,6 +173,7 @@ HUMAN_WORDS_DEFAULT = "админ,оператор,человек,менедже
 # Per-user async locks protect against duplicate/parallel AI replies when several
 # DM tasks for the same account receive the same private message.
 _dialog_locks: WeakValueDictionary[tuple[int, int], asyncio.Lock] = WeakValueDictionary()
+_quick_offer_generation_lock = asyncio.Lock()
 
 
 def _get_dialog_lock(account_user_id: int, target_user_id: int) -> asyncio.Lock:
@@ -235,6 +259,17 @@ def create_ai_tables() -> None:
             used_at TEXT NOT NULL
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS ai_quick_offer_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_user_id INTEGER NOT NULL,
+            target_user_id INTEGER NOT NULL,
+            dialog_id INTEGER NOT NULL,
+            series_text TEXT NOT NULL,
+            series_fingerprint TEXT,
+            used_at TEXT NOT NULL
+        )
+    """)
     # Older installations may have been created before the UNIQUE constraint.
     # Merge duplicate dialog rows without losing their message history.
     duplicates = cursor.execute(
@@ -280,6 +315,10 @@ def create_ai_tables() -> None:
         "CREATE INDEX IF NOT EXISTS idx_ai_link_help_account_id "
         "ON ai_link_help_usage(account_user_id, id DESC)"
     )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ai_quick_offer_account_id "
+        "ON ai_quick_offer_usage(account_user_id, id DESC)"
+    )
 
     # Лёгкие миграции для старых БД.
     for table, col, ddl in [
@@ -290,12 +329,19 @@ def create_ai_tables() -> None:
         ("ai_dialogs", "contact_cycle_id", "ALTER TABLE ai_dialogs ADD COLUMN contact_cycle_id INTEGER"),
         ("ai_dialogs", "dialog_module", "ALTER TABLE ai_dialogs ADD COLUMN dialog_module TEXT NOT NULL DEFAULT 'default'"),
         ("ai_messages", "tokens_used", "ALTER TABLE ai_messages ADD COLUMN tokens_used INTEGER DEFAULT 0"),
+        ("ai_quick_offer_usage", "series_fingerprint", "ALTER TABLE ai_quick_offer_usage ADD COLUMN series_fingerprint TEXT"),
     ]:
         try:
             cursor.execute(ddl)
             conn.commit()
         except Exception:
             pass
+    conn.commit()
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_quick_offer_fingerprint "
+        "ON ai_quick_offer_usage(series_fingerprint) "
+        "WHERE series_fingerprint IS NOT NULL"
+    )
     conn.commit()
     cursor.close()
     migrate_legacy_closed_dialogs()
@@ -664,6 +710,65 @@ def _dialog_has_post_offer_apology(dialog_id: int) -> bool:
         cursor.close()
 
 
+def _recent_quick_offer_series(limit: int = 30) -> list[str]:
+    cursor = conn.cursor()
+    try:
+        rows = cursor.execute(
+            """
+            SELECT series_text
+            FROM ai_quick_offer_usage
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (max(1, min(30, int(limit))),),
+        ).fetchall()
+        return [str(row[0]) for row in reversed(rows) if str(row[0] or "").strip()]
+    finally:
+        cursor.close()
+
+
+def _record_quick_offer_series(dialog: DialogRow, messages: list[str]) -> None:
+    series_text = "\n".join(message.strip() for message in messages if message.strip())
+    if not series_text:
+        return
+    fingerprint_source = " ".join(series_text.lower().replace("ё", "е").split())
+    fingerprint = hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            INSERT INTO ai_quick_offer_usage
+                (account_user_id, target_user_id, dialog_id, series_text,
+                 series_fingerprint, used_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                dialog.account_user_id,
+                dialog.target_user_id,
+                dialog.id,
+                series_text,
+                fingerprint,
+                _now_iso(),
+            ),
+        )
+        cursor.execute(
+            """
+            DELETE FROM ai_quick_offer_usage
+            WHERE id NOT IN (
+                  SELECT id FROM ai_quick_offer_usage
+                  ORDER BY id DESC
+                  LIMIT 240
+              )
+            """,
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+
+
 def _post_offer_apology() -> str:
     default = "Понял, извини, что побеспокоил. Больше писать не буду."
     return config("AI_POST_OFFER_APOLOGY", default=default).strip() or default
@@ -947,6 +1052,73 @@ async def _send_maxim_plan(
     return True
 
 
+async def _send_quick_offer_plan(
+    *,
+    dialog: DialogRow,
+    client: TelegramClient,
+    sender: User,
+    plan: FunnelPlan,
+    incoming_checkpoint: int,
+) -> tuple[bool, int, bool]:
+    """Send the reactive series and stop when a newer user reply arrives.
+
+    ai_processed_messages is claimed before the per-dialog lock, so this sender
+    can see a new Telegram message even while its handler is waiting for the
+    current series lock.
+    """
+    if ai_dry_run():
+        for index, message in enumerate(plan.messages, start=1):
+            logger.info(
+                f"[AI DM DRY RUN quick offer] user={sender.id} "
+                f"message={index}: {message}"
+            )
+            _save_message(
+                dialog.id,
+                "system",
+                f"[DRY RUN quick offer message={index}] {message}",
+                provider="dry_run",
+                model=plan.model,
+                tokens_used=plan.tokens_used if index == 1 else 0,
+            )
+        return False, 0, False
+
+    sent_count = 0
+    for index, message in enumerate(plan.messages, start=1):
+        current_incoming = _processed_incoming_count(
+            dialog.account_user_id, dialog.target_user_id
+        )
+        if current_incoming > incoming_checkpoint:
+            if sent_count:
+                _set_stage(dialog.id, "quick_offer_interrupted")
+            logger.info(
+                f"[AI DM] quick offer interrupted by new reply: dialog={dialog.id}, "
+                f"user={sender.id}, sent={sent_count}"
+            )
+            return False, sent_count, True
+
+        sent = await _safe_send_message(
+            client, sender, message, f"ai_quick_offer_{index}"
+        )
+        if not sent:
+            _set_dialog_status(
+                dialog.id, "send_error", "telegram_send_failed", stage="send_error"
+            )
+            return False, sent_count, False
+        _save_message(
+            dialog.id,
+            "outgoing",
+            message,
+            provider="openai",
+            model=plan.model,
+            tokens_used=plan.tokens_used if index == 1 else 0,
+        )
+        _mark_outgoing(dialog.id)
+        sent_count += 1
+        if index < len(plan.messages):
+            await _burst_delay()
+    return True, sent_count, False
+
+
 async def _send_stop_reply(
     *, dialog: DialogRow, client: TelegramClient, sender: User
 ) -> None:
@@ -1179,6 +1351,99 @@ async def handle_private_incoming(
             )
             logger.info(
                 f"[AI DM] human takeover: dialog={dialog.id}, user={sender.id}"
+            )
+            return
+
+        if (
+            normalize_first_dm_module(dialog.dialog_module)
+            == AI_QUICK_OFFER_MODULE
+            and not offer_already_sent
+            and dialog.stage != "quick_offer_interrupted"
+        ):
+            if is_soft_decline(text):
+                plan = FunnelPlan(
+                    action="soft_decline",
+                    next_stage="completed",
+                    close_after=True,
+                    messages=["Понял, без проблем. Не буду навязывать."],
+                    model="local_quick_offer_decline",
+                )
+                sent = await _send_maxim_plan(
+                    dialog=dialog, client=client, sender=sender, plan=plan
+                )
+                if sent:
+                    _finalize_completed_dialog(dialog, "completed_no_interest")
+                return
+
+            incoming_checkpoint = _processed_incoming_count(
+                dialog.account_user_id, dialog.target_user_id
+            )
+            await _reply_delay()
+            dialog = _get_dialog_by_id(dialog.id) or dialog
+            if dialog.status != "active" or _dialog_has_sent_offer(dialog.id):
+                return
+            if _processed_incoming_count(
+                dialog.account_user_id, dialog.target_user_id
+            ) > incoming_checkpoint:
+                logger.info(
+                    f"[AI DM] quick offer generation skipped because a newer reply "
+                    f"arrived: dialog={dialog.id}, user={sender.id}"
+                )
+                return
+
+            history = _current_cycle_history(dialog.id)
+            try:
+                async with _quick_offer_generation_lock:
+                    recent_series = _recent_quick_offer_series()
+                    quick_plan = await generate_quick_offer_plan(
+                        history=history,
+                        source_chat_title=dialog.source_chat_title,
+                        recent_series=recent_series,
+                    )
+                    if not ai_dry_run():
+                        _record_quick_offer_series(dialog, quick_plan.messages)
+            except QuickOfferGenerationError as exc:
+                _set_stage(dialog.id, "ai_quick_offer_generation_wait")
+                logger.warning(
+                    f"[AI DM] quick offer not sent: dialog={dialog.id}, "
+                    f"user={sender.id}, reason={exc}"
+                )
+                return
+            except Exception as exc:
+                _set_stage(dialog.id, "ai_quick_offer_generation_wait")
+                logger.error(
+                    f"[AI DM] quick-offer generation error: dialog={dialog.id}, "
+                    f"user={sender.id}: {exc}"
+                )
+                return
+
+            plan = FunnelPlan(
+                action="ai_quick_offer",
+                next_stage="post_link_active",
+                close_after=False,
+                messages=quick_plan.messages,
+                tokens_used=quick_plan.tokens_used,
+                model=quick_plan.model,
+            )
+            sent, _, _ = await _send_quick_offer_plan(
+                dialog=dialog,
+                client=client,
+                sender=sender,
+                plan=plan,
+                incoming_checkpoint=incoming_checkpoint,
+            )
+            if not sent:
+                return
+            _set_dialog_status(
+                dialog.id,
+                "active",
+                "link_sent_waiting_final",
+                stage="post_link_active",
+            )
+            mark_contact_link_sent(dialog.contact_cycle_id)
+            logger.info(
+                f"[AI DM] quick offer series sent: dialog={dialog.id}, "
+                f"user={sender.id}, messages={len(quick_plan.messages)}"
             )
             return
 
