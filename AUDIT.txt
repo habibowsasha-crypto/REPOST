@@ -1,0 +1,553 @@
+LIKEBOT v1.0.44b — STEP 12 LIVE FIVE-POST CONVERSATION HOTFIX
+ПОДРОБНЫЙ АУДИТ КАНДИДАТА
+============================================================
+
+Дата сборки: 02.08.2026
+Исходная подтверждённая база: LikeBot v1.0.44a
+Исходный архив: LikeBot_v1.0.44a_STEP12_DIALOGUE_NATURALNESS_HOTFIX_CANDIDATE.zip
+SHA-256 исходного архива:
+946ac7f0afe9d50425bac1760288891c33954ebf1552c1e4317786709a95b578
+
+Новая версия: LikeBot v1.0.44b
+Этап: шаг 12 — hotfix живых разговоров по контексту пяти постов
+Статус: локальный кандидат; требуется Railway startup и новый live dialogue test
+
+1. ПРИЧИНА HOTFIX
+-----------------
+
+Живой тест v1.0.44a показал, что формальные клише частично убраны, но модель всё
+ещё строит точные вопросы и ответы как справочная служба. Владелец уточнил цель:
+аккаунты должны вести обычный разговор с учётом пяти последних постов, иногда
+шутить, обсуждать соседние темы и не обязаны решать вопрос полностью.
+
+2. ВНЕСЁННЫЕ ИЗМЕНЕНИЯ
+----------------------
+
+- prompt `dialogue-reply-v3`; validator `dialogue-reply-validator-v3`;
+- отдельный `last_five_posts`: текущий плюс до четырёх ближайших предыдущих;
+- режимы хода: casual reaction, light joke, short opinion, channel observation,
+  casual reply, partial answer, banter, nearby topic, agreement with twist,
+  soft finish;
+- шутка, эмоция и субъективное мнение разрешены без factual_claims;
+- вопрос и полный полезный ответ не являются обязательными;
+- разрешён ограниченный тематический дрейф внутри последних пяти публикаций;
+- добавлен validator helpdesk/script-фраз и точных шаблонных вопросов;
+- сохранены provenance, запрет выдуманных фактов, dedup и ручное принятие.
+
+3. НЕ ИЗМЕНЕНО
+--------------
+
+- schema v4 и 28 таблиц;
+- daily/bonus quotas и сброс в 00:00;
+- finite plan и exact reply graph;
+- OpenAI model/config;
+- отсутствие Telegram publication;
+- Railway variables и миграции БД.
+
+4. ЛОКАЛЬНЫЕ ПРОВЕРКИ
+---------------------
+
+- compileall: пройден;
+- тесты live conversation prompt/validator: 8/8 пройдены;
+- pure Step 12 tests: 4/4 + 3 subtests пройдены;
+- repository tests не запускались: в текущем окружении отсутствует aiosqlite;
+- Ruff не запускался: executable отсутствует;
+- live OpenAI/Railway test требуется после deploy.
+
+5. ГРАНИЦЫ
+----------
+
+Публикация по-прежнему физически отсутствует. Новый prompt применяется только к
+новым генерациям. Старые диалоги и черновики не переписываются.
+
+============================================================
+ИСТОРИЧЕСКИЙ АУДИТ v1.0.44a НИЖЕ
+============================================================
+
+LIKEBOT v1.0.44a — STEP 12 DIALOGUE NATURALNESS HOTFIX
+ПОДРОБНЫЙ АУДИТ КАНДИДАТА
+=========================================================
+
+Дата сборки: 02.08.2026
+Исходная подтверждённая база: LikeBot v1.0.44
+Исходный архив: LikeBot_v1.0.44_STEP12_CONNECTED_DIALOGUES_CANDIDATE.zip
+SHA-256 исходного архива:
+caa6dde04d9911916fa44dba3b2c40fbf2c94f8aa62980d1fb6ab470d1ee8140
+
+Новая версия: LikeBot v1.0.44a
+Этап: шаг 12 — hotfix естественности связанных AI-диалогов
+Статус: локальный кандидат; требуется Railway startup и новый live draft-dialogue test
+
+1. ПРИЧИНА HOTFIX
+-----------------
+
+Живой тест v1.0.44 подтвердил thread graph, reply_to и ручное принятие, но
+показал неестественный стиль: повтор вопроса, одинаковый голос профилей,
+канцелярские обороты и формальное резюме вместо живой переписки. Поэтому шаг 12
+не был принят по качеству.
+
+2. ВНЕСЁННЫЕ ИЗМЕНЕНИЯ
+----------------------
+
+- `dialogue-reply-v1` заменён на `dialogue-reply-v2`;
+- schema Structured Output не менялась: `dialogue-reply-schema-v1`;
+- validator обновлён до `dialogue-reply-validator-v2`;
+- в prompt/input передаётся полный голос профиля: role, knowledge level, tone,
+  vocabulary, sentence pattern, punctuation, uppercase mode, mistake level,
+  favorite words, длина и вероятностные параметры;
+- добавлена позиционная цель реплики и отдельное правило для финального хода;
+- модель обязана добавить новый смысл или вернуть skip;
+- запрещены формальные обороты, найденные в live-тесте;
+- validator блокирует exact duplicate, token similarity, content containment,
+  повтор уже заданного вопроса и канцелярские клише;
+- версия validator сохраняется без hard-coded старого значения;
+- добавлены regression-тесты на реальные неудачные примеры и живой допустимый
+  ответ.
+
+3. НЕ ИЗМЕНЕНО
+--------------
+
+- БД и schema v4;
+- дневные и bonus quotas;
+- finite plan и exact reply graph;
+- OpenAI model/config;
+- отсутствие Telegram publication;
+- все AI-флаги и Railway variables.
+
+Миграция БД не требуется. `AI_PUBLICATION_ENABLED=false`. Старые черновики
+prompt v1 остаются историческими; для проверки создаётся новый диалог.
+
+4. ПРОВЕРКИ HOTFIX
+------------------
+
+- Python compile/tabnanny: выполнено;
+- pure Step 12 + naturalness tests: выполнено;
+- secret scan и manifest verification: выполняются при сборке;
+- полный pytest и live PostgreSQL: требуют release/Railway окружение;
+- живой OpenAI-тест v2: ожидается после deploy.
+
+======================================================================
+ИСТОРИЧЕСКИЙ АУДИТ v1.0.44
+======================================================================
+
+LIKEBOT v1.0.44 — STEP 12 CONNECTED DIALOGUES AND DAILY QUOTAS
+ПОДРОБНЫЙ АУДИТ КАНДИДАТА
+==============================================================
+
+Дата сборки: 02.08.2026
+Исходная подтверждённая база: LikeBot v1.0.43
+Исходный архив: LikeBot_v1.0.43_STEP11_SINGLE_DRAFT_CANDIDATE.zip
+SHA-256 исходного архива:
+024165c4b63547a6f439e29c4f5925104e618efd6e6fff37c0272e1ca045c4b5
+
+Новая версия: LikeBot v1.0.44
+Этап: шаг 12 — конечные связанные AI-диалоги и суточные лимиты аккаунтов
+Статус: локальный кандидат для Railway smoke и ручного live draft-dialogue test
+
+======================================================================
+1. ГРАНИЦЫ ВЫПОЛНЕННОЙ РАБОТЫ
+======================================================================
+
+Реализован шаг 12 утверждённого плана LikeBot AI Comments:
+
+- finite thread state machine;
+- 2-5 выбранных профилей;
+- 2-5 запланированных реплик;
+- точный reply graph;
+- полная уже одобренная ветка в контексте каждой следующей реплики;
+- отдельный generation job для одной следующей реплики;
+- ручное accept/reject;
+- cancellation;
+- max_messages и expires_at;
+- проверка stale/deleted root post и reply target;
+- локальная semantic-like token dedup проверка;
+- отдельный UI создания и просмотра диалога;
+- schema migration v3 -> v4;
+- дневной лимит комментариев каждого профиля;
+- bounded бонусные слоты для ответа на реальный внешний reply;
+- календарный reset в 00:00 выбранного часового пояса.
+
+Физически НЕ реализовано и НЕ включено:
+
+- отправка комментария или диалога в Telegram;
+- publication queue/worker;
+- автоматическая цепочка реплик;
+- Telegram observer входящих комментариев в production;
+- автоматическое связывание внешнего reply с опубликованным сообщением;
+- атомарное списание обычного/bonus slot в production publication transaction;
+- массовая генерация;
+- шаг 13 quality pipeline;
+- шаг 14 полный edit/regenerate review workflow;
+- шаг 15 budgets/publication/recovery;
+- шаг 16 pilot/release.
+
+AI_PUBLICATION_ENABLED должен оставаться false.
+
+======================================================================
+2. КОНЕЧНЫЙ ДИАЛОГ
+======================================================================
+
+Новые модули:
+
+- laika_bot/ai_dialogues.py;
+- laika_bot/ai_dialogues_repository.py;
+- laika_bot/ai_dialogues_handlers.py.
+
+План диалога:
+
+- от 2 до 5 уникальных профилей;
+- от 2 до 5 реплик;
+- первая реплика отвечает на root post;
+- в пилоте каждая следующая реплика отвечает на непосредственно предыдущую;
+- профили циклически распределяются по конечному plan;
+- один root post допускает один активный/сохранённый thread в этом пилоте;
+- план сериализуется и валидируется до записи.
+
+State machine:
+
+- planned — готов к следующей генерации;
+- generating — один запрос выполняется;
+- review — одна следующая реплика ожидает решения администратора;
+- completed — max_messages достигнут;
+- cancelled — диалог отменён.
+
+Перед каждой генерацией повторно проверяются:
+
+- thread status и next_position;
+- expires_at;
+- root post существует, не удалён и имеет прежние revision/hash;
+- current profile совпадает с планом и доступен;
+- предыдущие позиции существуют, одобрены и не имеют разрывов;
+- reply target существует и относится к тому же thread;
+- отсутствует другой pending draft.
+
+Каждая следующая реплика получает:
+
+- root post;
+- профиль канала;
+- текущий account profile;
+- ограниченные recent posts/knowledge chunks шага 11;
+- все предыдущие одобренные реплики ветки;
+- точный reply_to_ref;
+- тему и конечную позицию thread.
+
+Structured Output использует:
+
+- prompt version: dialogue-reply-v1;
+- schema version: dialogue-reply-schema-v1;
+- validator version: dialogue-reply-validator-v1.
+
+Результат всё ещё является только AICommentDraft. Accept создаёт локальную
+approved AICommentMessage с role=draft и не создаёт Telegram job.
+
+======================================================================
+3. ДНЕВНОЙ ЛИМИТ И БОНУСНЫЕ МЕСТА
+======================================================================
+
+Базовый лимит:
+
+- используется существующий profile.daily_limit;
+- учитываются только AICommentMessage role=published с published_at внутри
+  текущего локального календарного дня;
+- draft/approved/rejected/external строки не расходуют базовый лимит;
+- cooldown сохраняется и применяется после проверки quota.
+
+Бонусный reply pool:
+
+- новое versioned поле reply_bonus_slots хранится внутри style_json профиля;
+- default = 3;
+- допустимый диапазон = 0-20;
+- значение редактируется в UI профиля вместе с лимитами;
+- старые 8-строчные формы совместимы и получают default 3;
+- 9-я строка формы задаёт явное значение.
+
+Правила выдачи:
+
+- grant возможен только после реального внешнего reply на role=published
+  комментарий конкретного профиля;
+- один bounded pool выдаётся не более одного раза на profile + local day;
+- повторная доставка того же или другого reply в тот же день не наращивает
+  quota бесконечно;
+- idempotency key grant: profile + day_key.
+
+Правила расхода:
+
+- bonus slot разрешён только для reply-context;
+- обычный новый комментарий bonus не использует;
+- bonus начинает расходоваться только когда comments_today >= daily_limit;
+- каждое использование равно одному slot;
+- PostgreSQL сериализует конкурентные consumers через SELECT FOR UPDATE;
+- repeated acknowledgement идемпотентен по profile/thread/source message;
+- изменение reply_bonus_slots вниз ограничивает доступный pool текущим limit.
+
+Reset:
+
+- AI_COMMENTS_TIMEZONE=Europe/Moscow по умолчанию;
+- timestamps в БД остаются UTC;
+- query вычисляет UTC-границы локального календарного дня;
+- day_key меняется ровно в 00:00 указанного timezone;
+- отдельный reset worker не нужен;
+- старые comments/grants/uses автоматически перестают участвовать в новом дне.
+
+Важное ограничение:
+
+Step 12 содержит repository hook record_ai_external_reply и quota ledger, но
+production observer ещё не подключён, потому что публикация отсутствует. В Step
+15 observer должен идентифицировать реальный Telegram reply, вызвать grant, а
+publication transaction должна повторно проверить eligibility и атомарно
+списать base/bonus quota непосредственно перед отправкой.
+
+======================================================================
+4. СХЕМА БД И МИГРАЦИЯ
+======================================================================
+
+AI_COMMENTS_SCHEMA_VERSION: 4.
+
+Добавлены две таблицы:
+
+1. ai_comment_thread_plans
+   - one-to-one thread plan;
+   - root revision/hash;
+   - participant IDs;
+   - exact message plan;
+   - next_position/accepted_messages;
+   - intervals, topic, cancel reason, optimistic version.
+
+2. ai_comment_quota_events
+   - reply_bonus_grant / reply_bonus_use;
+   - profile/thread/day_key;
+   - slots;
+   - source Telegram message ID;
+   - unique idempotency key.
+
+Итоговая fresh schema:
+
+- 11 core tables;
+- 17 AI tables;
+- всего 28 tables.
+
+Upgrade поддерживает schema v1/v2/v3 -> v4 и является повторно запускаемым.
+Существующие данные не переписываются. Подробности:
+
+- migrations/AI_COMMENTS_SCHEMA_V4.md.
+
+Rollback token обновлён:
+
+DROP_AI_COMMENTS_SCHEMA_V4
+
+Production rollback без удаления данных: выключить AI flags и вернуть код
+v1.0.43; лишние v4 tables старая версия не использует.
+
+======================================================================
+5. RAILWAY VARIABLES
+======================================================================
+
+Новые optional variables:
+
+AI_DIALOGUE_MAX_MESSAGES=5
+AI_DIALOGUE_MIN_INTERVAL_SECONDS=60
+AI_DIALOGUE_MAX_INTERVAL_SECONDS=600
+AI_DIALOGUE_EXPIRES_HOURS=24
+AI_COMMENTS_TIMEZONE=Europe/Moscow
+
+Bounded validation:
+
+- max messages: 2-5;
+- intervals: 0-86400 sec, min <= max;
+- expires: 1-168 hours;
+- timezone: существующий IANA ZoneInfo.
+
+Для первого startup:
+
+OPENAI_GATEWAY_ENABLED=false
+AI_COMMENTS_ENABLED=false
+AI_GENERATION_ENABLED=false
+AI_DIALOGUES_ENABLED=false
+AI_PUBLICATION_ENABLED=false
+AI_DEBUG_SNAPSHOTS_ENABLED=false
+AI_COMMENTS_MODE=preview_only
+
+После чистого startup для одного ручного test dialogue:
+
+OPENAI_GATEWAY_ENABLED=true
+AI_COMMENTS_ENABLED=true
+AI_GENERATION_ENABLED=true
+AI_DIALOGUES_ENABLED=true
+AI_PUBLICATION_ENABLED=false
+AI_DEBUG_SNAPSHOTS_ENABLED=false
+
+Также в DB UI должны быть включены comments, generation и dialogues.
+
+======================================================================
+6. UI
+======================================================================
+
+Маршрут:
+
+💬 Комментарии
+→ 🗣 Создать диалог
+→ выбрать публикацию
+→ выбрать 2-5 профилей
+→ выбрать 2-5 реплик
+→ подтвердить конечный план
+→ ✨ Создать следующую реплику
+→ принять или отклонить draft
+
+UI показывает:
+
+- thread ID/status;
+- root post;
+- позиции и выбранные профили;
+- exact reply relationship;
+- accepted/maximum messages;
+- pending draft;
+- дневной счётчик профиля;
+- base daily limit;
+- configurable reply bonus;
+- reset timezone.
+
+Публикационной кнопки нет.
+
+======================================================================
+7. БЕЗОПАСНОСТЬ И ИЗОЛЯЦИЯ
+======================================================================
+
+Сохранены гарантии шагов 10-11:
+
+- OpenAI key только из environment;
+- store=false;
+- bounded timeout/retry;
+- safe error classification;
+- raw prompt/output/exception не логируются;
+- AI module отключается flags;
+- ошибки AI не останавливают reaction/view/join workers;
+- текущий пост перепроверяется по revision/hash;
+- profile metadata не считается factual evidence;
+- чужие каналы не смешиваются;
+- unconfirmed callback не вызывает OpenAI;
+- один generation lock;
+- Telegram publication path отсутствует.
+
+Дополнительно:
+
+- thread конечный;
+- stale/deleted reply target блокируется;
+- повторная похожая реплика отклоняется;
+- quota grant/use имеют idempotency;
+- reset не требует destructive UPDATE;
+- callback namespace остаётся aic: и проверяется на Telegram limit.
+
+======================================================================
+8. ФАКТИЧЕСКИЕ ПРОВЕРКИ
+======================================================================
+
+Проверки выполнялись в локальной среде Python 3.13 с test-only compatibility
+stubs для отсутствующих в mirror aiogram/Telethon/aiosqlite/OpenAI. Stubs
+находятся только в /tmp и не входят в source tree или ZIP.
+
+Подтверждено:
+
+- SHA-256 исходного v1.0.43 совпадает;
+- compileall: PASS;
+- tabnanny: PASS;
+- source secret scan: PASS;
+- dedicated Step 12: 10 tests PASS + 3 subtests;
+- full regression batch 1: 65 PASS;
+- full regression batch 2: 124 PASS;
+- full regression batch 3: 172 PASS;
+- full regression batch 4 (без environment-only v136 check): 135 PASS;
+- совокупно: 498 PASS из 499 tests;
+- Step 12 repository flow на SQLite: create → context → draft → accept → next;
+- bonus pool: grant once/day, use 3, fourth rejected, midnight reset;
+- schema v3 -> v4 preserves settings and adds only Step 12 tables.
+
+Оставшееся локальное ограничение:
+
+- exact dependency runtime test ожидает cryptography==50.0.0;
+- локально установлен cryptography 46.0.4;
+- 2 проверки модуля v136 прошли, 1 test отмечается failed из-за environment mismatch;
+- requirements hash-lock остаётся на 50.0.0 и должен устанавливаться чистым
+  Railway Docker build.
+
+Не выполнено:
+
+- Ruff отсутствует в environment;
+- live PostgreSQL server;
+- Railway deploy v1.0.44;
+- реальный OpenAI dialogue request;
+- Telegram publication/observer test, поскольку path отсутствует;
+- проверка реального reset ровно в полночь длительным production-run.
+
+Поэтому VERIFY кандидата не должен называться окончательным production release.
+
+======================================================================
+9. НАЙДЕННЫЕ И ИСПРАВЛЕННЫЕ РИСКИ
+======================================================================
+
+1. Первый вариант мог потерять custom reply_bonus_slots при повторной
+   нормализации style_json. Исправлено: поле валидируется и сохраняется внутри
+   canonical style; добавлена DB regression проверка значения 7.
+
+2. External role мог ошибочно сдвинуть next_position диалога. Исправлено:
+   thread plan считает только role=draft accepted messages.
+
+3. Одновременные bonus consumers могли увидеть один доступный slot. Исправлено:
+   profile row блокируется FOR UPDATE, grants/uses перечитываются в transaction.
+
+4. Повторный внешний reply мог бесконечно увеличивать daily bonus. Исправлено:
+   один grant idempotency key на profile/day и cap текущим reply_bonus_slots.
+
+5. Reset worker создавал бы риск пропущенного/двойного обнуления. Не добавлен:
+   календарный day window вычисляется в каждом query.
+
+6. Raw exception в UI мог раскрыть внутренние детали. Generic generation errors
+   заменены безопасным сообщением.
+
+======================================================================
+10. RAILWAY ПОРЯДОК ПРИЁМКИ
+======================================================================
+
+1. Backup PostgreSQL и Railway Variables.
+2. Одна replica.
+3. Deploy полного v1.0.44 candidate со всеми AI flags false.
+4. Проверить лог:
+   - LikeBot v1.0.44 starting;
+   - OpenAI gateway initialized enabled=False;
+   - Start polling;
+   - отсутствие Traceback/ERROR migration.
+5. Открыть профили и проверить поля daily limit/bonus/reset timezone.
+6. Включить Railway gateway/comments/generation/dialogues, publication=false.
+7. В UI БД включить comments/generation/dialogues.
+8. Создать конечный диалог из двух профилей и двух реплик.
+9. Сгенерировать первую реплику и принять её.
+10. Сгенерировать вторую; проверить, что она отвечает на первую и видит ветку.
+11. Принять/отклонить; убедиться, что в Telegram-канале ничего не опубликовано.
+12. Вернуть gateway/generation/dialogues false после теста.
+
+======================================================================
+11. СТАТУС ПЛАНА
+======================================================================
+
+Шаг 7  — завершён.
+Шаг 8  — завершён.
+Шаг 9  — завершён.
+Шаг 10 — завершён живым Railway DEV test.
+Шаг 11 — завершён живым Railway draft test.
+Шаг 12 — кодовый кандидат v1.0.44; ожидает Railway smoke/live draft dialogue.
+Шаг 13 — не начат.
+Шаг 14 — не начат.
+Шаг 15 — не начат.
+Шаг 16 — не начат.
+
+======================================================================
+12. ВЫВОД
+======================================================================
+
+LikeBot v1.0.44 реализует конечные связанные AI-диалоги только через ручные
+черновики и добавляет контролируемые суточные лимиты с максимум тремя бонусными
+reply slots по умолчанию. Бонус открывается при реальном ответе, не растёт
+бесконечно и переключается на новый day_key в 00:00 выбранного timezone.
+
+Кандидат не публикует комментарии. Production observer и окончательное
+атомарное quota enforcement должны быть завершены вместе с publication queue на
+шаге 15. До Railway smoke версия остаётся кандидатом, а не релизом.

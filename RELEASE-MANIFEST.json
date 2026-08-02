@@ -1,0 +1,649 @@
+{
+  "archive_root": "laika_bot_v1_0_44b_step12_live_conversation_hotfix_candidate",
+  "files": [
+    {
+      "path": ".dockerignore",
+      "sha256": "f8ff18f6a90b6d43172dae963b1211212830fa39968c7cf0593dd7e4b7a89804",
+      "size": 230
+    },
+    {
+      "path": ".env.example",
+      "sha256": "e1bab55a8f591225b8f586378c42d8a70c094a40b25f94695762b289e4fe93c5",
+      "size": 3665
+    },
+    {
+      "path": ".github/workflows/release-validation.yml",
+      "sha256": "e2c057ed0b6767d489f2c0783b8c6a802b1a0478de6a85328d956fc6a15b4647",
+      "size": 1728
+    },
+    {
+      "path": ".gitignore",
+      "sha256": "c6b76494b2f28bdad9c9dc154b54e9ae1fe59c4b02591e56983f216bbc0f8b01",
+      "size": 103
+    },
+    {
+      "path": "AUDIT.txt",
+      "sha256": "a9551c73cc885592018d2f0a4c71629492562a237ee111012133635f3e6d07dd",
+      "size": 26978
+    },
+    {
+      "path": "CHANGELOG.md",
+      "sha256": "0ad5767b54e448c3716b448514edb77237c0672254a32e73c8db3a3f67f3a486",
+      "size": 112848
+    },
+    {
+      "path": "Dockerfile",
+      "sha256": "d7d98c7784cc03bdfa31b4db90c0e8b7880dc67d44121a06c2ed25e76e787c60",
+      "size": 264
+    },
+    {
+      "path": "LIKEBOT_AI_COMMENTS_FULL_HANDOFF_PLAN_v1_2.txt",
+      "sha256": "26d6984f5aa629d8eb640d12643094453964926d5752aba87141aa6614f5ba8d",
+      "size": 83302
+    },
+    {
+      "path": "Procfile",
+      "sha256": "3b914e44fb41057c80a6c63bbab33f7add10d1c8138fea7165c7d9b5ca87f33d",
+      "size": 32
+    },
+    {
+      "path": "README.md",
+      "sha256": "84763f77174c6735b2f3276c3365c250fcb108775bd40181e9a66278eaa1b0c3",
+      "size": 108332
+    },
+    {
+      "path": "laika_bot/__init__.py",
+      "sha256": "cfda88d4ea1b54f42899432f25986ecb5453a3682b5680a4e11d8a474cc2aad8",
+      "size": 48
+    },
+    {
+      "path": "laika_bot/ai_account_profiles.py",
+      "sha256": "b5fa07ba27fe19666cf6e540d19c79b069298e67e6720c99470c95fce4d46c78",
+      "size": 29616
+    },
+    {
+      "path": "laika_bot/ai_account_profiles_handlers.py",
+      "sha256": "e6e4195044456936e249045aaa3d8d818f7964a447b3f7326cd4b8693458b9d8",
+      "size": 41732
+    },
+    {
+      "path": "laika_bot/ai_account_profiles_keyboards.py",
+      "sha256": "f641eea5e3a79adee1e9f418684c4e25250e1f56cb6d1825e6787ade94bc5ceb",
+      "size": 6671
+    },
+    {
+      "path": "laika_bot/ai_account_profiles_repository.py",
+      "sha256": "a5a8a7dae6df992df45ef7d53cf01ecf54a416d67829a53bf45a921c1ff70247",
+      "size": 45562
+    },
+    {
+      "path": "laika_bot/ai_channel_memory.py",
+      "sha256": "4607999f85274190461582d85d96502a75ba3e291eba31df072b4a7c34865472",
+      "size": 16212
+    },
+    {
+      "path": "laika_bot/ai_channel_memory_handlers.py",
+      "sha256": "00f091cf54052c89a3b1bdb1bcf034457794c8755cd8c94f937d16787e3c3d28",
+      "size": 40704
+    },
+    {
+      "path": "laika_bot/ai_comment_generation.py",
+      "sha256": "fa4781c12a2f3f5fd50f34d8cd44d42a7ba0cc13664b63f5dc974671d9da92ec",
+      "size": 26628
+    },
+    {
+      "path": "laika_bot/ai_comment_generation_handlers.py",
+      "sha256": "1c482093a86572b793c90e4e5185fafc1f69d2e6e6a62d7e4e9b68d4c75bc1a0",
+      "size": 30107
+    },
+    {
+      "path": "laika_bot/ai_comment_generation_repository.py",
+      "sha256": "2a384e2172a89fa7dad3622d9d00d7857b3ba13043ffb1adf9870b7610622715",
+      "size": 20755
+    },
+    {
+      "path": "laika_bot/ai_comments_handlers.py",
+      "sha256": "ee2c80feaba28de678350cd7087e165328011eea642c20029bffb30bf22300b5",
+      "size": 24692
+    },
+    {
+      "path": "laika_bot/ai_comments_keyboards.py",
+      "sha256": "ef2a33dd9fbe7e59c28028a2a8d2bf6e53081dd09e226edc401d5bb4e544edb2",
+      "size": 26464
+    },
+    {
+      "path": "laika_bot/ai_comments_migration.py",
+      "sha256": "4a466ac74791bc7ff8e33de7b202ba57ccfeb2f9ad4a5fb044728306487a83e8",
+      "size": 25960
+    },
+    {
+      "path": "laika_bot/ai_comments_models.py",
+      "sha256": "6fcd892fe63b660cc81e5d2a4954b46685bf880caaaa3c30ee858370b1cf2d08",
+      "size": 46663
+    },
+    {
+      "path": "laika_bot/ai_comments_repository.py",
+      "sha256": "c4055da0e1143b1981e316b8850a4c78f7ddffce099e7937f89268e315a26482",
+      "size": 50556
+    },
+    {
+      "path": "laika_bot/ai_comments_states.py",
+      "sha256": "074425b66c06e7252eae2fd28b7b093014d4eb87fadf567032791ac494b0adb7",
+      "size": 1228
+    },
+    {
+      "path": "laika_bot/ai_comments_ui.py",
+      "sha256": "b6d8319f969726a0b2070523be8c4bbf86dc70dce59ba8f1518e68df0e6058c6",
+      "size": 1087
+    },
+    {
+      "path": "laika_bot/ai_dialogues.py",
+      "sha256": "55683dd0f8fe07c5ed1549007bb6bf65800fe328ba31f8848c938229bcc7535c",
+      "size": 29010
+    },
+    {
+      "path": "laika_bot/ai_dialogues_handlers.py",
+      "sha256": "90e106e6fabfba24982e07105e45561ad00e47e7408ee01436197389ab072576",
+      "size": 38552
+    },
+    {
+      "path": "laika_bot/ai_dialogues_repository.py",
+      "sha256": "a99b54a38eca612c233babcd6ae1e4c061192af9f101fe3048b0bb6b1bb7642a",
+      "size": 34402
+    },
+    {
+      "path": "laika_bot/alerts.py",
+      "sha256": "ccb4455f1b1752905c63b7d35bbda3311a1e625c7adb4f44e60a94dac9464606",
+      "size": 33219
+    },
+    {
+      "path": "laika_bot/analytics.py",
+      "sha256": "45207096dedcdedab903eb0a0c81acbe05e2a4bea2c76b98b28ab4ebea8ab2fe",
+      "size": 14389
+    },
+    {
+      "path": "laika_bot/app.py",
+      "sha256": "49b695c494663d8feadcd40f4e73f36d0ccff0e28c6ea0fb60f76c2ba40eb82d",
+      "size": 7520
+    },
+    {
+      "path": "laika_bot/backup.py",
+      "sha256": "4bd2f4e1499f44d90d777108b2c81c800c685f1e5021859417e9ecef5eeb254f",
+      "size": 23884
+    },
+    {
+      "path": "laika_bot/channel_profiles.py",
+      "sha256": "1b49d73958744c608577f896bfcc8b08cc0132951f7fa209ab26fba00c23bfa3",
+      "size": 8258
+    },
+    {
+      "path": "laika_bot/config.py",
+      "sha256": "dff4b7a805e2241b1066759f4a6e1ebeaa7ffa868bb4260ee87642c466c07202",
+      "size": 15755
+    },
+    {
+      "path": "laika_bot/db.py",
+      "sha256": "9341c07ff29393759c40097ea61baeb8c8d3779dca5ce4a1d6f36ab1dc927130",
+      "size": 1750
+    },
+    {
+      "path": "laika_bot/db_accounts.py",
+      "sha256": "a93252eb50a1d60baf7021e8d0de871d80587fe26bbf4fd99a1ceb5125115243",
+      "size": 34975
+    },
+    {
+      "path": "laika_bot/db_analytics.py",
+      "sha256": "1385cf38c73482a37bc19bd756ef324eec89546bda67f92446cc4ee872d84a65",
+      "size": 54047
+    },
+    {
+      "path": "laika_bot/db_channels.py",
+      "sha256": "c19adb8d4ac66491a2b4b0f902fb6e586b2cb9b0f9e1667e83cfefeb79686077",
+      "size": 15557
+    },
+    {
+      "path": "laika_bot/db_configuration.py",
+      "sha256": "f18fb6b592cb005854e7ac4cf2ac6e9a1cdadead6b27d708831e06c3a60f7746",
+      "size": 45803
+    },
+    {
+      "path": "laika_bot/db_core.py",
+      "sha256": "3f7f3f5a23b076864d29c9d24c0195da5dedf636d6cfdf312b4c5d061c562e84",
+      "size": 17643
+    },
+    {
+      "path": "laika_bot/db_membership_jobs.py",
+      "sha256": "e81db6aa6e644757ffa08b72f2cec69b952332487bc9381a68f3ab4a3b5b5a28",
+      "size": 8856
+    },
+    {
+      "path": "laika_bot/db_reaction_jobs.py",
+      "sha256": "8524f7b20c4e232b431fc90ccdd8a6b48bc41f3176129dc6f055852f20e293cf",
+      "size": 21136
+    },
+    {
+      "path": "laika_bot/db_shared.py",
+      "sha256": "ce3b218714969aafd919af9d366d7b8936a4b5af97b20f63d9abff33a61876b0",
+      "size": 2920
+    },
+    {
+      "path": "laika_bot/db_view_jobs.py",
+      "sha256": "507b3e7573652bc7e60a11ca351884af1e5d0fd63ff9e410e313485ac73f7bde",
+      "size": 15372
+    },
+    {
+      "path": "laika_bot/handler_accounts.py",
+      "sha256": "d1a290730841376d2ae4f676349fb2bcde9dcfdc8fea854e61b0e7d320079e09",
+      "size": 82700
+    },
+    {
+      "path": "laika_bot/handler_automation.py",
+      "sha256": "aa1ff33020b2ee65384cc7c49d629caad7942a462d869079a10fb82f62931127",
+      "size": 49235
+    },
+    {
+      "path": "laika_bot/handler_backup.py",
+      "sha256": "6736ee3eaed74905b001a147c2724b24038c35faf8c003b8bee737c46424736c",
+      "size": 28343
+    },
+    {
+      "path": "laika_bot/handler_core.py",
+      "sha256": "8b099a4bddcd80a48d3beb2504202ab9806ff37da11fc5c722cf934f48c53944",
+      "size": 23607
+    },
+    {
+      "path": "laika_bot/handler_operations.py",
+      "sha256": "ce3a37e87419405497eea4d7674a0f6e0d358386cd1df81d1e89d4fb2c81870e",
+      "size": 44233
+    },
+    {
+      "path": "laika_bot/handler_shared.py",
+      "sha256": "baccf114c33fe2867aae2d134cf593a3a68671af5a944704217facd71cdbbdc1",
+      "size": 12833
+    },
+    {
+      "path": "laika_bot/handler_system.py",
+      "sha256": "b4040aeb4c0a43c6220f3457f9308fc4d097caa3e5f396a87422a8037c9be446",
+      "size": 18751
+    },
+    {
+      "path": "laika_bot/handler_targets.py",
+      "sha256": "4c26751f31e63f550b19c436a3a37fb4a822ba8f9e5a17e6b06fa74c885f3b47",
+      "size": 58728
+    },
+    {
+      "path": "laika_bot/handlers.py",
+      "sha256": "90034713c4851d6523d11d796b5d3c49ee3abaf5b1b9c5b65740f86baa85cd49",
+      "size": 2188
+    },
+    {
+      "path": "laika_bot/health.py",
+      "sha256": "e02f059436908b6c510a25816f8fcb8d64a6db6c713a8129269dd4c717ddd1c9",
+      "size": 2817
+    },
+    {
+      "path": "laika_bot/keyboards.py",
+      "sha256": "f413342dd19212d74eb256f4f59edaaa741a293f4acb2113588a010c5669be6d",
+      "size": 68055
+    },
+    {
+      "path": "laika_bot/management.py",
+      "sha256": "5021ec77430b52b7b848e73ffc446439b065cf9bdb30d123cf6e3ea36c181831",
+      "size": 6864
+    },
+    {
+      "path": "laika_bot/models.py",
+      "sha256": "d62f021da37045285c6e96a67cef784ed534858ec8cdf437df4796c44926c475",
+      "size": 18544
+    },
+    {
+      "path": "laika_bot/openai_gateway.py",
+      "sha256": "580a82b991bc83821e7f7834439288cdc54581ae65ace44eae3c9c7c84d7d0b9",
+      "size": 17361
+    },
+    {
+      "path": "laika_bot/openai_gateway_handlers.py",
+      "sha256": "f3ed26075e047895e110678b09654a2cc3ddb8a236d7d86bbc86cd9767687463",
+      "size": 9845
+    },
+    {
+      "path": "laika_bot/recovery.py",
+      "sha256": "beaa68c578b0a0ed6124dafcd7a66f16cbf1335e2b5d96c2d06a1fb826fc0136",
+      "size": 31822
+    },
+    {
+      "path": "laika_bot/selection.py",
+      "sha256": "d4013a847816658e0739456ca518d28b5fc45170193e0ef4af5a89883796ec1f",
+      "size": 4783
+    },
+    {
+      "path": "laika_bot/services/jobs.py",
+      "sha256": "5e1bb7624e1a52b8221f8ad1cebdc7cdbfc16464e4481ef0467bed9e6af27af4",
+      "size": 80951
+    },
+    {
+      "path": "laika_bot/services/telegram_accounts.py",
+      "sha256": "62a31893f983faa6452fbee3e7268e61e7817f73e8e507efcf26015f6bf1b0e5",
+      "size": 25501
+    },
+    {
+      "path": "laika_bot/states.py",
+      "sha256": "1eefd1f19fe794f4d847e62379de345e1ce02fa8a0926b4fc0e4f71fb4083ade",
+      "size": 1171
+    },
+    {
+      "path": "laika_bot/utils.py",
+      "sha256": "e89dd4374753f0e00c8afa1491dd340b6887de75f63db26565b905ccb6cf7210",
+      "size": 13090
+    },
+    {
+      "path": "migrations/AI_COMMENTS_SCHEMA_V1.md",
+      "sha256": "34fa71c8504e68dc33ea9c3a49457b6071d3a39e2599def967335503369c0dd7",
+      "size": 3756
+    },
+    {
+      "path": "migrations/AI_COMMENTS_SCHEMA_V2.md",
+      "sha256": "f02ac5d96dc2556fce4ad79dded1f7b82811cde4ba9ae4ed86c28db4e0aca8a9",
+      "size": 4007
+    },
+    {
+      "path": "migrations/AI_COMMENTS_SCHEMA_V3.md",
+      "sha256": "8c1e929378ab3de9bbe4608cd9d2048d6162715ddb556ea1920db20af3dd4626",
+      "size": 4740
+    },
+    {
+      "path": "migrations/AI_COMMENTS_SCHEMA_V4.md",
+      "sha256": "2a6bc58aa52b8b615492dfb7aa473819dc263b14caaaf76961ead909ddfa161d",
+      "size": 4344
+    },
+    {
+      "path": "pytest.ini",
+      "sha256": "07e12af78809b103a9e003b9bf24f9718928fa263046b37bf3ebc9ebbf802ceb",
+      "size": 24
+    },
+    {
+      "path": "railway.json",
+      "sha256": "016184d4a3e1c7f4659afe047a279cb32890e59ff1c167284e4aa077fb87c8eb",
+      "size": 197
+    },
+    {
+      "path": "requirements-dev.in",
+      "sha256": "81480eeef00b775f00aebc00baf10403e10d216b17b2f69df5da8ee8dbc94b96",
+      "size": 46
+    },
+    {
+      "path": "requirements-dev.txt",
+      "sha256": "2c1793ec2e9f16013c7fe2a823e6c4816b83d186c8ba7106088462231e95a102",
+      "size": 111771
+    },
+    {
+      "path": "requirements.in",
+      "sha256": "b195c6f097527b525eafec5ac1caef36c9fdf19115f3ce970a462c7201f31c75",
+      "size": 165
+    },
+    {
+      "path": "requirements.txt",
+      "sha256": "dc7da544d39020e31b080e9302e24a4bad95fd3a5574fbce48c4b997f099a153",
+      "size": 108929
+    },
+    {
+      "path": "ruff.toml",
+      "sha256": "bcce75e4c65a270da59fb780e6fc6f5f334f8f792fbd86c083d23fec19ea3a85",
+      "size": 351
+    },
+    {
+      "path": "tests/test_auth_menu_fix.py",
+      "sha256": "2c6225a956852f4999693d8e16879d32133e7abb6fae68249ab6c35b0ccbc2b5",
+      "size": 3645
+    },
+    {
+      "path": "tests/test_autolike_ui_queue_fix.py",
+      "sha256": "89ba625627260e3f66fe059ab10cf9dce4b0e467555d7415a634a923ef4356c6",
+      "size": 4424
+    },
+    {
+      "path": "tests/test_bigint_account_save_fix.py",
+      "sha256": "caa498bd71541cb0f2d0e5ce442fd628cfcff710dc0223dbd4f6fd1fde0a0796",
+      "size": 5184
+    },
+    {
+      "path": "tests/test_groups_patch.py",
+      "sha256": "ed636b8d9e345e916c1286f569cf24d8403441cf918b2785ade4ab1c1a36f385",
+      "size": 3278
+    },
+    {
+      "path": "tests/test_menu_redesign.py",
+      "sha256": "9586f45298836f1e3bdcede4b90af68b356cd4d751ff2264e2a860f1cbd04237",
+      "size": 2788
+    },
+    {
+      "path": "tests/test_utils.py",
+      "sha256": "0d45f7c32466381d27f9c72d5ed3f4751d1faea1dce41246bd1858bac35d9e99",
+      "size": 1006
+    },
+    {
+      "path": "tests/test_v106_delay_group_reactions.py",
+      "sha256": "b04c6cb5a0e32033d6bed9d441d1f15f6a481b6b6d6fb375e759a68ccccb7d66",
+      "size": 7584
+    },
+    {
+      "path": "tests/test_v107_live_queue_reschedule.py",
+      "sha256": "e99353fac126b9665c9f3dd7b2a6d46c53aede11208eb75292ab4c5a0f4b00bf",
+      "size": 6190
+    },
+    {
+      "path": "tests/test_v108_post_limit_promotion_period.py",
+      "sha256": "b7cab4b4783e86a8f314900a5be694c255d634d20b4e1f715817147e0ba9526a",
+      "size": 11029
+    },
+    {
+      "path": "tests/test_v109_connect_missing_accounts.py",
+      "sha256": "e20f6122d0e7f183764b4ce6a6f8119a03bf390f1ba5156f8b44eaac3b70c5f7",
+      "size": 9022
+    },
+    {
+      "path": "tests/test_v110_session_cleanup_private_invite.py",
+      "sha256": "c7c3bcc848d16ff2e481fb9a709ac49ade698f93bdbac69101d0244cdb803851",
+      "size": 12089
+    },
+    {
+      "path": "tests/test_v111_login_code_reader.py",
+      "sha256": "2f7d81dc083bb637c38b14f0ecb6e911dada9fe0b658c63232b355baea8b8ffc",
+      "size": 4959
+    },
+    {
+      "path": "tests/test_v112_weighted_channel_reactions_refresh.py",
+      "sha256": "c48937fc4d1c7d200d71a41fb9eb05f68fb1b77ceda97419cc3b7c9e31f290a3",
+      "size": 8785
+    },
+    {
+      "path": "tests/test_v113_post_type_reaction_percentages.py",
+      "sha256": "8c26ed8e96466ec5f190786743973712acd2faea8411ef71285f6ee178541319",
+      "size": 10259
+    },
+    {
+      "path": "tests/test_v114_reaction_implies_view.py",
+      "sha256": "52ad034dd50892509bbfb830c2db4e6e29358f19721f73b50680a0622e70304c",
+      "size": 6164
+    },
+    {
+      "path": "tests/test_v115_manual_recent_views.py",
+      "sha256": "66e01074c5e9daf8b2b2e8af3d0e7adef8ea9d34ae4826b7bde8df819d64e671",
+      "size": 17260
+    },
+    {
+      "path": "tests/test_v116_channel_reaction_windows.py",
+      "sha256": "33b26d9e381cc9b3f5da5e32f10d9597414a5b3fa7815883746f45da38b83b62",
+      "size": 8899
+    },
+    {
+      "path": "tests/test_v117_verified_views_compat.py",
+      "sha256": "a8c080bb74509c767da51a64378b706ca35a3e6ea8be5f9ca674fb378a64b259",
+      "size": 12362
+    },
+    {
+      "path": "tests/test_v118_problem_accounts.py",
+      "sha256": "ae3f5d9fbc156e6498aee8cf8b485f8807633fcc162afb56a1fca6d5479dba83",
+      "size": 12668
+    },
+    {
+      "path": "tests/test_v119_deep_audit_hardening.py",
+      "sha256": "b2817262c351694b3f8515ac2e759c52aadce42b1431af442589c29ebac2d161",
+      "size": 5859
+    },
+    {
+      "path": "tests/test_v120_account_email_metadata.py",
+      "sha256": "a32515e9afc5d9dd5e9f1734c753a9427b44f961bff4fbbbb36b53ab46d1b646",
+      "size": 13031
+    },
+    {
+      "path": "tests/test_v121_identity_credential_hardening.py",
+      "sha256": "e6d6f72f7ff145ff611041f709ff7713931e78e89981e6413973ab6dcdea1a3f",
+      "size": 16197
+    },
+    {
+      "path": "tests/test_v122_system_health_account_score.py",
+      "sha256": "141f784cdf913bde9bdd7a9815a0736c7650886fa290875b2b4578cdbcfc16c2",
+      "size": 10840
+    },
+    {
+      "path": "tests/test_v123_queue_runtime_retention_hardening.py",
+      "sha256": "f9ac0e8d831db2aeef2b12594869964f244c79460aad0778190190aa38e34bff",
+      "size": 20226
+    },
+    {
+      "path": "tests/test_v124_adaptive_account_load_balancing.py",
+      "sha256": "c6fb69d198fa11a96b24ca2f931bd2cec415681ee7062fddf1a09bde4d9f60f7",
+      "size": 12323
+    },
+    {
+      "path": "tests/test_v125_critical_admin_alerts.py",
+      "sha256": "feca2938e8473538928fdc8c0bf508995510a251cfb56669a13e1f49a812adf9",
+      "size": 27397
+    },
+    {
+      "path": "tests/test_v126_automatic_recovery.py",
+      "sha256": "0530624a2ccd4ee4e3d9be4d78afa182e323fd286ab50e4dcf5b11d84f31f92a",
+      "size": 34969
+    },
+    {
+      "path": "tests/test_v127_channel_profiles.py",
+      "sha256": "349888e514a1c15bfd43c67f529bd329e749c41a2d68370ea64a70d24ef56f8b",
+      "size": 19338
+    },
+    {
+      "path": "tests/test_v128_configuration_backup_restore.py",
+      "sha256": "132c9595bad1255aeeec08ae933f290314aeeb4f8e8aa0825c26d92a4a4add8f",
+      "size": 23355
+    },
+    {
+      "path": "tests/test_v129_expanded_analytics.py",
+      "sha256": "c8a1e8fcbc9c8e6f171165e1e72a34de226f46371bcb2d7864bae942ca94beef",
+      "size": 17002
+    },
+    {
+      "path": "tests/test_v130_management_tools.py",
+      "sha256": "d54ef0c053556bec651811fa1226de52700e7eecc5c95bf2837d646bba19d11d",
+      "size": 14239
+    },
+    {
+      "path": "tests/test_v130_management_ui.py",
+      "sha256": "90fe472a2a752348eefa403f645044ee57565df22733f8d9584502b8d2d97c9f",
+      "size": 7015
+    },
+    {
+      "path": "tests/test_v131_architecture_modularization.py",
+      "sha256": "dcc5d05a93f22ede3a1aca93768c29f342d01d0886d8d9687293d13b7c09bf5d",
+      "size": 6584
+    },
+    {
+      "path": "tests/test_v132_release_automation.py",
+      "sha256": "05a7f89ff63c61c430b4aa78cdd3289ab841cabd048cb2fb125d98fdc3a95dcc",
+      "size": 11320
+    },
+    {
+      "path": "tests/test_v133_deep_audit_runtime_hardening.py",
+      "sha256": "0e89245bddfca1e048d751f0a78587bf08dac7fa46c8b1d8ca8073f72a54fee2",
+      "size": 27157
+    },
+    {
+      "path": "tests/test_v134_problem_account_cleanup.py",
+      "sha256": "12bbee1b8685141c41d1b03423eda9d72778e44cfd60d657cb6f6419133f30a9",
+      "size": 6622
+    },
+    {
+      "path": "tests/test_v135_final_audit_hardening.py",
+      "sha256": "0c49c6bfd7de1c6b6fc0d43886079f4291170b9053e1678f94d401dfb84f809f",
+      "size": 8950
+    },
+    {
+      "path": "tests/test_v136_dependency_security_hardening.py",
+      "sha256": "fdad7995de2e69cb0a2c1f65c0379b073ab817bb9e218deb7c74d5c55845bb6d",
+      "size": 2292
+    },
+    {
+      "path": "tests/test_v137_ai_comments_schema_migration.py",
+      "sha256": "8a9069f7a966212dbe00e86589e23d6e0a7d338bbd88e0414d424862de057730",
+      "size": 24099
+    },
+    {
+      "path": "tests/test_v138_ai_comments_menu_scaffold.py",
+      "sha256": "1051375d796e16b51a3e6c9cb8475671800d17b4980a62641a855d43991df691",
+      "size": 21301
+    },
+    {
+      "path": "tests/test_v139_ai_channel_memory.py",
+      "sha256": "fb1f94952d5c1834c1ecdff7b21cdbb5ed3d259fd421dc5ec9066c5246392d36",
+      "size": 26253
+    },
+    {
+      "path": "tests/test_v140_ai_account_profiles.py",
+      "sha256": "e73dc8bab124d93db810fb21aa1a8e259b01187c2bc3dcdf9fa6e1bad5e6bb5e",
+      "size": 28524
+    },
+    {
+      "path": "tests/test_v142_openai_gateway.py",
+      "sha256": "23742a46f40745cf11d86f8e9ff6ebc145028d438db5e67da68751566997a10f",
+      "size": 14381
+    },
+    {
+      "path": "tests/test_v143_ai_single_comment_generation.py",
+      "sha256": "a4cf137180d3631d077d62e125e81a6a198d5e35530736cbb386bd450a7b2795",
+      "size": 32433
+    },
+    {
+      "path": "tests/test_v144_ai_connected_dialogues.py",
+      "sha256": "d55a76f3a861c22d46430ee2b6dba3dd9b6f4e703c4aa638ee22286e3cad6fcc",
+      "size": 24047
+    },
+    {
+      "path": "tests/test_v144a_ai_dialogue_naturalness.py",
+      "sha256": "617f6f408bc269ccd33562e2184fd3ab73ebb7bab32fefe37bd423f7b7c8a6d9",
+      "size": 15453
+    },
+    {
+      "path": "tools/__init__.py",
+      "sha256": "f38489e9705be0d561b17c536cac4c0313276238991a201669f6ea17c5012d80",
+      "size": 47
+    },
+    {
+      "path": "tools/ai_comments_schema.py",
+      "sha256": "ed3abb87fb5e5aa7f0a03908901f8f4b56ed1fedd97338a49c0e8474f0be405c",
+      "size": 3979
+    },
+    {
+      "path": "tools/release.py",
+      "sha256": "e1e48be020e927889ca02db0b6d423889b56bb1dd715ce7fabad264587590273",
+      "size": 3551
+    },
+    {
+      "path": "tools/release_lib.py",
+      "sha256": "bbcc48a063c968908bb8129665090227d427d3841bb1ecfb6bd331db1652201d",
+      "size": 61106
+    }
+  ],
+  "project": "LikeBot",
+  "schema": 1,
+  "source_date_epoch": 946684800,
+  "version": "1.0.44b"
+}

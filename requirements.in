@@ -1,0 +1,9 @@
+aiogram==3.30.0
+Telethon==1.44.0
+SQLAlchemy==2.0.51
+asyncpg==0.31.0
+aiosqlite==0.22.1
+cryptography==50.0.0
+pydantic-settings==2.14.2
+openai==2.52.0
+regex==2026.7.19
