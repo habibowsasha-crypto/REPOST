@@ -772,6 +772,12 @@ async def _account_dispatch_loop(account_user_id: int) -> None:
                     continue
                 result = await _send_pending_row(row)
                 pending_id = int(row["id"])
+                if result != "sent":
+                    logger.info(
+                        f"[DM unified] send result={result} "
+                        f"pending={pending_id} account={account_user_id} "
+                        f"target={row.get('target_user_id')}"
+                    )
                 if result == "sent":
                     try:
                         mark_unified_lead_sent(pending_id, account_user_id)

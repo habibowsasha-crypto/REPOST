@@ -986,6 +986,10 @@ def _ensure_pending_row_for_account(
     ).fetchone()
     if existing:
         pending_id = int(existing[0])
+        prev_status = str(existing[1] or "")
+        # Stuck claimed/sending after crash or lost_race must be reopened,
+        # otherwise claim_pending() always fails and the pool never moves.
+        reopen = prev_status in {"claimed", "sending", "uncertain_delivery"}
         conn.execute(
             """
             UPDATE dm_pending_queue
@@ -999,17 +1003,21 @@ def _ensure_pending_row_for_account(
                    source_chat_username=COALESCE(?, source_chat_username),
                    source_message_id=COALESCE(?, source_message_id),
                    eligible_at=CASE
+                     WHEN ? = 1 THEN ?
                      WHEN status IN ('pending','retry_wait','unresolved_peer')
                           AND eligible_at > ? THEN ?
                      ELSE eligible_at
                    END,
                    status=CASE
-                     WHEN status IN ('claimed','sending','uncertain_delivery') THEN status
+                     WHEN ? = 1 THEN 'pending'
                      ELSE 'pending'
                    END,
-                   claim_token=CASE
-                     WHEN status IN ('claimed','sending') THEN claim_token
-                     ELSE NULL
+                   claim_token=NULL,
+                   claimed_at=NULL,
+                   send_started_at=NULL,
+                   last_error=CASE
+                     WHEN ? = 1 THEN 'reopened_for_unified_send'
+                     ELSE last_error
                    END,
                    updated_at=?
              WHERE id=?
@@ -1024,8 +1032,12 @@ def _ensure_pending_row_for_account(
                 lead.get("source_chat_title"),
                 lead.get("source_chat_username"),
                 lead.get("source_message_id"),
+                1 if reopen else 0,
                 now,
                 now,
+                now,
+                1 if reopen else 0,
+                1 if reopen else 0,
                 now,
                 pending_id,
             ),
@@ -1123,6 +1135,10 @@ def prepare_unified_send_for_account(account_user_id: int) -> Optional[dict[str,
         return None
 
     ensure_unified_queue_schema()
+    try:
+        recover_stale_pending_claims(older_than_seconds=120)
+    except Exception as exc:
+        logger.debug(f"[DM unified] stale pending recovery skipped: {exc}")
     now = utc_now()
     now_iso = _iso(now)
     try:
@@ -1401,6 +1417,34 @@ def release_unified_lead_for_pending(
                 int(pending_id),
             ),
         )
+
+
+
+def recover_stale_pending_claims(*, older_than_seconds: int = 180) -> int:
+    """Reopen claimed/sending pending rows stuck longer than the threshold."""
+    ensure_unified_queue_schema()
+    cutoff = _iso(utc_now() - dt.timedelta(seconds=max(30, int(older_than_seconds))))
+    now = _iso(utc_now())
+    with _db_lock, conn:
+        cursor = conn.execute(
+            """
+            UPDATE dm_pending_queue
+               SET status='pending',
+                   claim_token=NULL,
+                   claimed_at=NULL,
+                   send_started_at=NULL,
+                   last_error='stale_claim_reopened',
+                   updated_at=?
+             WHERE status IN ('claimed','sending')
+               AND (
+                    (claimed_at IS NOT NULL AND claimed_at < ?)
+                    OR (send_started_at IS NOT NULL AND send_started_at < ?)
+                    OR (claimed_at IS NULL AND send_started_at IS NULL AND updated_at < ?)
+               )
+            """,
+            (now, cutoff, cutoff, cutoff),
+        )
+        return int(cursor.rowcount or 0)
 
 
 def recover_stale_unified_reservations(*, max_age_seconds: int = 180) -> int:
