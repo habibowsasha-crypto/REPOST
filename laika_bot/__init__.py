@@ -1,3 +1,3 @@
-"""LikeBot package."""
+from __future__ import annotations
 
-__version__ = "1.0.44b"
+__version__ = "1.0.44e"

@@ -1,5 +1,5 @@
 {
-  "archive_root": "laika_bot_v1_0_44b_step12_live_conversation_hotfix_candidate",
+  "archive_root": "laika_bot_v1_0_44e_step12_dialogue_coherence_hotfix_candidate",
   "files": [
     {
       "path": ".dockerignore",
@@ -23,13 +23,13 @@
     },
     {
       "path": "AUDIT.txt",
-      "sha256": "a9551c73cc885592018d2f0a4c71629492562a237ee111012133635f3e6d07dd",
-      "size": 26978
+      "sha256": "39cd19a8be097ce384a63cc6e56fc1f03fd5e40ceb08593e9c7ca56667e3847c",
+      "size": 4198
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "0ad5767b54e448c3716b448514edb77237c0672254a32e73c8db3a3f67f3a486",
-      "size": 112848
+      "sha256": "7b311b92a0073e338641b9e580903157d8d5f175108b0e9a3ec4ec3c670885d4",
+      "size": 116465
     },
     {
       "path": "Dockerfile",
@@ -38,8 +38,8 @@
     },
     {
       "path": "LIKEBOT_AI_COMMENTS_FULL_HANDOFF_PLAN_v1_2.txt",
-      "sha256": "26d6984f5aa629d8eb640d12643094453964926d5752aba87141aa6614f5ba8d",
-      "size": 83302
+      "sha256": "f23ab900c0b51e878d51a35944673653a4b12559dafe422e637c9824aba272ee",
+      "size": 87054
     },
     {
       "path": "Procfile",
@@ -48,13 +48,13 @@
     },
     {
       "path": "README.md",
-      "sha256": "84763f77174c6735b2f3276c3365c250fcb108775bd40181e9a66278eaa1b0c3",
-      "size": 108332
+      "sha256": "0e2b0f521ab443aae0e9d8c4f8a48f5d10dfeef6f0d28961051a58aaafc9a76b",
+      "size": 111275
     },
     {
       "path": "laika_bot/__init__.py",
-      "sha256": "cfda88d4ea1b54f42899432f25986ecb5453a3682b5680a4e11d8a474cc2aad8",
-      "size": 48
+      "sha256": "1f813ac0fc041b2f682ceb0ee841b98702cbc23296ad35795d55efb7f4f9bf60",
+      "size": 60
     },
     {
       "path": "laika_bot/ai_account_profiles.py",
@@ -138,8 +138,8 @@
     },
     {
       "path": "laika_bot/ai_dialogues.py",
-      "sha256": "55683dd0f8fe07c5ed1549007bb6bf65800fe328ba31f8848c938229bcc7535c",
-      "size": 29010
+      "sha256": "55b29ac2c8d9e3c9619ec575f816acf7ac1b79ca6b9d79fdf2cd22a2181a0789",
+      "size": 42145
     },
     {
       "path": "laika_bot/ai_dialogues_handlers.py",
@@ -618,8 +618,8 @@
     },
     {
       "path": "tests/test_v144a_ai_dialogue_naturalness.py",
-      "sha256": "617f6f408bc269ccd33562e2184fd3ab73ebb7bab32fefe37bd423f7b7c8a6d9",
-      "size": 15453
+      "sha256": "71cdbe6f8d8cc69a535752afef85538c1e3db8755053e51b2bff5a5e1ef2c07d",
+      "size": 28040
     },
     {
       "path": "tools/__init__.py",
@@ -645,5 +645,5 @@
   "project": "LikeBot",
   "schema": 1,
   "source_date_epoch": 946684800,
-  "version": "1.0.44b"
+  "version": "1.0.44e"
 }
