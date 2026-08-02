@@ -1,3 +1,5 @@
+import html
+import math
 from services.menu_ui import render_menu
 from loguru import logger
 import re
@@ -115,6 +117,12 @@ async def cancel_flow_button(event: callback_query) -> None:
     await render_menu(event, text, buttons=_main_menu_buttons())
     await event.answer()
 
+
+
+_UNIFIED_PAGE_SIZE = 25
+_unified_lead_snapshots: dict[int, list[int]] = {}
+
+
 def _format_queue_mode_screen() -> tuple[str, list]:
     from services.dm_unified_queue import (
         MODE_UNIFIED,
@@ -122,10 +130,11 @@ def _format_queue_mode_screen() -> tuple[str, list]:
     )
 
     stats = unified_queue_stats()
-    mode_label = (
-        "🌐 Общая очередь"
-        if stats["mode"] == MODE_UNIFIED
-        else "👤 Очередь по аккаунтам"
+    enabled = stats["mode"] == MODE_UNIFIED
+    mode_line = (
+        "🟢 <b>включена</b> (аккаунты берут лидов из одного пула)"
+        if enabled
+        else "⚪ <b>выключена</b> — сейчас очередь по аккаунтам"
     )
     next_line = "—"
     if stats["next_global_send_in_seconds"] is not None:
@@ -137,40 +146,35 @@ def _format_queue_mode_screen() -> tuple[str, list]:
         else:
             next_line = f"через {sec // 60} мин {sec % 60} сек"
 
-    status_bits = []
-    for name, key in (
-        ("pending", "pending"),
-        ("retry", "retry_wait"),
-        ("unresolved", "unresolved_peer"),
-        ("reserved", "reserved"),
-        ("uncertain", "uncertain_delivery"),
-    ):
-        value = int(stats["by_status"].get(key, 0))
-        if value:
-            status_bits.append(f"{name} {value}")
-    status_line = ", ".join(status_bits) if status_bits else "нет активных"
+    by = stats.get("by_status") or {}
+    pending = int(by.get("pending", 0))
+    retry = int(by.get("retry_wait", 0)) + int(by.get("unresolved_peer", 0))
+    reserved = int(by.get("reserved", 0)) + int(by.get("claimed", 0)) + int(by.get("sending", 0))
+    uncertain = int(by.get("uncertain_delivery", 0))
+    ready = int(stats["ready_leads"])
 
     text = (
-        "🌐 <b>Режим очереди первых DM</b>\n\n"
-        f"Сейчас: <b>{mode_label}</b>\n"
-        f"Активных лидов в пуле: <b>{stats['active_leads']}</b>\n"
-        f"Готовы к отправке: <b>{stats['ready_leads']}</b>\n"
-        f"В резерве: <b>{stats['reserved_leads']}</b>\n"
-        f"Статусы: <code>{status_line}</code>\n"
-        f"Отправлено (в пуле): <b>{stats['sent_leads']}</b>\n"
+        "🌐 <b>Общая очередь первых DM</b>\n\n"
+        f"Режим: {mode_line}\n\n"
+        f"К отправке: <b>{ready}</b> | "
+        f"В обработке/резерве: <b>{reserved}</b> | "
+        f"Спорных: <b>{uncertain}</b>\n"
+        f"Ожидают/retry: <b>{pending + retry}</b>\n"
+        f"Всего активных: <b>{stats['active_leads']}</b> чел. | "
+        f"✅ Отправлено (в пуле): <b>{stats['sent_leads']}</b>\n"
         f"Preferred-аккаунт на паузе: <b>{stats['preferred_account_paused_leads']}</b>\n\n"
         f"Общая пауза: <b>{stats['global_spacing_min']}–{stats['global_spacing_max']} сек</b>\n"
         f"Следующий слот: <b>{next_line}</b>\n\n"
-        "В «Общей очереди» все аккаунты берут лидов из одного пула с общей паузой. "
-        "PeerFlood и FloodWait аккаунта сохраняются. "
-        "Режим «По аккаунтам» — прежнее поведение."
+        "Это сводка по <b>общему пулу</b> (как список DM-задач, но на весь бот).\n"
+        "Список людей — кнопка «👥 Лиды пула»."
     )
     toggle_label = (
-        "↩️ Вернуть очередь по аккаунтам"
-        if stats["mode"] == MODE_UNIFIED
+        "↩️ Выключить общую очередь"
+        if enabled
         else "✅ Включить общую очередь"
     )
     buttons = [
+        [Button.inline("👥 Лиды пула", b"unified_leads_page_0")],
         [Button.inline(toggle_label, b"queue_mode_confirm")],
         [
             Button.inline("30–60 сек", b"queue_spacing_30_60"),
@@ -187,6 +191,124 @@ def _format_queue_mode_screen() -> tuple[str, list]:
     return text, buttons
 
 
+def _format_unified_lead_card(row: dict) -> str:
+    from services.account_profiles import format_account_label
+    from services.first_dm_modules import first_dm_module_label
+
+    username = " ".join(str(row.get("target_username") or "").split()).strip().lstrip("@")
+    first_name = " ".join(str(row.get("target_first_name") or "").split()).strip()
+    last_name = " ".join(str(row.get("target_last_name") or "").split()).strip()
+    full_name = " ".join(p for p in (first_name, last_name) if p).strip()
+    user_id = int(row["target_user_id"])
+    if username:
+        lead = f"@{html.escape(username[:32])}"
+    elif full_name:
+        lead = f"{html.escape(full_name[:32])} <i>(без @username)</i>"
+    else:
+        lead = "<i>без @username</i>"
+
+    status = str(row.get("status") or "pending")
+    status_map = {
+        "pending": "⏳ к отправке",
+        "retry_wait": "🔁 retry",
+        "unresolved_peer": "❓ peer",
+        "reserved": "🔒 резерв",
+        "claimed": "🔒 claimed",
+        "sending": "📤 sending",
+        "uncertain_delivery": "⚠️ спорный",
+    }
+    status_label = status_map.get(status, status)
+    chat = " ".join(str(row.get("source_chat_title") or "").split()) or "—"
+    if len(chat) > 40:
+        chat = chat[:39] + "…"
+    preferred = row.get("preferred_account_user_id")
+    reserved_by = row.get("reserved_by_account_user_id")
+    module = first_dm_module_label(row.get("first_dm_module"))
+    preferred_line = "—"
+    if preferred is not None:
+        try:
+            preferred_line = html.escape(
+                format_account_label(int(preferred), include_id=True, max_length=42)
+            )
+        except Exception:
+            preferred_line = str(preferred)
+    reserved_line = ""
+    if reserved_by is not None:
+        try:
+            reserved_line = (
+                "\nРезерв акк.: <b>"
+                + html.escape(
+                    format_account_label(int(reserved_by), include_id=True, max_length=42)
+                )
+                + "</b>"
+            )
+        except Exception:
+            reserved_line = f"\nРезерв акк.: <b>{reserved_by}</b>"
+    eligible = str(row.get("eligible_at") or "—")
+    if len(eligible) > 25:
+        eligible = eligible[:19]
+    return (
+        f"👤 <b>{lead}</b>\n"
+        f"🆔 <code>{user_id}</code> · {status_label}\n"
+        f"💬 Чат: {html.escape(chat)}\n"
+        f"📦 Модуль: {html.escape(module)}\n"
+        f"⭐ Preferred: {preferred_line}"
+        f"{reserved_line}\n"
+        f"🕒 eligible: <code>{html.escape(eligible)}</code>"
+    )
+
+
+async def _show_unified_leads_page(event, page: int, *, restart: bool = False) -> None:
+    from services.dm_unified_queue import (
+        list_active_unified_lead_ids,
+        list_unified_lead_rows_by_ids,
+    )
+
+    admin_id = int(event.sender_id)
+    if restart or admin_id not in _unified_lead_snapshots:
+        _unified_lead_snapshots[admin_id] = list_active_unified_lead_ids()
+    snapshot = _unified_lead_snapshots.get(admin_id) or []
+    total = len(snapshot)
+    pages = max(1, math.ceil(total / _UNIFIED_PAGE_SIZE) if total else 1)
+    page = max(0, min(int(page), pages - 1))
+    start = page * _UNIFIED_PAGE_SIZE
+    page_ids = snapshot[start : start + _UNIFIED_PAGE_SIZE]
+    rows = list_unified_lead_rows_by_ids(page_ids)
+
+    header = (
+        "👥 <b>Лиды общей очереди</b>\n"
+        f"Всего в снимке: <b>{total}</b>\n"
+        f"Страница <b>{page + 1}/{pages}</b>"
+        + (
+            f" · позиции <b>{start + 1}–{start + len(page_ids)}</b>"
+            if page_ids
+            else ""
+        )
+        + "\n\n"
+    )
+    if not rows:
+        body = "Пул пуст или все лиды уже завершены."
+    else:
+        body = "\n\n".join(_format_unified_lead_card(row) for row in rows)
+
+    buttons: list = []
+    nav = []
+    if page > 0:
+        nav.append(Button.inline("⬅️ Назад", f"unified_leads_page_{page - 1}".encode()))
+    if page + 1 < pages:
+        nav.append(Button.inline("Вперёд ➡️", f"unified_leads_page_{page + 1}".encode()))
+    if nav:
+        buttons.append(nav)
+    buttons.append(
+        [
+            Button.inline("🔄 Обновить список", b"unified_leads_restart"),
+            Button.inline("🌐 К режиму", b"menu_queue_mode"),
+        ]
+    )
+    buttons.append([Button.inline("🏠 Главное меню", b"menu_home")])
+    await render_menu(event, header + body, buttons=buttons)
+
+
 @bot.on(Query(data=b"menu_queue_mode"))
 async def menu_queue_mode(event: callback_query) -> None:
     if event.sender_id not in ADMIN_ID_LIST:
@@ -196,6 +318,29 @@ async def menu_queue_mode(event: callback_query) -> None:
     text, buttons = _format_queue_mode_screen()
     await render_menu(event, text, buttons=buttons)
     await event.answer()
+
+
+@bot.on(Query(data=lambda d: d.decode(errors="ignore").startswith("unified_leads_page_")))
+async def unified_leads_page(event: callback_query) -> None:
+    if event.sender_id not in ADMIN_ID_LIST:
+        await event.answer("Недоступно", alert=True)
+        return
+    raw = event.data.decode(errors="ignore")
+    try:
+        page = int(raw.rsplit("_", 1)[1])
+    except (ValueError, IndexError):
+        page = 0
+    await _show_unified_leads_page(event, page, restart=False)
+    await event.answer()
+
+
+@bot.on(Query(data=b"unified_leads_restart"))
+async def unified_leads_restart(event: callback_query) -> None:
+    if event.sender_id not in ADMIN_ID_LIST:
+        await event.answer("Недоступно", alert=True)
+        return
+    await _show_unified_leads_page(event, 0, restart=True)
+    await event.answer("Список обновлён")
 
 
 @bot.on(Query(data=b"queue_mode_confirm"))

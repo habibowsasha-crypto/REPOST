@@ -1316,6 +1316,88 @@ def recover_stale_unified_reservations(*, max_age_seconds: int = 180) -> int:
         return int(cursor.rowcount or 0)
 
 
+def list_active_unified_lead_ids() -> list[int]:
+    """Stable ordered IDs of unfinished unified leads for admin browsing."""
+    ensure_unified_queue_schema()
+    rows = conn.execute(
+        f"""
+        SELECT id FROM dm_unified_leads
+         WHERE status IN ({",".join("?" for _ in ACTIVE_LEAD_STATUSES)})
+         ORDER BY
+            CASE status
+              WHEN 'pending' THEN 0
+              WHEN 'retry_wait' THEN 1
+              WHEN 'unresolved_peer' THEN 2
+              WHEN 'reserved' THEN 3
+              WHEN 'claimed' THEN 4
+              WHEN 'sending' THEN 5
+              WHEN 'uncertain_delivery' THEN 6
+              ELSE 9
+            END,
+            eligible_at,
+            id
+        """,
+        ACTIVE_LEAD_STATUSES,
+    ).fetchall()
+    return [int(row[0]) for row in rows]
+
+
+def list_unified_lead_rows_by_ids(lead_ids: list[int]) -> list[dict[str, Any]]:
+    """Load lead rows in the same order as ``lead_ids``."""
+    if not lead_ids:
+        return []
+    ensure_unified_queue_schema()
+    placeholders = ",".join("?" for _ in lead_ids)
+    rows = conn.execute(
+        f"""
+        SELECT id, target_user_id, preferred_account_user_id, source_account_user_id,
+               dm_task_id, source_chat_id, source_chat_title, source_chat_username,
+               source_message_id, target_access_hash, target_username,
+               target_first_name, target_last_name, first_dm_module,
+               enqueued_at, eligible_at, status, reserved_by_account_user_id,
+               reserved_at, sent_at, sent_by_account_user_id, legacy_pending_id,
+               retry_count, last_error, updated_at
+          FROM dm_unified_leads
+         WHERE id IN ({placeholders})
+        """,
+        [int(x) for x in lead_ids],
+    ).fetchall()
+    keys = (
+        "id",
+        "target_user_id",
+        "preferred_account_user_id",
+        "source_account_user_id",
+        "dm_task_id",
+        "source_chat_id",
+        "source_chat_title",
+        "source_chat_username",
+        "source_message_id",
+        "target_access_hash",
+        "target_username",
+        "target_first_name",
+        "target_last_name",
+        "first_dm_module",
+        "enqueued_at",
+        "eligible_at",
+        "status",
+        "reserved_by_account_user_id",
+        "reserved_at",
+        "sent_at",
+        "sent_by_account_user_id",
+        "legacy_pending_id",
+        "retry_count",
+        "last_error",
+        "updated_at",
+    )
+    by_id = {int(row[0]): dict(zip(keys, row)) for row in rows}
+    ordered: list[dict[str, Any]] = []
+    for lead_id in lead_ids:
+        row = by_id.get(int(lead_id))
+        if row is not None:
+            ordered.append(row)
+    return ordered
+
+
 __all__ = [
     "MODE_PER_ACCOUNT",
     "MODE_UNIFIED",
@@ -1327,6 +1409,8 @@ __all__ = [
     "get_queue_runtime_state",
     "global_gate_wait_seconds",
     "is_unified_queue_mode",
+    "list_active_unified_lead_ids",
+    "list_unified_lead_rows_by_ids",
     "mark_unified_lead_sent",
     "migrate_pending_queue_to_unified_pool",
     "prepare_unified_send_for_account",
