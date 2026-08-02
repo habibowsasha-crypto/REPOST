@@ -43,6 +43,7 @@ from services.first_dm_modules import (
 )
 from services.ai_quick_offer import (
     QuickOfferGenerationError,
+    build_local_quick_offer_plan,
     generate_quick_offer_plan,
 )
 from services.kirill_vip_funnel import (
@@ -1104,11 +1105,14 @@ async def _send_quick_offer_plan(
                 dialog.id, "send_error", "telegram_send_failed", stage="send_error"
             )
             return False, sent_count, False
+        provider = (
+            "local" if str(plan.model).startswith("local_") else "openai"
+        )
         _save_message(
             dialog.id,
             "outgoing",
             message,
-            provider="openai",
+            provider=provider,
             model=plan.model,
             tokens_used=plan.tokens_used if index == 1 else 0,
         )
@@ -1392,9 +1396,9 @@ async def handle_private_incoming(
                 return
 
             history = _current_cycle_history(dialog.id)
+            recent_series = _recent_quick_offer_series()
             try:
                 async with _quick_offer_generation_lock:
-                    recent_series = _recent_quick_offer_series()
                     quick_plan = await generate_quick_offer_plan(
                         history=history,
                         source_chat_title=dialog.source_chat_title,
@@ -1402,20 +1406,30 @@ async def handle_private_incoming(
                     )
                     if not ai_dry_run():
                         _record_quick_offer_series(dialog, quick_plan.messages)
-            except QuickOfferGenerationError as exc:
-                _set_stage(dialog.id, "ai_quick_offer_generation_wait")
-                logger.warning(
-                    f"[AI DM] quick offer not sent: dialog={dialog.id}, "
-                    f"user={sender.id}, reason={exc}"
-                )
-                return
             except Exception as exc:
-                _set_stage(dialog.id, "ai_quick_offer_generation_wait")
-                logger.error(
-                    f"[AI DM] quick-offer generation error: dialog={dialog.id}, "
-                    f"user={sender.id}: {exc}"
+                # A valid incoming reply must never end in silence because the
+                # provider, parser, or validator failed. Use the same validated
+                # anti-repeat local builder as the generator's final fallback.
+                logger.warning(
+                    f"[AI DM] AI quick offer failed; using local safe fallback: "
+                    f"dialog={dialog.id}, user={sender.id}, reason={exc}"
                 )
-                return
+                try:
+                    async with _quick_offer_generation_lock:
+                        recent_series = _recent_quick_offer_series()
+                        quick_plan = build_local_quick_offer_plan(
+                            history=history,
+                            recent_series=recent_series,
+                        )
+                        if not ai_dry_run():
+                            _record_quick_offer_series(dialog, quick_plan.messages)
+                except QuickOfferGenerationError as fallback_exc:
+                    _set_stage(dialog.id, "ai_quick_offer_generation_wait")
+                    logger.error(
+                        f"[AI DM] quick offer could not be built: dialog={dialog.id}, "
+                        f"user={sender.id}, reason={fallback_exc}"
+                    )
+                    return
 
             plan = FunnelPlan(
                 action="ai_quick_offer",

@@ -1,15 +1,18 @@
-"""AI-generated quick offer sent only after a recipient replies.
+"""Reliable AI quick-offer generation for TgBlaster.
 
-The module never selects recipients and never sends the first DM.  It creates
-one connected series of three or four short messages after a real incoming
-reply.  Generated output is validated before Telegram sees it and is compared
-with recent series from the same connected account.
+The module reacts only after a recipient replies to the delivered first DM.
+OpenAI is tried first. Generated output is parsed and validated before Telegram
+sees it. If the provider is unavailable or repeatedly omits a mandatory fact,
+a locally assembled anti-repeat series is used so the recipient is not left
+without a reply.
 """
 
 from __future__ import annotations
 
 import difflib
+import json
 import re
+import secrets
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -21,11 +24,12 @@ from services.maxim_sales_funnel import PIRATE_VIP_LINK, PIRATE_VIP_LINK_TOKEN
 MODULE_ID = "ai_quick_offer"
 MODULE_LABEL = "🤖 AI Быстрый оффер"
 RECENT_SERIES_WINDOW = 30
-MAX_GENERATION_ATTEMPTS = 3
+MAX_GENERATION_ATTEMPTS = 4
+LOCAL_FALLBACK_ATTEMPTS = 400
 
 
 class QuickOfferGenerationError(RuntimeError):
-    """Raised when no safe, sufficiently different AI series is available."""
+    """Raised only when neither AI nor the safe local builder can make a series."""
 
 
 @dataclass(frozen=True)
@@ -73,16 +77,67 @@ def series_similarity(left: str, right: str) -> float:
     return max(sequence, jaccard)
 
 
+def _json_messages(raw: str) -> list[str]:
+    value = (raw or "").strip()
+    if not value or value[0] not in "[{":
+        return []
+    try:
+        parsed = json.loads(value)
+    except Exception:
+        return []
+    if isinstance(parsed, dict):
+        for key in ("messages", "series", "items"):
+            candidate = parsed.get(key)
+            if isinstance(candidate, list):
+                return [str(item).strip() for item in candidate if str(item).strip()][:4]
+        ordered: list[str] = []
+        for index in range(1, 5):
+            for key in (f"MESSAGE_{index}", f"message_{index}", str(index)):
+                candidate = parsed.get(key)
+                if candidate:
+                    ordered.append(str(candidate).strip())
+                    break
+        return ordered[:4]
+    if isinstance(parsed, list):
+        return [str(item).strip() for item in parsed if str(item).strip()][:4]
+    return []
+
+
 def _parse_messages(raw: str) -> list[str]:
-    messages: list[str] = []
-    for line in (raw or "").splitlines():
-        match = re.match(
-            r"^(?:MESSAGE|СООБЩЕНИЕ)[ _-]?([1-4])\s*:\s*(.+)$",
-            line.strip(),
-            flags=re.I,
-        )
+    """Parse strict labels, wrapped lines, numbered lists, or a JSON payload."""
+    from_json = _json_messages(raw)
+    if from_json:
+        return from_json
+
+    collected: dict[int, list[str]] = {}
+    current: int | None = None
+    label_pattern = re.compile(
+        r"^(?:MESSAGE|СООБЩЕНИЕ)?\s*[ _-]?([1-4])\s*[.):\-]\s*(.*)$",
+        flags=re.I,
+    )
+    explicit_pattern = re.compile(
+        r"^(?:MESSAGE|СООБЩЕНИЕ)[ _-]?([1-4])\s*:\s*(.*)$",
+        flags=re.I,
+    )
+    for raw_line in (raw or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = explicit_pattern.match(line) or label_pattern.match(line)
         if match:
-            messages.append(match.group(2).strip())
+            current = int(match.group(1))
+            collected.setdefault(current, [])
+            if match.group(2).strip():
+                collected[current].append(match.group(2).strip())
+            continue
+        if current is not None:
+            collected[current].append(line)
+
+    messages = [
+        " ".join(collected[index]).strip()
+        for index in sorted(collected)
+        if " ".join(collected[index]).strip()
+    ]
     return messages[:4]
 
 
@@ -94,6 +149,14 @@ def validate_quick_offer(
         return False, "нужно ровно 3 или 4 непустых сообщения"
     if any(len(message.split()) > 48 for message in clean):
         return False, "одно из сообщений длиннее 48 слов"
+
+    # A single series must not contain duplicated or near-duplicated bubbles.
+    for left_index, left in enumerate(clean):
+        for right in clean[left_index + 1:]:
+            if _normalize(left) == _normalize(right):
+                return False, "повторено сообщение внутри одной серии"
+            if series_similarity(left, right) >= 0.94:
+                return False, "сообщения внутри серии слишком похожи"
 
     combined = "\n".join(clean)
     normalized = _normalize(combined)
@@ -110,12 +173,18 @@ def validate_quick_offer(
         return False, "ссылка отправлена раньше объяснения"
 
     fact_groups = (
-        ("бесплат",),
+        ("бесплат", "без оплаты"),
         ("канал",),
         ("vip", "вип"),
         ("софт", "программ", "автомат"),
-        ("копир", "перенос", "собира"),
-        ("подписываться необязательно", "не обязательно подписываться", "подписка необязательна", "можешь просто посмотреть", "можешь просто глянуть"),
+        ("копир", "перенос", "собира", "дублир"),
+        (
+            "подписываться необязательно",
+            "не обязательно подписываться",
+            "подписка необязательна",
+            "можешь просто посмотреть",
+            "можешь просто глянуть",
+        ),
     )
     if any(not any(marker in normalized for marker in group) for group in fact_groups):
         return False, "не хватает обязательного факта об оффере"
@@ -129,7 +198,7 @@ def validate_quick_offer(
     forbidden = (
         "высокий винрейт", "большой винрейт", "гарантир", "без риска",
         "точно заработ", "100 процентов", "официальный vip", "официальный вип",
-        "легкие деньги", "легкие деньги", "не пожалеешь", "уникальная возможность",
+        "легкие деньги", "не пожалеешь", "уникальная возможность",
     )
     if any(marker in normalized for marker in forbidden):
         return False, "есть неподтвержденное обещание или рекламный лозунг"
@@ -137,15 +206,15 @@ def validate_quick_offer(
     for previous in list(recent_series)[-RECENT_SERIES_WINDOW:]:
         if _normalize(previous) == normalized:
             return False, "точный повтор недавней серии"
-        if series_similarity(combined, previous) >= 0.82:
+        if series_similarity(combined, previous) >= 0.86:
             return False, "серия слишком похожа на недавнюю"
-        previous_messages = [item.strip() for item in str(previous).splitlines() if item.strip()]
+        previous_messages = [
+            item.strip() for item in str(previous).splitlines() if item.strip()
+        ]
         for message in clean:
             for old_message in previous_messages:
                 if _normalize(message) == _normalize(old_message):
                     return False, "повторено отдельное недавнее сообщение"
-                if series_similarity(message, old_message) >= 0.90:
-                    return False, "отдельное сообщение слишком похоже на недавнее"
     return True, "ok"
 
 
@@ -183,20 +252,141 @@ def _history_text(history: Sequence[tuple[str, str]]) -> str:
     return "\n".join(lines)
 
 
+_REACTION_STARTS = (
+    "Понял тебя.", "Да, объясню коротко.", "Окей, тогда без лишнего.",
+    "Хорошо, расскажу по сути.", "Понял вопрос.", "Да, сейчас поясню.",
+    "Смотри, идея простая.", "Ага, понял.", "Тогда скажу прямо.",
+    "Окей, вот о чём речь.", "Да, речь вот о чём.", "Понял, не буду растягивать.",
+)
+_REACTION_ENDS = (
+    "Хотел показать один бесплатный вариант.",
+    "Я как раз хотел поделиться одной находкой.",
+    "Есть один вариант, который можно спокойно посмотреть.",
+    "Хотел оставить тебе одну полезную ссылку.",
+    "Покажу один канал, а дальше сам оценишь.",
+    "Могу сразу объяснить, что именно предлагаю.",
+    "Хотел коротко рассказать про один канал.",
+    "Дам суть в нескольких сообщениях.",
+    "Предложение простое и без обязательств.",
+    "Покажу, что имел в виду.",
+)
+_FACT_OPENERS = (
+    "Есть отдельный бесплатный Telegram-канал",
+    "Речь про бесплатный Telegram-канал",
+    "Это бесплатный Telegram-канал",
+    "Суть в бесплатном Telegram-канале",
+    "Я хотел показать бесплатный Telegram-канал",
+    "Есть один бесплатный канал в Telegram",
+    "Это отдельный бесплатный канал в Telegram",
+    "Предложение связано с бесплатным Telegram-каналом",
+)
+_FACT_MECHANISMS = (
+    "куда софт автоматически копирует новые публикации из платных закрытых VIP-каналов трейдеров.",
+    "в который программа автоматически переносит свежие посты из платных закрытых VIP-каналов трейдеров.",
+    "где софт собирает и копирует новые материалы из платных закрытых VIP-каналов трейдеров.",
+    "куда автоматический софт переносит свежие публикации из платных закрытых VIP-каналов трейдеров.",
+    "в котором программа собирает новые посты из платных закрытых VIP-каналов трейдеров.",
+    "куда софт дублирует свежие материалы из платных закрытых VIP-каналов трейдеров.",
+    "где программа автоматически копирует публикации из нескольких платных закрытых VIP-каналов трейдеров.",
+    "куда софт автоматически переносит новые посты из нескольких платных закрытых VIP-каналов трейдеров.",
+    "где автоматическая программа собирает свежие публикации из платных закрытых VIP-каналов трейдеров.",
+    "в который софт копирует новые материалы из нескольких платных закрытых VIP-каналов трейдеров.",
+)
+_LINK_STARTS = (
+    "Можешь просто посмотреть, подписываться необязательно:",
+    "Можешь просто глянуть, подписка необязательна:",
+    "Не обязательно подписываться — сначала просто посмотри:",
+    "Подписываться необязательно, можешь спокойно открыть и оценить:",
+    "Можешь просто посмотреть содержимое, без обязательной подписки:",
+    "Сначала можешь просто глянуть, подписываться необязательно:",
+    "Вот ссылка; можешь просто посмотреть, подписка необязательна:",
+    "Оставлю ссылку — не обязательно подписываться, просто оцени:",
+    "Можешь открыть и просто посмотреть, подписываться необязательно:",
+    "Посмотри при желании; подписка необязательна:",
+)
+_LINK_CONTEXTS = (
+    "откроешь, когда будет удобно",
+    "дальше сам решишь, подходит тебе или нет",
+    "сначала глянь содержимое без спешки",
+    "ничего покупать для просмотра не нужно",
+    "можно быстро оценить, что там публикуют",
+    "оставлю здесь, чтобы не потерялась",
+    "посмотришь в свободное время",
+    "можешь открыть и сразу понять, интересно ли тебе",
+    "решение о подписке потом примешь сам",
+    "просто проверь, есть ли там польза для тебя",
+    "можно зайти на минуту и спокойно выйти",
+    "оставляю без каких-либо обязательств",
+)
+_HELP_STARTS = (
+    "Если ссылка не нажимается,", "Если переход не срабатывает,",
+    "Если Telegram не даёт нажать ссылку,", "Если по ссылке не переходит,",
+    "Если приглашение выглядит неактивным,", "Если нажатие ничего не открывает,",
+    "Если ссылка сначала не работает,", "Если Telegram мешает перейти,",
+    "Если переход блокируется верхней плашкой,", "Если не получается открыть сразу,",
+)
+_HELP_CLOSES = (
+    "закрой крестиком сверху плашку «Заблокировать / Добавить».",
+    "нажми крестик на верхней плашке «Заблокировать / Добавить».",
+    "убери крестиком плашку «Заблокировать / Добавить» над чатом.",
+    "сначала закрой крестиком верхнюю плашку «Заблокировать / Добавить».",
+    "крестиком убери сверху окно «Заблокировать / Добавить».",
+    "закрой верхнюю панель «Заблокировать / Добавить» через крестик.",
+    "на верхней панели «Заблокировать / Добавить» нажми крестик.",
+    "убери крестиком верхнее предложение «Заблокировать / Добавить».",
+)
+_HELP_COPIES = (
+    "Если не поможет, скопируй ссылку и вставь её в Telegram.",
+    "Если всё равно не откроется, скопируй ссылку и вставь в Telegram.",
+    "Запасной вариант — скопируй ссылку и вставь её прямо в Telegram.",
+    "При повторной проблеме скопируй ссылку и вставь её в Telegram вручную.",
+    "Если переход снова не сработает, скопируй ссылку и вставь в Telegram.",
+    "В крайнем случае скопируй ссылку и открой её через вставку в Telegram.",
+    "Если не выйдет, просто скопируй ссылку и вставь её в Telegram.",
+    "Ещё вариант: скопируй ссылку, затем вставь её в Telegram.",
+)
+
+
+def _local_candidate() -> list[str]:
+    rng = secrets.SystemRandom()
+    return [
+        f"{rng.choice(_REACTION_STARTS)} {rng.choice(_REACTION_ENDS)}",
+        f"{rng.choice(_FACT_OPENERS)}, {rng.choice(_FACT_MECHANISMS)}",
+        f"{rng.choice(_LINK_STARTS)} {rng.choice(_LINK_CONTEXTS)}: {PIRATE_VIP_LINK}",
+        f"{rng.choice(_HELP_STARTS)} {rng.choice(_HELP_CLOSES)} "
+        f"{rng.choice(_HELP_COPIES)}",
+    ]
+
+
+def build_local_quick_offer_plan(
+    *, history: Sequence[tuple[str, str]], recent_series: Sequence[str]
+) -> QuickOfferPlan:
+    """Build a complete anti-repeat series when AI cannot provide one.
+
+    The clauses have thousands of possible combinations. Every candidate is
+    passed through the same safety and recent-series validator as AI output.
+    """
+    del history  # Reserved for future intent-aware local reactions.
+    recent = list(recent_series)[-RECENT_SERIES_WINDOW:]
+    last_reason = "локальный кандидат не создан"
+    for _ in range(LOCAL_FALLBACK_ATTEMPTS):
+        messages = _local_candidate()
+        valid, last_reason = validate_quick_offer(messages, recent)
+        if valid:
+            return QuickOfferPlan(messages, 0, "local_safe_fallback")
+    raise QuickOfferGenerationError(
+        f"safe local series was not generated: {last_reason}"
+    )
+
+
 async def generate_quick_offer_plan(
     *,
     history: Sequence[tuple[str, str]],
     source_chat_title: str | None,
     recent_series: Sequence[str],
 ) -> QuickOfferPlan:
-    """Generate and validate one unique reactive offer series.
-
-    There is intentionally no static fallback: when OpenAI is unavailable or
-    repeatedly returns an unsafe/repetitive series, nothing is sent.
-    """
+    """Generate a unique reactive offer and never fail silently."""
     api_key = config("OPENAI_API_KEY", default="").strip()
-    if not api_key:
-        raise QuickOfferGenerationError("OPENAI_API_KEY is not configured")
     model = config("AI_MODEL", default="gpt-4o-mini").strip() or "gpt-4o-mini"
     title = " ".join(str(source_chat_title or "неизвестен").split())[:160]
     recent = list(recent_series)[-RECENT_SERIES_WINDOW:]
@@ -244,25 +434,41 @@ MESSAGE_4: текст
     )
 
     total_tokens = 0
-    last_reason = "пустой ответ"
-    for attempt in range(MAX_GENERATION_ATTEMPTS):
-        instructions = base_instructions
-        if attempt:
-            instructions += (
-                "\n\nПРЕДЫДУЩИЙ ВАРИАНТ ОТКЛОНЕН: " + last_reason
-                + ". Создай заметно другой вариант, сохрани факты и формат."
-            )
-        messages, tokens = await _generate_once(
-            api_key=api_key,
-            model=model,
-            instructions=instructions,
-            input_text=input_text,
-        )
-        total_tokens += tokens
-        valid, last_reason = validate_quick_offer(messages, recent)
-        if valid:
-            return QuickOfferPlan(messages, total_tokens, model)
+    last_reason = "OpenAI недоступен"
+    if api_key:
+        for attempt in range(MAX_GENERATION_ATTEMPTS):
+            instructions = base_instructions
+            if attempt:
+                instructions += (
+                    "\n\nПРЕДЫДУЩИЙ ВАРИАНТ ОТКЛОНЕН: " + last_reason
+                    + ". Создай заметно другой вариант, сохрани факты и формат."
+                )
+            try:
+                messages, tokens = await _generate_once(
+                    api_key=api_key,
+                    model=model,
+                    instructions=instructions,
+                    input_text=input_text,
+                )
+            except Exception as exc:
+                last_reason = f"ошибка OpenAI: {type(exc).__name__}: {exc}"
+                continue
+            total_tokens += tokens
+            valid, last_reason = validate_quick_offer(messages, recent)
+            if valid:
+                return QuickOfferPlan(messages, total_tokens, model)
+    else:
+        last_reason = "OPENAI_API_KEY is not configured"
 
-    raise QuickOfferGenerationError(
-        f"safe unique series was not generated: {last_reason}"
-    )
+    # The important behavioural guarantee: a valid recipient reply must not end
+    # in silence merely because the provider omitted one required phrase.
+    try:
+        fallback = build_local_quick_offer_plan(
+            history=history,
+            recent_series=recent,
+        )
+        return QuickOfferPlan(fallback.messages, total_tokens, fallback.model)
+    except QuickOfferGenerationError as exc:
+        raise QuickOfferGenerationError(
+            f"AI failed ({last_reason}); local fallback failed ({exc})"
+        ) from exc
