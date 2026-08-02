@@ -1,0 +1,44 @@
+TgBlaster v1.0.14 - verification summary
+
+Base archive:
+TgBlaster-dm-ai-dialog-v1_0_13_first_dm_queue_regression_fix(1)(2).zip
+SHA-256: bedaa19bfc3c9ac645e5836ce561ca3d0621366668a62ed6558d95272c581c24
+
+Protected first-DM files (byte-for-byte unchanged from v1.0.13):
+services/first_message.py
+SHA-256: a34f2613c338b1f89284335d2462cc1ed1b1e43b3063dcdf4a511a3b7f0f32aa
+
+handlers/dm/dm_handlers.py
+SHA-256: e3314ad1aeab97b399a11a3ce4aeb1d42b73e29dd73c265e390a3540613dffe6
+
+Changed runtime scope:
+- services/ai_dialog_service.py
+- services/maxim_sales_funnel.py (new)
+- handlers/ai_dialog/ai_admin_handlers.py
+
+Documentation/configuration scope:
+- .env.example
+- README.md
+- VERSION
+- PATCH_NOTES_v1_0_14_MAXIM_CONTEXT_SALES_FUNNEL.txt
+
+Tests added:
+- tests/test_first_dm_unchanged.py
+- tests/test_maxim_sales_funnel.py
+
+Validation completed:
+- Python compileall: PASS
+- Main-module import smoke test: PASS
+- unittest: 8/8 PASS
+- Full local fallback funnel reaches exact link: PASS
+- Benefit/business-model branch: PASS
+- Scam/naeb branch remains active and uses no-pressure reply: PASS
+- Direct opt-out closes AI follow-up: PASS
+- Question «а платить не надо?» is not a false opt-out: PASS
+- VIP first DM does not cause a repeated VIP question: PASS
+- First-DM module hash guard: PASS
+- DM runtime hash guard: PASS
+
+Not executed:
+- Real Telegram sends/login/FloodWait scenarios.
+- Real OpenAI network request (local fallback and prompt/validation path were tested without a key).

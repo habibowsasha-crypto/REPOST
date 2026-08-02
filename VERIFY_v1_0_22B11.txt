@@ -1,0 +1,68 @@
+TgBlaster v1.0.22b11 — VERIFY
+================================
+
+Base archive
+------------
+TgBlaster-dm-ai-dialog-v1_0_22b10_ai_quick_offer_reliable_reply.zip
+SHA-256: 26206a2975695287de8baa69001ff5fa5bc0ce9d145c9ac9b4537091254a5a92
+
+Implemented scope
+-----------------
+- Per-account on/off button for official @SpamBot monitoring.
+- Persistent SQLite state and due timer.
+- PeerFlood queues an immediate @SpamBot check only when the feature is enabled.
+- Restriction timestamp parser for English and Russian month names.
+- Next check = restriction end + 1 minute.
+- 15-minute retry after no response, API error or unrecognized reply.
+- 5-minute guard when @SpamBot repeats an already elapsed timestamp.
+- Exact free-status recognition in Russian plus known English variants.
+- Admin notification and manual resume button after free status.
+- No automatic first-DM resume.
+- Existing queue remains intact.
+
+Automated verification
+----------------------
+- Python compileall: PASS
+- AST parse: 66 Python files, 0 errors
+- Full pytest suite with project test stubs: 150 passed
+- unittest subtests reported by pytest: 38 passed
+- New @SpamBot monitor tests: 6 passed
+- Legacy database migration simulation: PASS
+- Main module import with test stubs: PASS
+- Secret-pattern scan: 0 likely production secrets detected
+
+First-message preservation
+--------------------------
+The following files are byte-identical to v1.0.22b10:
+- services/first_message.py
+  SHA-256 a34f2613c338b1f89284335d2462cc1ed1b1e43b3063dcdf4a511a3b7f0f32aa
+- services/first_message_kirill_vip.py
+  SHA-256 94f8c82b6077af0eefecd3f9dbc927a4adc876680fc0e6ee187a5a8d6f33282b
+- services/kirill_vip_funnel.py
+  SHA-256 dd0d2d215d943914cbe2af3865ae02f4e6900100ab3ab6094f45ae8916326892
+- services/first_message_ai_quick_offer.py
+  SHA-256 932eaed9a1a2a867b235666861b8c2a4103bfabc863285c5af9e22ccb7779739
+
+Changed production files
+------------------------
+- handlers/account/account_management.py
+- handlers/account/delete_account_handlers.py
+- handlers/dm/dm_handlers.py
+- handlers/dm/dm_management_handlers.py
+- main.py
+- services/spambot_monitor.py (new)
+- utils/database/database.py
+- README.md
+- VERSION
+
+Honest test boundary
+--------------------
+No live Telegram account or live @SpamBot request was used in the offline verification environment.
+The Telethon conversation path is covered by deterministic fake-client tests; final confirmation of Telegram's current localized response format must be observed in Railway logs after deployment.
+
+Deployment
+----------
+- No new Railway Variables are required.
+- Keep one Railway replica.
+- Existing /data/sessions.db is migrated in place.
+- Enable monitoring separately in each account card.

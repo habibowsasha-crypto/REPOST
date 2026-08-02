@@ -1,0 +1,55 @@
+TgBlaster v1.0.20 — INTERNAL VERIFICATION
+Date: 2026-07-15
+
+BASE
+- Built strictly from: TgBlaster-dm-ai-dialog-v1_0_19_link_access_help.zip
+- Base ZIP SHA-256: b0b37150d73231b1ecf08fbb8bacda5de1ae34fbcf248c9939802c4e33594d59
+- VERSION: 1.0.20
+
+IMPLEMENTED
+- Every successfully delivered approved invitation link is followed by one separate Telegram UI hint.
+- Default pause before the hint: 3–7 seconds.
+- The hint explains how to close «Заблокировать / Добавить» with the cross on the right.
+- The hint also tells the user to retry the link or copy it into Telegram.
+- Curated pool: 24 unique variants, all validated by code and tests.
+- Persistent per-account rotation excludes the 12 most recently used variants.
+- Old variants return to the pool later, so repetition is possible only over time, not consecutively.
+- Rotation persists in SQLite table ai_link_help_usage across process restarts.
+- The usage table is bounded to the latest 240 rows per connected account.
+- Explicit link resend also receives another, non-recent hint variant.
+- The automatic hint contains no invitation link and does not count against the normal sales follow-up cap.
+- A failed optional hint does not convert an already delivered invitation link into send_error.
+- Generated multi-message sales replies are validated so the link is the final sales message before the automatic hint.
+
+OPTIONAL VARIABLES
+- AI_LINK_HELP_DELAY_MIN_SECONDS=3
+- AI_LINK_HELP_DELAY_MAX_SECONDS=7
+- Both have defaults and are not required in Railway.
+
+TESTS
+- python -m compileall -q . : PASS
+- python -m unittest discover -s tests -v : PASS, 52 tests
+- python -m pytest -q : PASS, 52 tests + 38 subtests
+- pyflakes on changed runtime/tests : PASS
+- Runtime import with isolated environment : PASS
+- Fresh SQLite bootstrap : PASS
+- v1.0.19 database -> v1.0.20 migration : PASS
+- Variant pool integrity: 24 unique, all mandatory meanings present : PASS
+- Persistent recent-variant rotation : PASS
+- Initial link -> immediate separate help : PASS
+- Explicit resend -> different help variant : PASS
+- Optional help send failure preserves active post-link dialog : PASS
+- Secret-pattern scan : PASS, no real API keys, Telegram sessions, databases or logs included
+
+REGRESSION PROTECTION
+- services/first_message.py SHA-256 before: a34f2613c338b1f89284335d2462cc1ed1b1e43b3063dcdf4a511a3b7f0f32aa
+- services/first_message.py SHA-256 after : a34f2613c338b1f89284335d2462cc1ed1b1e43b3063dcdf4a511a3b7f0f32aa
+- handlers/dm/dm_handlers.py SHA-256 before: 09532010f9074dc254bf14cce6dd617eccd83d5c40fbf6723dec54e84a93bc13
+- handlers/dm/dm_handlers.py SHA-256 after : 09532010f9074dc254bf14cce6dd617eccd83d5c40fbf6723dec54e84a93bc13
+- No first-DM recipient rule, queue format, timing, template selection, limit or Telegram send path changed.
+
+HONEST LIMITS
+- No real Telegram message was sent during offline verification.
+- No real OpenAI request was made.
+- Telegram UI wording can differ by platform, language and app version; the hint matches the supplied Russian mobile Telegram screenshot and retains a copy fallback.
+- The 24 variants are curated local texts rather than unrestricted AI rewrites. This is deliberate: it keeps the instruction accurate while still providing long-term variation.

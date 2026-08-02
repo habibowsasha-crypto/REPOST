@@ -1,0 +1,46 @@
+TgBlaster v1.0.15 verification
+Date: 2026-07-15
+
+Base archive:
+TgBlaster-dm-ai-dialog-v1_0_14_maxim_context_sales_funnel.zip
+SHA-256: 72c0d53d97cb4852c91c94d973b49db78cc51ac6090ec6ca82f8891b4e27741d
+
+Source integrity:
+services/first_message.py
+a34f2613c338b1f89284335d2462cc1ed1b1e43b3063dcdf4a511a3b7f0f32aa
+UNCHANGED byte-for-byte from v1.0.13/v1.0.14.
+
+handlers/dm/dm_handlers.py
+278e22272c133864aee18d718757cf9afa8029a4c36c1f0405be70e1368ec05f
+Changed only for persistent opt-out queue purge and checks before enqueue/send.
+
+services/maxim_sales_funnel.py
+34e179458282dde720ad66bac97294d7a2b175bd139dcde6641534ea0982ed3f
+
+services/ai_dialog_service.py
+5d1b893f0093e53172b9bbf0e55afb1182d9e2d67fdb97590898a62dcf9ae1af
+
+services/dm_opt_out.py
+1204446fbb97eff636390d176fc96fa53f0376bb7f7d7720ea04f49b23c51dcf
+
+utils/database/database.py
+eef771e09c6d5b6697d60390cb670dec133c001dd0a0855f71e57020e60dcc9a
+
+handlers/ai_dialog/ai_admin_handlers.py
+037ac24ffe8c8c47d1a5f3246a8d2ab7a8b92f72ef57da5ce29659219e0025ba
+
+Checks completed:
+- Python compileall: PASS
+- unittest discover: PASS (10 tests)
+- main.py import with isolated environment: PASS
+- clean SQLite schema creation: PASS
+- dm_opt_out_users table and index: PASS
+- global opt-out persistence: PASS
+- runtime removal from live queues: PASS (2 queue entries removed in smoke test)
+- manual opt-out removal: PASS
+- future dialog reopens only after a new first DM: PASS
+- exact PIRATE VIP FREE link preserved: PASS
+- forbidden vague wording absent from generated local replies: PASS
+- wording uses "моментально" / "сразу", not "почти моментально": PASS
+
+Live Telegram sends and live OpenAI calls were not executed.

@@ -1,0 +1,31 @@
+TgBlaster v1.0.22b — INTERNAL VERIFICATION SUMMARY
+Дата: 2026-07-16
+
+Проверено до упаковки:
+- Python compileall: успешно.
+- unittest: 89/89 успешно.
+- pytest: 89 тестов + 38 подтестов успешно.
+- pyflakes изменённых runtime/test-файлов: замечаний нет.
+- services/first_message.py SHA-256:
+  a34f2613c338b1f89284335d2462cc1ed1b1e43b3063dcdf4a511a3b7f0f32aa
+- Чистая SQLite-база и повторный запуск миграций: успешно.
+- Реальная база, созданная кодом v1.0.20, мигрирована в v1.0.22b без потери
+  DM-задачи, чата и account pacing defaults.
+- Реальная база, созданная кодом v1.0.21, мигрирована с объединением
+  account-wide дублей, сохранением двух source-связей и переносом владельца
+  pending-строки на активную задачу.
+- Legacy UNIQUE(dm_task_id,target_user_id) удаляется безопасной rebuild-миграцией.
+- dm_pending_sources мигрирует к PK
+  (pending_id, dm_task_id, source_chat_id).
+- 10 000 queue rows: due query использует idx_dm_pending_account_due;
+  SQL-пагинация использует idx_dm_pending_task_due.
+- Проверены: отсутствие burst, общий pacing двух задач, FloodWait, PeerFlood,
+  graceful stop/restart, uncertain delivery, unresolved-peer backoff, удаление
+  задачи, multi-source reassignment, очистка очереди и bounds ручного ввода.
+
+Честные ограничения:
+- Реальные Telegram/OpenAI/Railway вызовы не выполнялись.
+- Для production требуется одна Railway replica.
+- Этап C ещё не выполнен: Telethon client/private listener остаётся на уровне
+  DM-задачи; остановка задачи останавливает получение личных ответов через её
+  клиент до повторного запуска.

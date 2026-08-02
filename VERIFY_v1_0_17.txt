@@ -1,0 +1,22 @@
+TgBlaster v1.0.17 verification
+
+Base: v1.0.16 SHA-256 ca54d9008d350ee425ca2b955ec19f606bed8ae02b836bfddbb91e2047976fed
+
+PASS: full project compileall
+PASS: runtime import with safe dummy ENV
+PASS: clean SQLite schema creation/migrations
+PASS: 17/17 unit tests
+PASS: completed contact blocks only the same connected account
+PASS: a different connected account remains eligible
+PASS: clear by source chat removes only completed-contact blocks
+PASS: clear sends no message and does not touch permanent opt-out
+PASS: before-link inactivity 72h -> abandoned without repeat block
+PASS: post-link inactivity 72h -> completed with same-account repeat block
+PASS: post-link user reply -> one final answer -> completed
+PASS: global explicit opt-out remains persistent
+PASS: check before queue and immediately before first-DM send
+PASS: first-DM queue remains exactly (target_id, sender)
+PASS: services/first_message.py byte-identical; SHA-256 a34f2613c338b1f89284335d2462cc1ed1b1e43b3063dcdf4a511a3b7f0f32aa
+PASS: no .env, DB, sessions, logs or pyc included
+
+Not performed: real Telegram sends/logins, live FloodWait/PeerFlood, real OpenAI network calls.
