@@ -1218,8 +1218,29 @@ def prepare_unified_send_for_account(account_user_id: int) -> Optional[dict[str,
 
 
 def mark_unified_lead_sent(pending_id: int, account_user_id: int) -> None:
+    """Mark the lead sent and drop the same user from every other queue/pool row."""
     now = _iso(utc_now())
+    pending_id = int(pending_id)
+    account_user_id = int(account_user_id)
+    target_user_id: int | None = None
     with _db_lock, conn:
+        row = conn.execute(
+            "SELECT target_user_id FROM dm_pending_queue WHERE id=?",
+            (pending_id,),
+        ).fetchone()
+        if row:
+            target_user_id = int(row[0])
+        if target_user_id is None:
+            row = conn.execute(
+                """
+                SELECT target_user_id FROM dm_unified_leads
+                 WHERE legacy_pending_id=? OR id=?
+                 LIMIT 1
+                """,
+                (pending_id, pending_id),
+            ).fetchone()
+            if row:
+                target_user_id = int(row[0])
         conn.execute(
             """
             UPDATE dm_unified_leads
@@ -1233,21 +1254,54 @@ def mark_unified_lead_sent(pending_id: int, account_user_id: int) -> None:
                    updated_at=?
              WHERE legacy_pending_id=?
                 OR (
-                    target_user_id=(
-                        SELECT target_user_id FROM dm_pending_queue WHERE id=?
+                    ? IS NOT NULL
+                    AND target_user_id=?
+                    AND status IN (
+                        'reserved','claimed','sending','pending',
+                        'retry_wait','unresolved_peer'
                     )
-                    AND status IN ('reserved','claimed','sending','pending')
                 )
             """,
             (
                 now,
-                int(account_user_id),
-                int(pending_id),
+                account_user_id,
+                pending_id,
                 now,
-                int(pending_id),
-                int(pending_id),
+                pending_id,
+                target_user_id,
+                target_user_id,
             ),
         )
+        if target_user_id is not None:
+            # Any other unified leads for the same person become cancelled.
+            conn.execute(
+                """
+                UPDATE dm_unified_leads
+                   SET status='cancelled',
+                       last_error='sent_by_another_account',
+                       reserved_by_account_user_id=NULL,
+                       reserved_at=NULL,
+                       reserve_token=NULL,
+                       updated_at=?
+                 WHERE target_user_id=?
+                   AND status NOT IN ('sent','cancelled')
+                """,
+                (now, target_user_id),
+            )
+    if target_user_id is not None:
+        try:
+            from services.dm_task_queue import cancel_target_globally
+
+            cancel_target_globally(
+                target_user_id,
+                "sent_via_unified_queue",
+                except_pending_id=pending_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[DM unified] global cancel after send failed "
+                f"target={target_user_id}: {exc}"
+            )
 
 
 def release_unified_lead_for_pending(

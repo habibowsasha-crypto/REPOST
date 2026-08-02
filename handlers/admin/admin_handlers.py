@@ -131,16 +131,16 @@ def _format_queue_mode_screen() -> tuple[str, list]:
 
     stats = unified_queue_stats()
     enabled = stats["mode"] == MODE_UNIFIED
-    mode_line = (
-        "🟢 <b>включена</b> (аккаунты берут лидов из одного пула)"
-        if enabled
-        else "⚪ <b>выключена</b> — сейчас очередь по аккаунтам"
-    )
+    if enabled:
+        mode_line = "🟢 <b>Включена</b> — аккаунты пишут из общего пула"
+    else:
+        mode_line = "⚪ <b>Выключена</b> — очередь по аккаунтам (соло)"
+
     next_line = "—"
     if stats["next_global_send_in_seconds"] is not None:
         sec = int(stats["next_global_send_in_seconds"])
         if sec <= 0:
-            next_line = "сейчас свободен"
+            next_line = "свободен"
         elif sec < 120:
             next_line = f"через {sec} сек"
         else:
@@ -149,24 +149,34 @@ def _format_queue_mode_screen() -> tuple[str, list]:
     by = stats.get("by_status") or {}
     pending = int(by.get("pending", 0))
     retry = int(by.get("retry_wait", 0)) + int(by.get("unresolved_peer", 0))
-    reserved = int(by.get("reserved", 0)) + int(by.get("claimed", 0)) + int(by.get("sending", 0))
+    reserved = (
+        int(by.get("reserved", 0))
+        + int(by.get("claimed", 0))
+        + int(by.get("sending", 0))
+    )
     uncertain = int(by.get("uncertain_delivery", 0))
     ready = int(stats["ready_leads"])
+    active = int(stats["active_leads"])
+    sent = int(stats["sent_leads"])
+    preferred_paused = int(stats["preferred_account_paused_leads"])
+    spacing = f"{stats['global_spacing_min']}–{stats['global_spacing_max']} сек"
 
     text = (
-        "🌐 <b>Общая очередь первых DM</b>\n\n"
-        f"Режим: {mode_line}\n\n"
-        f"К отправке: <b>{ready}</b> | "
-        f"В обработке/резерве: <b>{reserved}</b> | "
-        f"Спорных: <b>{uncertain}</b>\n"
-        f"Ожидают/retry: <b>{pending + retry}</b>\n"
-        f"Всего активных: <b>{stats['active_leads']}</b> чел. | "
-        f"✅ Отправлено (в пуле): <b>{stats['sent_leads']}</b>\n"
-        f"Preferred-аккаунт на паузе: <b>{stats['preferred_account_paused_leads']}</b>\n\n"
-        f"Общая пауза: <b>{stats['global_spacing_min']}–{stats['global_spacing_max']} сек</b>\n"
-        f"Следующий слот: <b>{next_line}</b>\n\n"
-        "Это сводка по <b>общему пулу</b> (как список DM-задач, но на весь бот).\n"
-        "Список людей — кнопка «👥 Лиды пула»."
+        "🌐 <b>Общая очередь первых DM</b>\n"
+        f"{mode_line}\n\n"
+        f"📬 <b>К отправке:</b> {ready}\n"
+        f"⚙️ <b>В работе:</b> {reserved}\n"
+        f"⚠️ <b>Спорных:</b> {uncertain}\n"
+        f"⏳ <b>Ожидают / retry:</b> {pending + retry}\n"
+        f"👥 <b>Всего в пуле:</b> {active}\n"
+        f"✅ <b>Уже написали:</b> {sent}\n"
+        f"⏸ <b>Preferred на паузе:</b> {preferred_paused}\n\n"
+        f"⏱ <b>Общая пауза:</b> {spacing}\n"
+        f"🚀 <b>Слот:</b> {next_line}\n\n"
+        "📦 <b>Модуль:</b> 🤖 AI Первый DM\n"
+        "📋 <b>Соло-задачи:</b> мониторинг чатов работает, "
+        "отправка из их очередей на паузе\n"
+        "🔁 После отправки человек снимается из очередей всех аккаунтов"
     )
     toggle_label = (
         "↩️ Выключить общую очередь"
@@ -184,14 +194,16 @@ def _format_queue_mode_screen() -> tuple[str, list]:
             Button.inline("2–5 мин", b"queue_spacing_120_300"),
             Button.inline("5–10 мин", b"queue_spacing_300_600"),
         ],
-        [Button.inline("✏️ Своя пауза (мин–макс сек)", b"queue_spacing_custom")],
-        [Button.inline("🔄 Обновить", b"menu_queue_mode")],
-        [Button.inline("🏠 Главное меню", b"menu_home")],
+        [Button.inline("✏️ Своя пауза", b"queue_spacing_custom")],
+        [
+            Button.inline("🔄 Обновить", b"menu_queue_mode"),
+            Button.inline("🏠 Меню", b"menu_home"),
+        ],
     ]
     return text, buttons
 
 
-def _format_unified_lead_card(row: dict) -> str:
+def _format_unified_lead_card(row: dict, *, index: int) -> str:
     from services.account_profiles import format_account_label
     from services.first_dm_modules import first_dm_module_label
 
@@ -203,9 +215,9 @@ def _format_unified_lead_card(row: dict) -> str:
     if username:
         lead = f"@{html.escape(username[:32])}"
     elif full_name:
-        lead = f"{html.escape(full_name[:32])} <i>(без @username)</i>"
+        lead = f"{html.escape(full_name[:32])} <i>без @</i>"
     else:
-        lead = "<i>без @username</i>"
+        lead = "<i>без username</i>"
 
     status = str(row.get("status") or "pending")
     status_map = {
@@ -219,42 +231,22 @@ def _format_unified_lead_card(row: dict) -> str:
     }
     status_label = status_map.get(status, status)
     chat = " ".join(str(row.get("source_chat_title") or "").split()) or "—"
-    if len(chat) > 40:
-        chat = chat[:39] + "…"
+    if len(chat) > 36:
+        chat = chat[:35] + "…"
     preferred = row.get("preferred_account_user_id")
-    reserved_by = row.get("reserved_by_account_user_id")
-    module = first_dm_module_label(row.get("first_dm_module"))
     preferred_line = "—"
     if preferred is not None:
         try:
             preferred_line = html.escape(
-                format_account_label(int(preferred), include_id=True, max_length=42)
+                format_account_label(int(preferred), include_id=True, max_length=36)
             )
         except Exception:
             preferred_line = str(preferred)
-    reserved_line = ""
-    if reserved_by is not None:
-        try:
-            reserved_line = (
-                "\nРезерв акк.: <b>"
-                + html.escape(
-                    format_account_label(int(reserved_by), include_id=True, max_length=42)
-                )
-                + "</b>"
-            )
-        except Exception:
-            reserved_line = f"\nРезерв акк.: <b>{reserved_by}</b>"
-    eligible = str(row.get("eligible_at") or "—")
-    if len(eligible) > 25:
-        eligible = eligible[:19]
     return (
-        f"👤 <b>{lead}</b>\n"
+        f"<b>#{index}</b> · {lead}\n"
         f"🆔 <code>{user_id}</code> · {status_label}\n"
-        f"💬 Чат: {html.escape(chat)}\n"
-        f"📦 Модуль: {html.escape(module)}\n"
-        f"⭐ Preferred: {preferred_line}"
-        f"{reserved_line}\n"
-        f"🕒 eligible: <code>{html.escape(eligible)}</code>"
+        f"💬 {html.escape(chat)}\n"
+        f"⭐ {preferred_line}"
     )
 
 
@@ -275,38 +267,46 @@ async def _show_unified_leads_page(event, page: int, *, restart: bool = False) -
     page_ids = snapshot[start : start + _UNIFIED_PAGE_SIZE]
     rows = list_unified_lead_rows_by_ids(page_ids)
 
-    header = (
-        "👥 <b>Лиды общей очереди</b>\n"
-        f"Всего в снимке: <b>{total}</b>\n"
-        f"Страница <b>{page + 1}/{pages}</b>"
-        + (
-            f" · позиции <b>{start + 1}–{start + len(page_ids)}</b>"
-            if page_ids
-            else ""
+    if total:
+        pos = f"{start + 1}–{start + len(page_ids)}"
+        header = (
+            f"👥 <b>Лиды общей очереди</b>\n"
+            f"Всего: <b>{total}</b> · стр. <b>{page + 1}/{pages}</b> · поз. <b>{pos}</b>\n\n"
         )
-        + "\n\n"
-    )
-    if not rows:
-        body = "Пул пуст или все лиды уже завершены."
     else:
-        body = "\n\n".join(_format_unified_lead_card(row) for row in rows)
+        header = "👥 <b>Лиды общей очереди</b>\nПул пуст.\n\n"
+
+    if not rows:
+        body = "<i>Нет активных лидов в снимке.</i>"
+    else:
+        cards = []
+        for i, row in enumerate(rows, start=start + 1):
+            cards.append(_format_unified_lead_card(row, index=i))
+        body = "\n\n".join(cards)
 
     buttons: list = []
     nav = []
     if page > 0:
-        nav.append(Button.inline("⬅️ Назад", f"unified_leads_page_{page - 1}".encode()))
+        nav.append(Button.inline("⬅️", f"unified_leads_page_{page - 1}".encode()))
     if page + 1 < pages:
-        nav.append(Button.inline("Вперёд ➡️", f"unified_leads_page_{page + 1}".encode()))
+        nav.append(Button.inline("➡️", f"unified_leads_page_{page + 1}".encode()))
     if nav:
         buttons.append(nav)
     buttons.append(
         [
-            Button.inline("🔄 Обновить список", b"unified_leads_restart"),
+            Button.inline("🔄 Обновить", b"unified_leads_restart"),
             Button.inline("🌐 К режиму", b"menu_queue_mode"),
         ]
     )
-    buttons.append([Button.inline("🏠 Главное меню", b"menu_home")])
-    await render_menu(event, header + body, buttons=buttons)
+    buttons.append([Button.inline("🏠 Меню", b"menu_home")])
+    await render_menu(
+        event,
+        header + body,
+        buttons=buttons,
+        parse_mode="html",
+        link_preview=False,
+    )
+
 
 
 @bot.on(Query(data=b"menu_queue_mode"))
@@ -316,7 +316,7 @@ async def menu_queue_mode(event: callback_query) -> None:
         return
     await clear_admin_interaction_state(event.sender_id)
     text, buttons = _format_queue_mode_screen()
-    await render_menu(event, text, buttons=buttons)
+    await render_menu(event, text, buttons=buttons, parse_mode="html")
     await event.answer()
 
 
@@ -393,7 +393,7 @@ async def queue_mode_set_unified(event: callback_query) -> None:
     set_queue_mode(MODE_UNIFIED, admin_id=int(event.sender_id))
     await event.answer("Общая очередь включена")
     text, buttons = _format_queue_mode_screen()
-    await render_menu(event, text, buttons=buttons)
+    await render_menu(event, text, buttons=buttons, parse_mode="html")
 
 
 @bot.on(Query(data=b"queue_mode_set_per_account"))
@@ -406,7 +406,7 @@ async def queue_mode_set_per_account(event: callback_query) -> None:
     set_queue_mode(MODE_PER_ACCOUNT, admin_id=int(event.sender_id))
     await event.answer("Режим по аккаунтам")
     text, buttons = _format_queue_mode_screen()
-    await render_menu(event, text, buttons=buttons)
+    await render_menu(event, text, buttons=buttons, parse_mode="html")
 
 
 def _is_queue_spacing_preset(data) -> bool:
@@ -439,7 +439,7 @@ async def queue_spacing_preset(event: callback_query) -> None:
         return
     await event.answer(f"Пауза {low}–{high} сек")
     text, buttons = _format_queue_mode_screen()
-    await render_menu(event, text, buttons=buttons)
+    await render_menu(event, text, buttons=buttons, parse_mode="html")
 
 
 @bot.on(Query(data=b"queue_spacing_custom"))

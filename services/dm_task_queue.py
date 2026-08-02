@@ -1013,16 +1013,41 @@ def cancel_account_target(account_user_id: int, target_user_id: int, reason: str
         return int(cursor.rowcount or 0)
 
 
-def cancel_target_globally(target_user_id: int, reason: str) -> int:
+def cancel_target_globally(
+    target_user_id: int,
+    reason: str,
+    *,
+    except_pending_id: int | None = None,
+) -> int:
+    """Cancel unfinished first-DM rows for this Telegram user on every account.
+
+    Used after a successful first DM so the same person does not stay queued
+    under other accounts/tasks (especially in unified mode).
+    """
+    reason_text = clean_text(reason)
+    now = iso(utc_now())
+    params: list = [reason_text, now, int(target_user_id)]
+    except_sql = ""
+    if except_pending_id is not None:
+        except_sql = " AND id<>?"
+        params.append(int(except_pending_id))
     with _db_lock, conn:
         cursor = conn.execute(
-            """
+            f"""
             UPDATE dm_pending_queue
-               SET status='cancelled', last_error=?, updated_at=?
+               SET status='cancelled',
+                   last_error=?,
+                   claim_token=NULL,
+                   claimed_at=NULL,
+                   updated_at=?
              WHERE target_user_id=?
-               AND status IN ('pending','retry_wait','unresolved_peer','claimed')
+               AND status IN (
+                    'pending','retry_wait','unresolved_peer','claimed',
+                    'sending','uncertain_delivery'
+               )
+               {except_sql}
             """,
-            (clean_text(reason), iso(utc_now()), int(target_user_id)),
+            params,
         )
         return int(cursor.rowcount or 0)
 

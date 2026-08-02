@@ -503,6 +503,9 @@ async def _send_pending_row(row: dict) -> str:
             return "unresolved"
 
         first_dm_module = normalize_first_dm_module(task.get("first_dm_module"))
+        # Unified pool always writes with AI First DM (peer-helper short funnel).
+        if is_unified_queue_mode():
+            first_dm_module = AI_FIRST_DM_MODULE
         if first_dm_module == KIRILL_VIP_MODULE:
             outgoing_text = choose_kirill_vip_first_dm_text()
         elif first_dm_module == AI_QUICK_OFFER_MODULE:
@@ -688,6 +691,21 @@ async def _send_pending_row(row: dict) -> str:
                 f"[DM {task_id}] delivered but AI dialog save failed user={target_id}: {exc}"
             )
         pacing = mark_account_send_completed(account_user_id)
+        # Remove the same person from every other account/task queue.
+        try:
+            removed = cancel_target_globally(
+                target_id,
+                "first_dm_sent_elsewhere",
+                except_pending_id=row_id,
+            )
+            if removed:
+                logger.info(
+                    f"[DM {task_id}] purged {removed} other queue rows for user={target_id}"
+                )
+        except Exception as exc:
+            logger.warning(
+                f"[DM {task_id}] global queue purge failed user={target_id}: {exc}"
+            )
         logger.info(
             f"[DM {task_id}] first DM delivered user={target_id}; account pacing={pacing}s"
         )
