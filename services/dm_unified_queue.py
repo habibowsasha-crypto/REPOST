@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import datetime as dt
 import threading
+import uuid
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -53,6 +54,9 @@ class QueueRuntimeState:
     global_spacing_max: int
     last_global_send_at: Optional[str]
     next_global_send_at: Optional[str]
+    lease_owner_account_user_id: Optional[int]
+    lease_token: Optional[str]
+    lease_expires_at: Optional[str]
     updated_at: str
     updated_by_admin_id: Optional[int]
 
@@ -87,21 +91,40 @@ def ensure_unified_queue_schema() -> None:
                 global_spacing_max INTEGER NOT NULL DEFAULT 60,
                 last_global_send_at TEXT,
                 next_global_send_at TEXT,
+                lease_owner_account_user_id INTEGER,
+                lease_token TEXT,
+                lease_expires_at TEXT,
                 updated_at TEXT NOT NULL,
                 updated_by_admin_id INTEGER
             )
             """
         )
+        # Backward-compatible migration for databases created before b27.
+        runtime_columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(dm_queue_runtime)").fetchall()
+        }
+        for column_name, column_sql in (
+            ("lease_owner_account_user_id", "INTEGER"),
+            ("lease_token", "TEXT"),
+            ("lease_expires_at", "TEXT"),
+        ):
+            if column_name not in runtime_columns:
+                conn.execute(
+                    f"ALTER TABLE dm_queue_runtime ADD COLUMN {column_name} {column_sql}"
+                )
         conn.execute(
             """
             INSERT OR IGNORE INTO dm_queue_runtime (
                 id, mode, global_spacing_min, global_spacing_max,
-                last_global_send_at, next_global_send_at, updated_at,
-                updated_by_admin_id
-            ) VALUES (1, 'per_account', 30, 60, NULL, NULL, ?, NULL)
+                last_global_send_at, next_global_send_at,
+                lease_owner_account_user_id, lease_token, lease_expires_at,
+                updated_at, updated_by_admin_id
+            ) VALUES (1, 'per_account', 30, 60, NULL, NULL, NULL, NULL, NULL, ?, NULL)
             """,
             (now,),
         )
+
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS dm_unified_leads (
@@ -198,8 +221,9 @@ def get_queue_runtime_state() -> QueueRuntimeState:
     row = conn.execute(
         """
         SELECT mode, global_spacing_min, global_spacing_max,
-               last_global_send_at, next_global_send_at, updated_at,
-               updated_by_admin_id
+               last_global_send_at, next_global_send_at,
+               lease_owner_account_user_id, lease_token, lease_expires_at,
+               updated_at, updated_by_admin_id
           FROM dm_queue_runtime
          WHERE id=1
         """
@@ -214,8 +238,11 @@ def get_queue_runtime_state() -> QueueRuntimeState:
         global_spacing_max=int(row[2] or 60),
         last_global_send_at=row[3],
         next_global_send_at=row[4],
-        updated_at=str(row[5] or ""),
-        updated_by_admin_id=int(row[6]) if row[6] is not None else None,
+        lease_owner_account_user_id=int(row[5]) if row[5] is not None else None,
+        lease_token=str(row[6]) if row[6] is not None else None,
+        lease_expires_at=row[7],
+        updated_at=str(row[8] or ""),
+        updated_by_admin_id=int(row[9]) if row[9] is not None else None,
     )
 
 
@@ -821,43 +848,80 @@ def global_gate_wait_seconds() -> Optional[float]:
     if not is_unified_queue_mode():
         return 0.0
     state = get_queue_runtime_state()
+    now = utc_now()
+    lease_expires_at = parse_iso(state.lease_expires_at)
+    if state.lease_token and lease_expires_at is not None and lease_expires_at > now:
+        return max(0.0, (lease_expires_at - now).total_seconds())
     next_at = parse_iso(state.next_global_send_at)
     if next_at is None:
         return 0.0
-    remaining = (next_at - utc_now()).total_seconds()
+    remaining = (next_at - now).total_seconds()
     return remaining if remaining > 0 else 0.0
 
 
-def try_claim_global_send_lease(account_user_id: int, *, lease_seconds: int = 120) -> bool:
-    """Atomically reserve the single global first-DM send window."""
-    from services.dm_task_queue import is_global_first_dm_paused, parse_iso
+def try_claim_global_send_lease(
+    account_user_id: int, *, lease_seconds: int = 300
+) -> Optional[str]:
+    """Atomically reserve the global send window and return its owner token."""
+    from services.dm_task_queue import is_global_first_dm_paused
 
     if is_global_first_dm_paused() or not is_unified_queue_mode():
-        return False
+        return None
     now = utc_now()
+    now_iso = _iso(now)
     lease_until = now + dt.timedelta(seconds=max(30, int(lease_seconds)))
+    token = uuid.uuid4().hex
     ensure_unified_queue_schema()
     with _db_lock, conn:
-        row = conn.execute(
-            "SELECT next_global_send_at FROM dm_queue_runtime WHERE id=1"
-        ).fetchone()
-        next_at = parse_iso(row[0]) if row and row[0] else None
-        if next_at is not None and next_at > now:
-            return False
         cursor = conn.execute(
             """
             UPDATE dm_queue_runtime
-               SET next_global_send_at=?, updated_at=?
+               SET lease_owner_account_user_id=?, lease_token=?,
+                   lease_expires_at=?, updated_at=?
              WHERE id=1
                AND (next_global_send_at IS NULL OR next_global_send_at<=?)
+               AND (lease_token IS NULL OR lease_expires_at IS NULL OR lease_expires_at<=?)
             """,
-            (_iso(lease_until), _iso(now), _iso(now)),
+            (
+                int(account_user_id),
+                token,
+                _iso(lease_until),
+                now_iso,
+                now_iso,
+                now_iso,
+            ),
+        )
+        return token if int(cursor.rowcount or 0) == 1 else None
+
+
+def renew_global_send_lease(
+    account_user_id: int, lease_token: str, *, lease_seconds: int = 300
+) -> bool:
+    """Extend a live lease only when the same account and token still own it."""
+    now = utc_now()
+    with _db_lock, conn:
+        cursor = conn.execute(
+            """
+            UPDATE dm_queue_runtime
+               SET lease_expires_at=?, updated_at=?
+             WHERE id=1
+               AND lease_owner_account_user_id=?
+               AND lease_token=?
+               AND lease_expires_at>?
+            """,
+            (
+                _iso(now + dt.timedelta(seconds=max(30, int(lease_seconds)))),
+                _iso(now),
+                int(account_user_id),
+                str(lease_token),
+                _iso(now),
+            ),
         )
         return int(cursor.rowcount or 0) == 1
 
 
-def complete_global_send_window() -> None:
-    """Apply configured global spacing after a successful first DM."""
+def complete_global_send_window(account_user_id: int, lease_token: str) -> bool:
+    """Apply global spacing only when the caller still owns the lease."""
     import random
 
     state = get_queue_runtime_state()
@@ -866,29 +930,51 @@ def complete_global_send_window() -> None:
     delay = random.randint(low, high)
     now = utc_now()
     with _db_lock, conn:
-        conn.execute(
+        cursor = conn.execute(
             """
             UPDATE dm_queue_runtime
-               SET last_global_send_at=?, next_global_send_at=?, updated_at=?
+               SET last_global_send_at=?, next_global_send_at=?,
+                   lease_owner_account_user_id=NULL, lease_token=NULL,
+                   lease_expires_at=NULL, updated_at=?
              WHERE id=1
+               AND lease_owner_account_user_id=?
+               AND lease_token=?
             """,
-            (_iso(now), _iso(now + dt.timedelta(seconds=delay)), _iso(now)),
+            (
+                _iso(now),
+                _iso(now + dt.timedelta(seconds=delay)),
+                _iso(now),
+                int(account_user_id),
+                str(lease_token),
+            ),
         )
+        return int(cursor.rowcount or 0) == 1
 
 
-def release_global_send_lease(*, retry_seconds: int = 2) -> None:
-    """Free the global window quickly after a failed / skipped send attempt."""
+def release_global_send_lease(
+    account_user_id: int, lease_token: str, *, retry_seconds: int = 2
+) -> bool:
+    """Release only the lease owned by this sender; stale senders cannot clear a new lease."""
     now = utc_now()
     due = now + dt.timedelta(seconds=max(0, int(retry_seconds)))
     with _db_lock, conn:
-        conn.execute(
+        cursor = conn.execute(
             """
             UPDATE dm_queue_runtime
-               SET next_global_send_at=?, updated_at=?
+               SET next_global_send_at=?, lease_owner_account_user_id=NULL,
+                   lease_token=NULL, lease_expires_at=NULL, updated_at=?
              WHERE id=1
+               AND lease_owner_account_user_id=?
+               AND lease_token=?
             """,
-            (_iso(due), _iso(now)),
+            (
+                _iso(due),
+                _iso(now),
+                int(account_user_id),
+                str(lease_token),
+            ),
         )
+        return int(cursor.rowcount or 0) == 1
 
 
 def _account_flood_or_paused(account_user_id: int) -> bool:
@@ -987,9 +1073,37 @@ def _ensure_pending_row_for_account(
     if existing:
         pending_id = int(existing[0])
         prev_status = str(existing[1] or "")
-        # Stuck claimed/sending after crash or lost_race must be reopened,
-        # otherwise claim_pending() always fails and the pool never moves.
-        reopen = prev_status in {"claimed", "sending", "uncertain_delivery"}
+        # Once a Telegram request started, delivery may already have happened.
+        # Preserve the permanent duplicate guard instead of reopening it.
+        if prev_status in {"sending", "uncertain_delivery"}:
+            conn.execute(
+                """
+                UPDATE dm_pending_queue
+                   SET status='uncertain_delivery', claim_token=NULL, claimed_at=NULL,
+                       last_error=CASE
+                         WHEN status='sending' THEN 'unified_send_result_unknown'
+                         ELSE last_error
+                       END,
+                       updated_at=?
+                 WHERE id=?
+                """,
+                (now, pending_id),
+            )
+            conn.execute(
+                """
+                UPDATE dm_unified_leads
+                   SET status='uncertain_delivery', legacy_pending_id=?,
+                       reserved_by_account_user_id=NULL, reserved_at=NULL,
+                       reserve_token=NULL,
+                       last_error='pending_uncertain_duplicate_guard', updated_at=?
+                 WHERE id=?
+                """,
+                (pending_id, now, int(lead["id"])),
+            )
+            return None
+
+        # A stale claim that never started Telegram delivery is safe to reopen.
+        reopen = prev_status == "claimed"
         conn.execute(
             """
             UPDATE dm_pending_queue
@@ -1131,7 +1245,8 @@ def prepare_unified_send_for_account(account_user_id: int) -> Optional[dict[str,
         return None
     if _account_flood_or_paused(account_user_id):
         return None
-    if not try_claim_global_send_lease(account_user_id):
+    global_lease_token = try_claim_global_send_lease(account_user_id)
+    if global_lease_token is None:
         return None
 
     ensure_unified_queue_schema()
@@ -1190,7 +1305,7 @@ def prepare_unified_send_for_account(account_user_id: int) -> Optional[dict[str,
                     )
                 except Exception:
                     pass
-                release_global_send_lease(retry_seconds=2)
+                release_global_send_lease(account_user_id, global_lease_token, retry_seconds=2)
                 return None
 
             lead = {
@@ -1214,39 +1329,32 @@ def prepare_unified_send_for_account(account_user_id: int) -> Optional[dict[str,
                 "legacy_pending_id": int(lead_row[17]) if lead_row[17] is not None else None,
             }
 
+            # access_hash is account-scoped in Telegram. Never copy a hash learned
+            # by another account into the current sender's pending row.
+            account_link = conn.execute(
+                """
+                SELECT access_hash, target_username
+                  FROM dm_unified_lead_accounts
+                 WHERE lead_id=? AND account_user_id=?
+                """,
+                (int(lead["id"]), account_user_id),
+            ).fetchone()
+            if account_link is not None:
+                lead["target_access_hash"] = (
+                    int(account_link[0]) if account_link[0] is not None else None
+                )
+                if account_link[1]:
+                    lead["target_username"] = account_link[1]
+            elif account_user_id not in {
+                lead.get("preferred_account_user_id"),
+                lead.get("source_account_user_id"),
+            }:
+                lead["target_access_hash"] = None
+
             task_id = _pick_active_task_for_account(account_user_id, lead.get("dm_task_id"))
             if task_id is None:
-                release_global_send_lease(retry_seconds=5)
+                release_global_send_lease(account_user_id, global_lease_token, retry_seconds=5)
                 return None
-
-            # Skip targets that can never be written (completed / opt-out)
-            try:
-                from services.dm_contact_analytics import is_completed_contact
-                from services.dm_opt_out import is_opted_out
-                tid = int(lead["target_user_id"])
-                if is_completed_contact(account_user_id, tid) or is_opted_out(tid):
-                    conn.execute(
-                        """
-                        UPDATE dm_unified_leads
-                           SET status='cancelled',
-                               last_error=?,
-                               reserved_by_account_user_id=NULL,
-                               reserved_at=NULL,
-                               reserve_token=NULL,
-                               updated_at=?
-                         WHERE target_user_id=?
-                           AND status NOT IN ('sent','cancelled')
-                        """,
-                        (
-                            "completed_or_opt_out",
-                            now_iso,
-                            tid,
-                        ),
-                    )
-                    release_global_send_lease(retry_seconds=0)
-                    return None
-            except Exception as exc:
-                logger.debug(f"[DM unified] completed/opt-out check skipped: {exc}")
 
             # Reserve lead for this account.
             cursor = conn.execute(
@@ -1263,14 +1371,14 @@ def prepare_unified_send_for_account(account_user_id: int) -> Optional[dict[str,
                 (
                     account_user_id,
                     now_iso,
-                    f"acct-{account_user_id}-{int(now.timestamp())}",
+                    global_lease_token,
                     int(task_id),
                     now_iso,
                     int(lead["id"]),
                 ),
             )
             if int(cursor.rowcount or 0) != 1:
-                release_global_send_lease(retry_seconds=1)
+                release_global_send_lease(account_user_id, global_lease_token, retry_seconds=1)
                 return None
 
             _attach_lead_account(
@@ -1283,16 +1391,23 @@ def prepare_unified_send_for_account(account_user_id: int) -> Optional[dict[str,
             _cancel_other_account_pending(int(lead["target_user_id"]), account_user_id)
             pending_id = _ensure_pending_row_for_account(lead, account_user_id, int(task_id))
             if pending_id is None:
-                conn.execute(
-                    """
-                    UPDATE dm_unified_leads
-                       SET status='pending', reserved_by_account_user_id=NULL,
-                           reserved_at=NULL, reserve_token=NULL, updated_at=?
-                     WHERE id=?
-                    """,
-                    (now_iso, int(lead["id"])),
+                current = conn.execute(
+                    "SELECT status FROM dm_unified_leads WHERE id=?",
+                    (int(lead["id"]),),
+                ).fetchone()
+                if not current or str(current[0]) != "uncertain_delivery":
+                    conn.execute(
+                        """
+                        UPDATE dm_unified_leads
+                           SET status='pending', reserved_by_account_user_id=NULL,
+                               reserved_at=NULL, reserve_token=NULL, updated_at=?
+                         WHERE id=?
+                        """,
+                        (now_iso, int(lead["id"])),
+                    )
+                release_global_send_lease(
+                    account_user_id, global_lease_token, retry_seconds=2
                 )
-                release_global_send_lease(retry_seconds=2)
                 return None
 
             conn.execute(
@@ -1306,12 +1421,13 @@ def prepare_unified_send_for_account(account_user_id: int) -> Optional[dict[str,
             ensure_account_settings(account_user_id)
             row = _load_pending_row(int(pending_id))
             if row is None:
-                release_global_send_lease(retry_seconds=2)
+                release_global_send_lease(account_user_id, global_lease_token, retry_seconds=2)
                 return None
             row["_unified_lead_id"] = int(lead["id"])
+            row["_global_lease_token"] = global_lease_token
             return row
     except Exception:
-        release_global_send_lease(retry_seconds=2)
+        release_global_send_lease(account_user_id, global_lease_token, retry_seconds=2)
         raise
 
 
@@ -1418,29 +1534,18 @@ def release_unified_lead_for_pending(
         else None
     )
     mapped = _map_pending_status(status)
-    # cancelled/sent are terminal — must NOT fall back to pending
-    # (old bug: cancelled not in ACTIVE_LEAD_STATUSES → forced pending → infinite loop)
-    if mapped in {"cancelled", "sent"}:
-        final_status = mapped
-    elif mapped in ACTIVE_LEAD_STATUSES:
-        final_status = mapped
-    else:
-        final_status = "pending"
     with _db_lock, conn:
-        # Resolve target for terminal cancel of all duplicates
-        target_row = conn.execute(
-            "SELECT target_user_id FROM dm_pending_queue WHERE id=?",
-            (int(pending_id),),
-        ).fetchone()
-        target_user_id = int(target_row[0]) if target_row else None
         conn.execute(
-            """
+            f"""
             UPDATE dm_unified_leads
                SET status=?,
                    eligible_at=COALESCE(?, eligible_at),
                    reserved_by_account_user_id=NULL,
                    reserved_at=NULL,
                    reserve_token=NULL,
+                   retry_count=retry_count + CASE
+                     WHEN ? IN ('pending','retry_wait','unresolved_peer') THEN 1 ELSE 0
+                   END,
                    last_error=COALESCE(?, last_error),
                    updated_at=?
              WHERE legacy_pending_id=?
@@ -1452,76 +1557,107 @@ def release_unified_lead_for_pending(
                 )
             """,
             (
-                final_status,
+                mapped if mapped in ACTIVE_LEAD_STATUSES or mapped in {"cancelled", "sent"} else "pending",
                 due_iso,
+                mapped,
                 _clean(error),
                 now_iso,
                 int(pending_id),
                 int(pending_id),
             ),
         )
-        # If terminal cancel/sent, drop every other active lead for same user
-        if final_status in {"cancelled", "sent"} and target_user_id is not None:
-            conn.execute(
-                """
-                UPDATE dm_unified_leads
-                   SET status=?,
-                       last_error=COALESCE(?, last_error),
-                       reserved_by_account_user_id=NULL,
-                       reserved_at=NULL,
-                       reserve_token=NULL,
-                       updated_at=?
-                 WHERE target_user_id=?
-                   AND status NOT IN ('sent', 'cancelled')
-                """,
-                (final_status, _clean(error), now_iso, target_user_id),
-            )
 
 
 
 def recover_stale_pending_claims(*, older_than_seconds: int = 180) -> int:
-    """Reopen claimed/sending pending rows stuck longer than the threshold."""
+    """Recover stale claims without ever retrying an unknown Telegram send."""
     ensure_unified_queue_schema()
     cutoff = _iso(utc_now() - dt.timedelta(seconds=max(30, int(older_than_seconds))))
     now = _iso(utc_now())
     with _db_lock, conn:
-        cursor = conn.execute(
+        claimed = conn.execute(
             """
             UPDATE dm_pending_queue
-               SET status='pending',
-                   claim_token=NULL,
-                   claimed_at=NULL,
-                   send_started_at=NULL,
-                   last_error='stale_claim_reopened',
-                   updated_at=?
-             WHERE status IN ('claimed','sending')
-               AND (
-                    (claimed_at IS NOT NULL AND claimed_at < ?)
-                    OR (send_started_at IS NOT NULL AND send_started_at < ?)
-                    OR (claimed_at IS NULL AND send_started_at IS NULL AND updated_at < ?)
+               SET status='pending', claim_token=NULL, claimed_at=NULL,
+                   send_started_at=NULL, last_error='stale_claim_reopened', updated_at=?
+             WHERE status='claimed'
+               AND COALESCE(claimed_at, updated_at) < ?
+               AND NOT EXISTS (
+                 SELECT 1
+                   FROM dm_unified_leads AS l
+                   JOIN dm_queue_runtime AS r ON r.id=1
+                  WHERE l.legacy_pending_id=dm_pending_queue.id
+                    AND l.status='reserved'
+                    AND l.reserve_token=r.lease_token
+                    AND l.reserved_by_account_user_id=r.lease_owner_account_user_id
+                    AND r.lease_expires_at>?
                )
             """,
-            (now, cutoff, cutoff, cutoff),
-        )
-        return int(cursor.rowcount or 0)
+            (now, cutoff, now),
+        ).rowcount
+        sending = conn.execute(
+            """
+            UPDATE dm_pending_queue
+               SET status='uncertain_delivery', claim_token=NULL, claimed_at=NULL,
+                   last_error='stale_send_marked_uncertain', updated_at=?
+             WHERE status='sending'
+               AND COALESCE(send_started_at, claimed_at, updated_at) < ?
+               AND NOT EXISTS (
+                 SELECT 1
+                   FROM dm_unified_leads AS l
+                   JOIN dm_queue_runtime AS r ON r.id=1
+                  WHERE l.legacy_pending_id=dm_pending_queue.id
+                    AND l.status='reserved'
+                    AND l.reserve_token=r.lease_token
+                    AND l.reserved_by_account_user_id=r.lease_owner_account_user_id
+                    AND r.lease_expires_at>?
+               )
+            """,
+            (now, cutoff, now),
+        ).rowcount
+        return int(claimed or 0) + int(sending or 0)
 
 
 def recover_stale_unified_reservations(*, max_age_seconds: int = 180) -> int:
-    cutoff = _iso(utc_now() - dt.timedelta(seconds=max(60, int(max_age_seconds))))
+    """Recover abandoned reservations while preserving active leases and send guards."""
+    now = utc_now()
+    now_iso = _iso(now)
+    cutoff = _iso(now - dt.timedelta(seconds=max(60, int(max_age_seconds))))
     with _db_lock, conn:
         cursor = conn.execute(
             """
             UPDATE dm_unified_leads
-               SET status='pending',
+               SET status=CASE
+                     WHEN EXISTS (
+                       SELECT 1 FROM dm_pending_queue AS q
+                        WHERE q.id=dm_unified_leads.legacy_pending_id
+                          AND q.status IN ('sending','uncertain_delivery')
+                     ) THEN 'uncertain_delivery'
+                     ELSE 'pending'
+                   END,
                    reserved_by_account_user_id=NULL,
                    reserved_at=NULL,
                    reserve_token=NULL,
-                   last_error='stale_unified_reservation_recovered',
+                   last_error=CASE
+                     WHEN EXISTS (
+                       SELECT 1 FROM dm_pending_queue AS q
+                        WHERE q.id=dm_unified_leads.legacy_pending_id
+                          AND q.status IN ('sending','uncertain_delivery')
+                     ) THEN 'stale_reservation_preserved_uncertain'
+                     ELSE 'stale_unified_reservation_recovered'
+                   END,
                    updated_at=?
              WHERE status='reserved'
-               AND COALESCE(reserved_at, updated_at)<?
+               AND COALESCE(reserved_at, updated_at) < ?
+               AND NOT EXISTS (
+                 SELECT 1 FROM dm_queue_runtime AS r
+                  WHERE r.id=1
+                    AND r.lease_token=dm_unified_leads.reserve_token
+                    AND r.lease_owner_account_user_id=dm_unified_leads.reserved_by_account_user_id
+                    AND r.lease_expires_at>?
+               )
             """,
-            (_iso(utc_now()), cutoff),
+            (now_iso, cutoff, now_iso),
         )
         return int(cursor.rowcount or 0)
 
@@ -1627,6 +1763,7 @@ __all__ = [
     "prepare_unified_send_for_account",
     "recover_stale_unified_reservations",
     "release_global_send_lease",
+    "renew_global_send_lease",
     "release_unified_lead_for_pending",
     "safe_shadow_sync_pending_row",
     "set_global_spacing",

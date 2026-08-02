@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import os
 from types import SimpleNamespace
 from typing import Optional
 
@@ -114,10 +115,35 @@ from services.dm_unified_queue import (
     prepare_unified_send_for_account,
     recover_stale_unified_reservations,
     release_global_send_lease,
+    renew_global_send_lease,
     release_unified_lead_for_pending,
 )
 from utils.database.database import create_dm_tables
 from utils.telegram import gid_key
+
+
+def _telegram_send_timeout_seconds() -> float:
+    """Bound one Telegram delivery attempt below the unified lease lifetime."""
+    try:
+        value = float(os.getenv("TELEGRAM_SEND_TIMEOUT_SECONDS", "90"))
+    except (TypeError, ValueError):
+        value = 90.0
+    return min(110.0, max(15.0, value))
+
+
+async def _global_lease_heartbeat(account_user_id: int, lease_token: str) -> None:
+    """Keep a live unified send lease owned while async pre-send work is running."""
+    try:
+        while True:
+            await asyncio.sleep(60)
+            if not renew_global_send_lease(account_user_id, lease_token):
+                logger.warning(
+                    f"[DM unified] global lease heartbeat lost "
+                    f"account={account_user_id}"
+                )
+                return
+    except asyncio.CancelledError:
+        raise
 
 # Admin setup state.
 dm_setup_state: dict = {}
@@ -552,18 +578,35 @@ async def _send_pending_row(row: dict) -> str:
 
         partial_delivery = False
         try:
-            if task["photo_url"]:
-                if outgoing_text and len(outgoing_text) <= 1024:
-                    await client.send_file(
-                        target_peer, task["photo_url"], caption=outgoing_text
-                    )
+            async def _deliver_first_dm() -> None:
+                nonlocal partial_delivery
+                if task["photo_url"]:
+                    if outgoing_text and len(outgoing_text) <= 1024:
+                        await client.send_file(
+                            target_peer, task["photo_url"], caption=outgoing_text
+                        )
+                    else:
+                        await client.send_file(target_peer, task["photo_url"])
+                        partial_delivery = True
+                        if outgoing_text:
+                            await client.send_message(target_peer, outgoing_text)
                 else:
-                    await client.send_file(target_peer, task["photo_url"])
-                    partial_delivery = True
-                    if outgoing_text:
-                        await client.send_message(target_peer, outgoing_text)
-            else:
-                await client.send_message(target_peer, outgoing_text)
+                    await client.send_message(target_peer, outgoing_text)
+
+            await asyncio.wait_for(
+                _deliver_first_dm(), timeout=_telegram_send_timeout_seconds()
+            )
+        except asyncio.TimeoutError:
+            mark_uncertain(
+                row_id,
+                f"telegram_send_timeout_{int(_telegram_send_timeout_seconds())}s",
+            )
+            mark_account_send_completed(account_user_id)
+            _safe_log_event(task_id, target_id, "uncertain")
+            logger.error(
+                f"[DM {task_id}] Telegram send timeout user={target_id}; marked uncertain"
+            )
+            return "uncertain"
         except UserPrivacyRestrictedError:
             if partial_delivery:
                 mark_uncertain(row_id, "photo_delivered_text_privacy_error")
@@ -770,7 +813,15 @@ async def _account_dispatch_loop(account_user_id: int) -> None:
                         return
                     await asyncio.sleep(2)
                     continue
-                result = await _send_pending_row(row)
+                global_lease_token = str(row.get("_global_lease_token") or "")
+                lease_heartbeat = asyncio.create_task(
+                    _global_lease_heartbeat(account_user_id, global_lease_token)
+                )
+                try:
+                    result = await _send_pending_row(row)
+                finally:
+                    lease_heartbeat.cancel()
+                    await asyncio.gather(lease_heartbeat, return_exceptions=True)
                 pending_id = int(row["id"])
                 if result != "sent":
                     logger.info(
@@ -785,9 +836,11 @@ async def _account_dispatch_loop(account_user_id: int) -> None:
                         logger.warning(
                             f"[DM unified] mark sent failed pending={pending_id}: {exc}"
                         )
-                    complete_global_send_window()
+                    complete_global_send_window(account_user_id, global_lease_token)
                 elif result in {"peer_flood", "flood_wait"}:
-                    release_global_send_lease(retry_seconds=2)
+                    release_global_send_lease(
+                        account_user_id, global_lease_token, retry_seconds=2
+                    )
                     try:
                         release_unified_lead_for_pending(
                             pending_id,
@@ -800,7 +853,9 @@ async def _account_dispatch_loop(account_user_id: int) -> None:
                             f"[DM unified] release after {result} failed: {exc}"
                         )
                 elif result == "cancelled":
-                    release_global_send_lease(retry_seconds=1)
+                    release_global_send_lease(
+                        account_user_id, global_lease_token, retry_seconds=1
+                    )
                     try:
                         release_unified_lead_for_pending(
                             pending_id,
@@ -810,21 +865,26 @@ async def _account_dispatch_loop(account_user_id: int) -> None:
                     except Exception as exc:
                         logger.debug(f"[DM unified] cancel lead: {exc}")
                 elif result in {"uncertain", "known_failure"}:
-                    # Do not free the lead for automatic retry; mirrors legacy guards.
-                    release_global_send_lease(retry_seconds=2)
+                    release_global_send_lease(
+                        account_user_id, global_lease_token, retry_seconds=2
+                    )
                     try:
                         release_unified_lead_for_pending(
                             pending_id,
-                            status="uncertain_delivery"
-                            if result == "uncertain"
-                            else "retry_wait",
+                            status=(
+                                "uncertain_delivery"
+                                if result == "uncertain"
+                                else "cancelled"
+                            ),
                             error=result,
-                            retry_seconds=None if result == "uncertain" else 120,
+                            retry_seconds=None,
                         )
                     except Exception as exc:
                         logger.debug(f"[DM unified] failure lead update: {exc}")
                 else:
-                    release_global_send_lease(retry_seconds=1)
+                    release_global_send_lease(
+                        account_user_id, global_lease_token, retry_seconds=1
+                    )
                     if result in {
                         "lost_race",
                         "task_inactive",
