@@ -1,0 +1,40 @@
+TgBlaster v1.0.22b14 — Общая очередь, Шаг 2 (рабочая отправка)
+==============================================================
+
+Основа: v1.0.22b13 (unified queue step 1 schema/migration/shadow).
+
+Что сделано
+-----------
+1. Режим unified реально влияет на dispatcher:
+   - per_account — прежнее поведение (пауза аккаунта + своя очередь);
+   - unified — общая пауза между любыми first DM, выбор лида из пула.
+
+2. prepare_unified_send_for_account():
+   - резервирует лид;
+   - материализует/переиспользует pending-строку для отправляющего аккаунта;
+   - отменяет active pending других аккаунтов по тому же target;
+   - использует существующий _send_pending_row (first DM модули без изменений).
+
+3. Глобальный spacing (default 30–60 сек) после успешной отправки.
+   Lease на время send, чтобы два аккаунта не писали одновременно.
+
+4. PeerFlood / FloodWait аккаунта: пауза и cooldown сохраняются.
+   При PeerFlood лид возвращается в пул (другие аккаунты могут взять).
+
+5. Fallback: лид с @username может взять другой аккаунт с активной DM-задачей.
+
+6. UI: Меню → «🌐 Режим очереди DM» (вкл/выкл общей очереди).
+
+7. recover_stale_queue восстанавливает зависшие reserved-лиды.
+
+Не изменено
+-----------
+- services/first_message.py
+- services/first_message_kirill_vip.py
+- services/kirill_vip_funnel.py
+- тексты/веса first DM
+- AI quick offer / SpamBot monitor
+
+Новых Railway Variables нет.
+По умолчанию mode=per_account — после deploy поведение как раньше,
+пока админ не включит общую очередь в меню.

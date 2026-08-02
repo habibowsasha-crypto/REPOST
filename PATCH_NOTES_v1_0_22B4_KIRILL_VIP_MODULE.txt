@@ -1,0 +1,50 @@
+TgBlaster v1.0.22b4 — selectable first-DM module «VIP Кирилла»
+Date: 2026-07-19
+Base: TgBlaster v1.0.22b3
+
+IMPLEMENTED
+1. A module selector appears after choosing a connected Telegram account while creating a DM task:
+   - 🧩 Текущие фразы
+   - 👑 VIP Кирилла
+2. The selection is stored per DM task in dm_tasks.first_dm_module.
+3. Existing tasks migrate to the default/original module automatically.
+4. The module can be changed later from the DM task card.
+5. Changing a task module affects future unsent first DMs, including pending queue rows.
+   An already-started AI dialog keeps the module saved at the moment its first DM was delivered.
+6. The task list and task card show the selected module.
+
+VIP КИРИЛЛА FIRST DM
+- New isolated file: services/first_message_kirill_vip.py.
+- 24 unique first questions.
+- Every question explicitly mentions Кирилл so the first DM is understandable without prior context.
+- The original services/first_message.py is unchanged byte-for-byte.
+
+VIP КИРИЛЛА DIALOG TREE
+- The first follow-up explains that Максим noticed the user in Кирилл's chat.
+- If the user says the VIP is already owned, Максим asks whether it was expensive and immediately explains the free alternative.
+- If the user does not own the VIP, Максим immediately explains that a separate purchase is unnecessary.
+- The explanation states that software instantly copies new posts from VIP Кирилла and five other paid closed VIP channels into one free Telegram channel.
+- Exact approved link:
+  https://telegram.me/+pvPjmt2KW_QyZTAy
+- Existing automatic 3–7 second Telegram UI help after the link is preserved.
+- Post-link branches cover link access, resend, official-access honesty, source count and natural completion.
+- Soft refusal, explicit opt-out, scam suspicion, global completed protection and media/emoji handling remain active.
+
+DATABASE MIGRATION
+- dm_tasks.first_dm_module TEXT NOT NULL DEFAULT 'default'
+- ai_dialogs.dialog_module TEXT NOT NULL DEFAULT 'default'
+- Migration is additive and preserves existing tasks/dialogs.
+
+NOT CHANGED
+- Recipient detection and monitored-chat trigger.
+- Queue states and atomic claim.
+- Account-wide pacing.
+- FloodWait / PeerFlood behavior.
+- Global first-DM pause.
+- Global completed-contact protection.
+- Permanent global opt-out.
+- Existing first-DM template module.
+- Existing started dialogs.
+
+NEW RAILWAY VARIABLES
+None.

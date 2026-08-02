@@ -1,0 +1,12 @@
+TgBlaster v1.0.22b26 — stale claimed/sending pending fix
+========================================================
+BUG:
+After crash or lost_race, dm_pending_queue rows stayed in status
+claimed/sending. claim_pending() only accepts pending/retry_wait/
+unresolved_peer → always lost_race → pool never advanced while UI
+showed ready + free slot.
+
+FIX:
+1) _ensure_pending_row_for_account reopens claimed/sending/uncertain
+2) recover_stale_pending_claims() before each unified prepare
+3) Log non-sent unified results for Railway debugging

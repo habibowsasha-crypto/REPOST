@@ -1,0 +1,21 @@
+TgBlaster v1.0.22b27 — unified queue safety and reliability fix
+===============================================================
+
+Built strictly from v1.0.22b26.
+
+Fixed without adding new recipient limits, bans, filters, or pacing restrictions:
+1. uncertain_delivery is never reopened automatically; stale sending becomes uncertain.
+2. global send lease now has an owner and unique token; an old sender cannot release a newer lease.
+3. one Telegram delivery attempt has a bounded runtime and becomes uncertain on timeout.
+4. cross-account unified sending no longer copies another account's access_hash.
+5. permanent privacy/blocked/deactivated failures are terminal in the unified pool.
+6. active unified sends renew their owner lease with a heartbeat.
+7. stale pending/reservation recovery respects a live lease and preserves uncertain guards.
+8. retry_count now advances for genuine unified retry states.
+9. tests were expanded for duplicate guards, lease ownership, hash isolation, stale recovery, and timeout.
+
+Protected behavior not changed:
+- @SpamBot automatic resume logic;
+- first-DM phrases/templates and module selection;
+- Kirill VIP funnel;
+- existing user-configured delays and limits.

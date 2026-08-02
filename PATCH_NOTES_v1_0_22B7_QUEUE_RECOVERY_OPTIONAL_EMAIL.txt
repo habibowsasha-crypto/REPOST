@@ -1,0 +1,31 @@
+TgBlaster v1.0.22b7 — QUEUE RECOVERY + OPTIONAL ACCOUNT EMAIL
+
+База: v1.0.22b6
+
+ИСПРАВЛЕНО
+- Исправлено несовпадение SELECT и списка ключей в get_due_pending().
+- При старте процесса claimed безопасно возвращаются в pending.
+- При старте процесса sending переводятся в uncertain_delivery без автоматического дубля.
+- Добавлено периодическое восстановление реально зависших записей очереди.
+- Счётчики очереди разделены на sendable, processing, uncertain и total.
+- Длинный вывод карточек очереди дробится по безопасному UTF-16 лимиту Telegram.
+- При неожиданном падении monitor/dispatcher планируется контролируемый перезапуск.
+- Обновление профилей аккаунтов выполняется с ограниченным параллелизмом и тайм-аутом.
+
+ДОБАВЛЕНО
+- Необязательное поле account_email в sessions.
+- Запрос e-mail после успешной авторизации Telegram-аккаунта.
+- Кнопка «⏭ Пропустить».
+- Изменение e-mail из карточки аккаунта.
+- При повторной авторизации существующий e-mail не стирается.
+- Best-effort удаление сообщений с кодом входа и паролем 2FA из админского чата.
+
+НЕ ИЗМЕНЕНО
+- services/first_message.py
+- services/first_message_kirill_vip.py
+- services/kirill_vip_funnel.py
+- тексты, веса и выбор первых DM
+- completed, permanent opt-out, FloodWait, PeerFlood и ручные паузы
+- задержки и лимиты DM-задач
+
+НОВЫХ RAILWAY VARIABLES НЕТ.
