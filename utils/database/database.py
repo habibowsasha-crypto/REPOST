@@ -793,3 +793,17 @@ def create_dm_tables() -> None:
 
     create_opt_out_table()
     create_contact_tables()
+
+    from services.first_message_ai_generated import ensure_ai_first_dm_history_table
+
+    ensure_ai_first_dm_history_table()
+
+    # Unified queue Step 1: schema + idempotent migration of active legacy rows.
+    # Live first-DM sending remains on dm_pending_queue until Step 2.
+    from services.dm_unified_queue import (
+        ensure_unified_queue_schema,
+        migrate_pending_queue_to_unified_pool,
+    )
+
+    ensure_unified_queue_schema()
+    migrate_pending_queue_to_unified_pool()

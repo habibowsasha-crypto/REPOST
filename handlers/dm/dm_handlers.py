@@ -94,16 +94,28 @@ from services.dm_task_queue import (
 )
 from services.first_message import choose_first_dm_text, is_random_first_dm_enabled
 from services.first_dm_modules import (
+    AI_FIRST_DM_MODULE,
     AI_QUICK_OFFER_MODULE,
     DEFAULT_FIRST_DM_MODULE,
     KIRILL_VIP_MODULE,
     first_dm_module_label,
     normalize_first_dm_module,
 )
+from services.first_message_ai_generated import choose_ai_generated_first_dm_text
 from services.first_message_ai_quick_offer import choose_ai_quick_offer_first_dm_text
 from services.first_message_kirill_vip import choose_kirill_vip_first_dm_text
 from services.menu_ui import render_menu
 from services.spambot_monitor import trigger_peer_flood_monitor
+from services.dm_unified_queue import (
+    complete_global_send_window,
+    global_gate_wait_seconds,
+    is_unified_queue_mode,
+    mark_unified_lead_sent,
+    prepare_unified_send_for_account,
+    recover_stale_unified_reservations,
+    release_global_send_lease,
+    release_unified_lead_for_pending,
+)
 from utils.database.database import create_dm_tables
 from utils.telegram import gid_key
 
@@ -495,11 +507,26 @@ async def _send_pending_row(row: dict) -> str:
             outgoing_text = choose_kirill_vip_first_dm_text()
         elif first_dm_module == AI_QUICK_OFFER_MODULE:
             outgoing_text = choose_ai_quick_offer_first_dm_text()
+        elif first_dm_module == AI_FIRST_DM_MODULE:
+            try:
+                outgoing_text = await choose_ai_generated_first_dm_text(
+                    source_chat_title=row.get("source_chat_title"),
+                    target_first_name=row.get("target_first_name"),
+                )
+            except Exception as exc:
+                logger.warning(f"[DM {task_id}] AI first DM fallback: {exc}")
+                outgoing_text = (
+                    choose_first_dm_text(task["post_text"] or "")
+                    or (task["post_text"] or "Привет 👋")
+                )
         else:
             outgoing_text = (
                 choose_first_dm_text(task["post_text"] or "")
                 or (task["post_text"] or "Привет 👋")
             )
+        outgoing_text = " ".join(str(outgoing_text or "").split()).strip()
+        if not outgoing_text:
+            outgoing_text = "Привет 👋"
         if is_global_first_dm_paused():
             release_first_dm_claim(account_user_id, target_id, first_claim)
             release_pending_claim(row_id, queue_claim, "global_pause_before_sending")
@@ -687,6 +714,114 @@ async def _account_dispatch_loop(account_user_id: int) -> None:
             state = get_account_dispatch_state(account_user_id)
             if state.is_paused:
                 await asyncio.sleep(5)
+                continue
+
+            unified = is_unified_queue_mode()
+            if unified:
+                # Unified mode: one global spacing window for all accounts.
+                # Per-account pacing is skipped; PeerFlood pause and FloodWait remain.
+                from services.dm_task_queue import parse_iso as _parse_iso
+
+                cooldown = _parse_iso(state.cooldown_until)
+                if cooldown is not None:
+                    now = datetime.datetime.now(datetime.timezone.utc)
+                    if cooldown > now:
+                        await asyncio.sleep(
+                            min(max((cooldown - now).total_seconds(), 0.25), 30.0)
+                        )
+                        continue
+                gate_wait = global_gate_wait_seconds()
+                if gate_wait is None:
+                    await asyncio.sleep(5)
+                    continue
+                if gate_wait > 0:
+                    await asyncio.sleep(min(max(gate_wait, 0.25), 30.0))
+                    continue
+                try:
+                    recover_stale_unified_reservations()
+                except Exception as exc:
+                    logger.debug(
+                        f"[DM unified] stale reservation recovery skipped: {exc}"
+                    )
+                row = prepare_unified_send_for_account(account_user_id)
+                if row is None:
+                    if not _account_has_active_tasks(account_user_id):
+                        logger.info(
+                            f"[DM dispatcher] account={account_user_id} has no active tasks; exiting"
+                        )
+                        return
+                    await asyncio.sleep(2)
+                    continue
+                result = await _send_pending_row(row)
+                pending_id = int(row["id"])
+                if result == "sent":
+                    try:
+                        mark_unified_lead_sent(pending_id, account_user_id)
+                    except Exception as exc:
+                        logger.warning(
+                            f"[DM unified] mark sent failed pending={pending_id}: {exc}"
+                        )
+                    complete_global_send_window()
+                elif result in {"peer_flood", "flood_wait"}:
+                    release_global_send_lease(retry_seconds=2)
+                    try:
+                        release_unified_lead_for_pending(
+                            pending_id,
+                            status="retry_wait",
+                            error=result,
+                            retry_seconds=60 if result == "peer_flood" else 30,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            f"[DM unified] release after {result} failed: {exc}"
+                        )
+                elif result == "cancelled":
+                    release_global_send_lease(retry_seconds=1)
+                    try:
+                        release_unified_lead_for_pending(
+                            pending_id,
+                            status="cancelled",
+                            error="cancelled_by_send_pipeline",
+                        )
+                    except Exception as exc:
+                        logger.debug(f"[DM unified] cancel lead: {exc}")
+                elif result in {"uncertain", "known_failure"}:
+                    # Do not free the lead for automatic retry; mirrors legacy guards.
+                    release_global_send_lease(retry_seconds=2)
+                    try:
+                        release_unified_lead_for_pending(
+                            pending_id,
+                            status="uncertain_delivery"
+                            if result == "uncertain"
+                            else "retry_wait",
+                            error=result,
+                            retry_seconds=None if result == "uncertain" else 120,
+                        )
+                    except Exception as exc:
+                        logger.debug(f"[DM unified] failure lead update: {exc}")
+                else:
+                    release_global_send_lease(retry_seconds=1)
+                    if result in {
+                        "lost_race",
+                        "task_inactive",
+                        "global_paused",
+                        "retry",
+                        "unresolved",
+                    }:
+                        try:
+                            release_unified_lead_for_pending(
+                                pending_id,
+                                status="unresolved_peer"
+                                if result == "unresolved"
+                                else "pending",
+                                error=result,
+                                retry_seconds=60 if result == "unresolved" else 5,
+                            )
+                        except Exception as exc:
+                            logger.debug(
+                                f"[DM unified] release after {result}: {exc}"
+                            )
+                await asyncio.sleep(0.25)
                 continue
 
             gate_wait = account_gate_wait_seconds(account_user_id)
@@ -1145,6 +1280,7 @@ async def dm_pick_account(event: callback_query) -> None:
         "Модуль сохраняется отдельно для этой DM-задачи.",
         buttons=[
             [Button.inline("🧩 Текущие фразы", b"dm_module_default")],
+            [Button.inline("🤖 AI Первый DM", b"dm_module_ai_first_dm")],
             [Button.inline("👑 VIP Кирилла", b"dm_module_kirill_vip")],
             [Button.inline("🤖 AI Быстрый оффер", b"dm_module_ai_quick_offer")],
             [Button.inline("◀️ Назад", b"menu_dm_post")],
@@ -1167,6 +1303,7 @@ def _build_chat_buttons(groups, selected):
 
 @bot.on(Query(data=lambda d: d in {
     b"dm_module_default",
+    b"dm_module_ai_first_dm",
     b"dm_module_kirill_vip",
     b"dm_module_ai_quick_offer",
 }))
@@ -1181,6 +1318,8 @@ async def dm_pick_first_message_module(event: callback_query) -> None:
         module = KIRILL_VIP_MODULE
     elif event.data == b"dm_module_ai_quick_offer":
         module = AI_QUICK_OFFER_MODULE
+    elif event.data == b"dm_module_ai_first_dm":
+        module = AI_FIRST_DM_MODULE
     else:
         module = DEFAULT_FIRST_DM_MODULE
     st["first_dm_module"] = module

@@ -497,6 +497,10 @@ def enqueue_pending(
                 ),
             )
     ensure_account_settings(account_user_id)
+    # Step 1 shadow mirror: keep unified pool current without changing send path.
+    from services.dm_unified_queue import safe_shadow_sync_pending_row
+
+    safe_shadow_sync_pending_row(int(pending_id))
     return created, pending_id
 
 
@@ -755,7 +759,18 @@ def recover_stale_queue(*, process_start: bool = False) -> dict[str, int]:
             """,
             (sending_reason, *sending_params),
         ).rowcount
-    return {"claimed_recovered": int(claimed or 0), "sending_uncertain": int(sending or 0)}
+    unified_recovered = 0
+    try:
+        from services.dm_unified_queue import recover_stale_unified_reservations
+
+        unified_recovered = int(recover_stale_unified_reservations() or 0)
+    except Exception:
+        unified_recovered = 0
+    return {
+        "claimed_recovered": int(claimed or 0),
+        "sending_uncertain": int(sending or 0),
+        "unified_reserved_recovered": unified_recovered,
+    }
 
 
 def count_pending(dm_task_id: int, source_chat_id: Optional[int] = None) -> int:
