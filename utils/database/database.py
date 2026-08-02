@@ -527,6 +527,7 @@ def create_dm_tables() -> None:
             CREATE TABLE IF NOT EXISTS dm_spambot_monitor (
                 account_user_id INTEGER PRIMARY KEY,
                 is_enabled INTEGER NOT NULL DEFAULT 0,
+                auto_resume INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'disabled',
                 next_check_at TEXT,
                 restriction_until TEXT,
@@ -554,6 +555,11 @@ def create_dm_tables() -> None:
         "dm_tasks",
         "first_dm_module",
         "ALTER TABLE dm_tasks ADD COLUMN first_dm_module TEXT NOT NULL DEFAULT 'default'",
+    )
+    _add_column_if_missing(
+        "dm_spambot_monitor",
+        "auto_resume",
+        "ALTER TABLE dm_spambot_monitor ADD COLUMN auto_resume INTEGER NOT NULL DEFAULT 0",
     )
     with conn:
         conn.execute(

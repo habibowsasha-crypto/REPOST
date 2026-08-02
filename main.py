@@ -108,15 +108,29 @@ async def _run_queue_recovery_job() -> None:
 async def _notify_spambot_free(result: SpamBotCheckResult) -> None:
     account_user_id = int(result.account_user_id)
     label = html.escape(format_account_label(account_user_id, include_id=True, max_length=60))
-    text = (
-        "✅ <b>@SpamBot: ограничений больше нет</b>\n\n"
-        f"👤 Аккаунт: <b>{label}</b>\n"
-        "Первые DM остаются на паузе. Возобновление выполняется только вручную."
-    )
-    buttons = [
-        [Button.inline("▶️ Возобновить первые DM", f"spambot_monitor_resume_{account_user_id}".encode())],
-        [Button.inline("👤 Открыть аккаунт", f"account_info_{account_user_id}".encode())],
-    ]
+    if result.auto_resumed:
+        # Restart the account dispatcher so the preserved queue can continue.
+        from handlers.dm.dm_handlers import ensure_account_dispatcher
+
+        ensure_account_dispatcher(account_user_id)
+        text = (
+            "✅ <b>@SpamBot: ограничений больше нет</b>\n\n"
+            f"👤 Аккаунт: <b>{label}</b>\n"
+            "▶️ Первые DM возобновлены автоматически. Сохранённая очередь продолжается."
+        )
+        buttons = [
+            [Button.inline("👤 Открыть аккаунт", f"account_info_{account_user_id}".encode())],
+        ]
+    else:
+        text = (
+            "✅ <b>@SpamBot: ограничений больше нет</b>\n\n"
+            f"👤 Аккаунт: <b>{label}</b>\n"
+            "Первые DM остаются на паузе. Возобновление выполняется только вручную."
+        )
+        buttons = [
+            [Button.inline("▶️ Возобновить первые DM", f"spambot_monitor_resume_{account_user_id}".encode())],
+            [Button.inline("👤 Открыть аккаунт", f"account_info_{account_user_id}".encode())],
+        ]
     for admin_id in ADMIN_ID_LIST:
         try:
             await bot.send_message(int(admin_id), text, buttons=buttons, parse_mode="html")

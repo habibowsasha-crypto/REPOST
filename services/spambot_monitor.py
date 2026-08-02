@@ -1,8 +1,10 @@
 """Safe @SpamBot restriction monitoring for Telegram user accounts.
 
-The monitor never resumes first-DM sending automatically.  It only checks the
-official Telegram @SpamBot status after a PeerFlood pause and notifies the
-administrator when the account reports that it is free from restrictions.
+By default the monitor does not resume first-DM sending automatically.  It
+checks the official Telegram @SpamBot status after a PeerFlood pause and
+notifies the administrator when the account reports that it is free from
+restrictions.  Per-account auto_resume may optionally clear the PeerFlood
+pause after a free reply; FloodWait cooldowns are never bypassed.
 """
 
 from __future__ import annotations
@@ -115,6 +117,7 @@ _RESTRICTION_DATE_RE = re.compile(
 class SpamBotMonitorState:
     account_user_id: int
     is_enabled: bool
+    auto_resume: bool
     status: str
     next_check_at: Optional[str]
     restriction_until: Optional[str]
@@ -132,6 +135,7 @@ class SpamBotCheckResult:
     restriction_until: Optional[str] = None
     next_check_at: Optional[str] = None
     error: Optional[str] = None
+    auto_resumed: bool = False
 
 
 def utc_now() -> dt.datetime:
@@ -193,10 +197,10 @@ def _ensure_row(account_user_id: int) -> None:
         conn.execute(
             """
             INSERT OR IGNORE INTO dm_spambot_monitor (
-                account_user_id, is_enabled, status, next_check_at,
+                account_user_id, is_enabled, auto_resume, status, next_check_at,
                 restriction_until, last_checked_at, last_response_text,
                 last_error, updated_at
-            ) VALUES (?, 0, ?, NULL, NULL, NULL, NULL, NULL, ?)
+            ) VALUES (?, 0, 0, ?, NULL, NULL, NULL, NULL, NULL, ?)
             """,
             (int(account_user_id), _STATUS_DISABLED, now),
         )
@@ -206,9 +210,9 @@ def get_spambot_monitor_state(account_user_id: int) -> SpamBotMonitorState:
     _ensure_row(account_user_id)
     row = conn.execute(
         """
-        SELECT account_user_id, is_enabled, status, next_check_at,
-               restriction_until, last_checked_at, last_response_text,
-               last_error, updated_at
+        SELECT account_user_id, is_enabled, COALESCE(auto_resume, 0), status,
+               next_check_at, restriction_until, last_checked_at,
+               last_response_text, last_error, updated_at
           FROM dm_spambot_monitor
          WHERE account_user_id=?
         """,
@@ -218,13 +222,14 @@ def get_spambot_monitor_state(account_user_id: int) -> SpamBotMonitorState:
     return SpamBotMonitorState(
         account_user_id=int(row[0]),
         is_enabled=bool(row[1]),
-        status=str(row[2] or _STATUS_DISABLED),
-        next_check_at=row[3],
-        restriction_until=row[4],
-        last_checked_at=row[5],
-        last_response_text=_clean_text(row[6]),
-        last_error=_clean_text(row[7]),
-        updated_at=str(row[8] or ""),
+        auto_resume=bool(row[2]),
+        status=str(row[3] or _STATUS_DISABLED),
+        next_check_at=row[4],
+        restriction_until=row[5],
+        last_checked_at=row[6],
+        last_response_text=_clean_text(row[7]),
+        last_error=_clean_text(row[8]),
+        updated_at=str(row[9] or ""),
     )
 
 
@@ -273,6 +278,53 @@ def set_spambot_monitor_enabled(
                 (_STATUS_DISABLED, _iso(now), int(account_user_id)),
             )
     return get_spambot_monitor_state(account_user_id)
+
+
+def set_spambot_auto_resume(
+    account_user_id: int,
+    enabled: bool,
+) -> SpamBotMonitorState:
+    """Enable or disable automatic first-DM resume after a free @SpamBot reply.
+
+    Default remains manual. Auto-resume only acts when the account is on a
+    PeerFlood pause and monitoring is enabled.
+    """
+    _ensure_row(account_user_id)
+    now = _iso(utc_now())
+    with _db_lock, conn:
+        conn.execute(
+            """
+            UPDATE dm_spambot_monitor
+               SET auto_resume=?, updated_at=?
+             WHERE account_user_id=?
+            """,
+            (1 if enabled else 0, now, int(account_user_id)),
+        )
+    return get_spambot_monitor_state(account_user_id)
+
+
+def maybe_auto_resume_after_free(account_user_id: int) -> bool:
+    """Resume PeerFlood-paused first DMs when auto_resume is enabled.
+
+    Returns True only when the account pause was actually cleared.
+    FloodWait cooldown is left intact by resume_account().
+    """
+    state = get_spambot_monitor_state(account_user_id)
+    if not state.is_enabled or not state.auto_resume:
+        return False
+    if state.status != _STATUS_FREE:
+        return False
+    if not _account_is_peer_flood_paused(account_user_id):
+        return False
+    # Local import keeps startup free of circular module initialization.
+    from services.dm_task_queue import resume_account
+
+    resume_account(int(account_user_id))
+    mark_spambot_manual_resume(int(account_user_id))
+    logger.info(
+        f"[SpamBot monitor] auto-resume applied account={int(account_user_id)}"
+    )
+    return True
 
 
 def trigger_peer_flood_monitor(account_user_id: int) -> bool:
@@ -569,6 +621,22 @@ async def process_due_spambot_checks(
                 retry_seconds=NO_RESPONSE_RETRY_SECONDS,
                 error=f"unexpected {type(exc).__name__}: {exc}",
             )
+        if result.outcome == _STATUS_FREE:
+            try:
+                if maybe_auto_resume_after_free(account_user_id):
+                    result = SpamBotCheckResult(
+                        account_user_id=result.account_user_id,
+                        outcome=result.outcome,
+                        response_text=result.response_text,
+                        restriction_until=result.restriction_until,
+                        next_check_at=result.next_check_at,
+                        error=result.error,
+                        auto_resumed=True,
+                    )
+            except Exception as exc:
+                logger.exception(
+                    f"[SpamBot monitor] auto-resume failed account={account_user_id}: {exc}"
+                )
         results.append(result)
         if result.outcome == _STATUS_FREE and on_free is not None:
             try:
@@ -604,8 +672,10 @@ __all__ = [
     "is_spambot_free_response",
     "list_due_spambot_accounts",
     "mark_spambot_manual_resume",
+    "maybe_auto_resume_after_free",
     "parse_spambot_restriction_until",
     "process_due_spambot_checks",
+    "set_spambot_auto_resume",
     "set_spambot_monitor_enabled",
     "spambot_status_label",
     "trigger_peer_flood_monitor",

@@ -14,6 +14,7 @@ from services.menu_ui import render_menu
 from services.spambot_monitor import (
     get_spambot_monitor_state,
     mark_spambot_manual_resume,
+    set_spambot_auto_resume,
     set_spambot_monitor_enabled,
     spambot_status_label,
 )
@@ -169,8 +170,10 @@ async def _show_account_info(event: callback_query, user_id: int) -> None:
             else "🟢 запущены"
         )
 
+        auto_resume_label = "🟢 ВКЛ" if monitor.auto_resume else "🔴 ВЫКЛ"
         monitor_details = [
             f"🛡 **Мониторинг @SpamBot:** {monitor_enabled}",
+            f"▶️ **Автовозобновление DM:** {auto_resume_label}",
             f"📨 **Первые DM аккаунта:** {first_dm_state}",
         ]
         if monitor.is_enabled:
@@ -194,11 +197,22 @@ async def _show_account_info(event: callback_query, user_id: int) -> None:
             if monitor.is_enabled
             else "🛡 Включить мониторинг @SpamBot"
         )
+        auto_toggle_label = (
+            "▶️ Выключить автовозобновление DM"
+            if monitor.auto_resume
+            else "▶️ Включить автовозобновление DM"
+        )
         buttons = [
             [
                 Button.inline(
                     toggle_label,
                     f"spambot_monitor_toggle_{user_id}".encode(),
+                )
+            ],
+            [
+                Button.inline(
+                    auto_toggle_label,
+                    f"spambot_auto_resume_toggle_{user_id}".encode(),
                 )
             ],
         ]
@@ -303,6 +317,44 @@ async def toggle_spambot_monitor(event: callback_query) -> None:
             message += ". Проверка поставлена в очередь"
     else:
         message = "Мониторинг @SpamBot выключен"
+    await event.answer(message)
+    await _show_account_info(event, user_id)
+
+
+@bot.on(
+    Query(
+        data=lambda data: data.decode(errors="ignore").startswith(
+            "spambot_auto_resume_toggle_"
+        )
+    )
+)
+async def toggle_spambot_auto_resume(event: callback_query) -> None:
+    if not _is_admin(event.sender_id):
+        await event.answer("Недоступно", alert=True)
+        return
+    user_id = _parse_account_id(event.data, "spambot_auto_resume_toggle_")
+    if user_id is None:
+        await event.answer("Некорректный ID аккаунта", alert=True)
+        return
+    exists = conn.execute(
+        "SELECT 1 FROM sessions WHERE user_id=?", (int(user_id),)
+    ).fetchone()
+    if not exists:
+        await event.answer("Аккаунт не найден", alert=True)
+        return
+
+    current = get_spambot_monitor_state(user_id)
+    updated = set_spambot_auto_resume(user_id, not current.auto_resume)
+    if updated.auto_resume:
+        message = (
+            "Автовозобновление включено: после ответа @SpamBot "
+            "первые DM снимут паузу без ручного нажатия"
+        )
+    else:
+        message = (
+            "Автовозобновление выключено: после снятия ограничений "
+            "нужна ручная кнопка возобновления"
+        )
     await event.answer(message)
     await _show_account_info(event, user_id)
 

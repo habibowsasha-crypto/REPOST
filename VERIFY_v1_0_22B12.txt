@@ -1,0 +1,47 @@
+TgBlaster v1.0.22b12 — VERIFY
+Дата: 2026-08-02
+
+БАЗА
+----
+TgBlaster-dm-ai-dialog-v1_0_22b11_spambot_monitor_manual_resume.zip
+ZIP integrity: OK
+
+ИЗМЕНЕНИЯ
+--------
+- services/spambot_monitor.py: auto_resume flag, maybe_auto_resume_after_free, process_due applies resume
+- utils/database/database.py: column auto_resume + in-place migration DEFAULT 0
+- handlers/account/account_management.py: UI toggle + status line
+- main.py: free notification distinguishes auto vs manual; ensure_account_dispatcher on auto
+- tests/test_spambot_monitor.py: auto/manual scenarios
+- README.md, VERSION, PATCH_NOTES_v1_0_22B12_SPAMBOT_AUTO_RESUME.txt
+
+ПОВЕДЕНИЕ
+---------
+1. Default auto_resume=0 — ручное возобновление как в b11.
+2. auto_resume=1 — после free_detected снимается PeerFlood-пауза, монитор -> idle,
+   dispatcher поднимается, очередь сохраняется и продолжается.
+3. FloodWait cooldown не сбрасывается.
+4. Повторный PeerFlood снова ставит паузу.
+
+НЕ ИЗМЕНЕНО (SHA-256)
+---------------------
+services/first_message.py
+  a34f2613c338b1f89284335d2462cc1ed1b1e43b3063dcdf4a511a3b7f0f32aa
+services/first_message_kirill_vip.py
+  94f8c82b6077af0eefecd3f9dbc927a4adc876680fc0e6ee187a5a8d6f33282b
+services/kirill_vip_funnel.py
+  dd0d2d215d943914cbe2af3865ae02f4e6900100ab3ab6094f45ae8916326892
+
+ТЕСТЫ (реально запущены)
+------------------------
+- unzip integrity: PASS
+- compileall: PASS
+- AST parse 66 files: PASS
+- pytest: 153 passed, 38 subtests passed
+- test_spambot_monitor: PASS (включая auto/manual free)
+- test_ai_quick_offer: PASS
+- секреты/session/db/log/pyc в архиве: отсутствуют
+
+ОГРАНИЧЕНИЯ
+-----------
+Live Telegram / live @SpamBot / Railway deploy не выполнялись в offline-среде.
