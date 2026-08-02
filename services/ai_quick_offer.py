@@ -221,15 +221,30 @@ def validate_quick_offer(
 async def _generate_once(
     *, api_key: str, model: str, instructions: str, input_text: str
 ) -> tuple[list[str], int]:
+    import asyncio
+
     from openai import AsyncOpenAI
 
-    client = AsyncOpenAI(api_key=api_key)
-    response = await client.responses.create(
-        model=model,
-        instructions=instructions,
-        input=[{"role": "user", "content": input_text}],
-        max_output_tokens=520,
+    timeout_seconds = float(
+        config("AI_QUICK_OFFER_TIMEOUT_SECONDS", default="45") or 45
     )
+    timeout_seconds = max(8.0, min(timeout_seconds, 120.0))
+    client = AsyncOpenAI(api_key=api_key)
+    try:
+        async def _call():
+            return await client.responses.create(
+                model=model,
+                instructions=instructions,
+                input=[{"role": "user", "content": input_text}],
+                max_output_tokens=520,
+            )
+
+        response = await asyncio.wait_for(_call(), timeout=timeout_seconds)
+    finally:
+        try:
+            await client.close()
+        except Exception:
+            pass
     usage: Any = getattr(response, "usage", None)
     tokens = int(getattr(usage, "total_tokens", 0) or 0) if usage is not None else 0
     raw = getattr(response, "output_text", None)

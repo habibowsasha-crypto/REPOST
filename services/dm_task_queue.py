@@ -266,23 +266,38 @@ def mark_account_send_completed(account_user_id: int) -> int:
 
 def set_account_cooldown(account_user_id: int, seconds: int, reason: str) -> str:
     # FloodWait is Telegram-owned and must not be truncated to the admin delay limit.
+    # Do not overwrite an active PeerFlood/manual pause_reason with FloodWait text:
+    # SpamBot auto-resume detects PeerFlood via pause_reason.
     seconds = max(1, min(int(seconds), MAX_COOLDOWN_SECONDS))
     candidate = utc_now() + dt.timedelta(seconds=seconds)
     ensure_account_settings(account_user_id)
+    reason_text = clean_text(reason)
     with _db_lock, conn:
         row = conn.execute(
-            "SELECT cooldown_until FROM dm_account_dispatch WHERE account_user_id=?",
+            """
+            SELECT cooldown_until, is_paused, pause_reason
+              FROM dm_account_dispatch
+             WHERE account_user_id=?
+            """,
             (int(account_user_id),),
         ).fetchone()
         existing = parse_iso(row[0]) if row and row[0] else None
         until = max(candidate, existing) if existing is not None else candidate
+        is_paused = bool(row[1]) if row else False
+        current_reason = clean_text(row[2]) if row else None
+        preserve_peer = False
+        if is_paused and current_reason:
+            normalized = current_reason.lower().replace("ё", "е").replace(" ", "")
+            if "peerflood" in normalized:
+                preserve_peer = True
+        stored_reason = current_reason if preserve_peer else reason_text
         conn.execute(
             """
             UPDATE dm_account_dispatch
                SET cooldown_until=?, pause_reason=?, updated_at=?
              WHERE account_user_id=?
             """,
-            (iso(until), clean_text(reason), iso(utc_now()), int(account_user_id)),
+            (iso(until), stored_reason, iso(utc_now()), int(account_user_id)),
         )
     return iso(until)
 

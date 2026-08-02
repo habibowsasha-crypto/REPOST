@@ -23,6 +23,7 @@ from telethon.tl.types import User
 from config import conn
 from services.maxim_sales_funnel import (
     PIRATE_VIP_LINK_TOKEN,
+    build_ai_first_dm_short_plan,
     LINK_ACCESS_HELP_VARIANTS,
     FunnelPlan,
     build_local_plan,
@@ -36,6 +37,7 @@ from services.maxim_sales_funnel import (
     validate_link_access_help,
 )
 from services.first_dm_modules import (
+    AI_FIRST_DM_MODULE,
     AI_QUICK_OFFER_MODULE,
     DEFAULT_FIRST_DM_MODULE,
     KIRILL_VIP_MODULE,
@@ -204,6 +206,50 @@ class DialogRow:
     stopped_reason: Optional[str]
 
 
+
+def prune_ai_processed_messages(*, keep_days: int = 30, max_rows: int = 200_000) -> int:
+    """Bound the dedup table so Railway SQLite does not grow forever."""
+    keep_days = max(1, int(keep_days))
+    max_rows = max(1000, int(max_rows))
+    deleted = 0
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            DELETE FROM ai_processed_messages
+             WHERE processed_at < datetime('now', ?)
+            """,
+            (f"-{keep_days} days",),
+        )
+        deleted += int(cursor.rowcount or 0)
+        cursor.execute("SELECT COUNT(*) FROM ai_processed_messages")
+        total = int((cursor.fetchone() or [0])[0] or 0)
+        if total > max_rows:
+            overflow = total - max_rows
+            cursor.execute(
+                """
+                DELETE FROM ai_processed_messages
+                 WHERE id IN (
+                    SELECT id FROM ai_processed_messages
+                     ORDER BY id ASC
+                     LIMIT ?
+                 )
+                """,
+                (overflow,),
+            )
+            deleted += int(cursor.rowcount or 0)
+        conn.commit()
+    except Exception as exc:
+        logger.warning(f"[AI] prune_ai_processed_messages failed: {exc}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        cursor.close()
+    return deleted
+
+
 def create_ai_tables() -> None:
     cursor = conn.cursor()
     cursor.execute("""
@@ -321,7 +367,7 @@ def create_ai_tables() -> None:
         "ON ai_quick_offer_usage(account_user_id, id DESC)"
     )
 
-    # Лёгкие миграции для старых БД.
+    # Лёгкие миграции для старых БД (только если колонки ещё нет).
     for table, col, ddl in [
         ("ai_dialogs", "stopped_reason", "ALTER TABLE ai_dialogs ADD COLUMN stopped_reason TEXT"),
         ("ai_dialogs", "message_count", "ALTER TABLE ai_dialogs ADD COLUMN message_count INTEGER DEFAULT 0"),
@@ -333,10 +379,18 @@ def create_ai_tables() -> None:
         ("ai_quick_offer_usage", "series_fingerprint", "ALTER TABLE ai_quick_offer_usage ADD COLUMN series_fingerprint TEXT"),
     ]:
         try:
+            existing_cols = {
+                str(row[1])
+                for row in cursor.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if col in existing_cols:
+                continue
             cursor.execute(ddl)
             conn.commit()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                f"[AI schema] migration skipped table={table} col={col}: {exc}"
+            )
     conn.commit()
     cursor.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_quick_offer_fingerprint "
@@ -346,6 +400,10 @@ def create_ai_tables() -> None:
     conn.commit()
     cursor.close()
     migrate_legacy_closed_dialogs()
+    try:
+        prune_ai_processed_messages()
+    except Exception as exc:
+        logger.warning(f"[AI] startup prune failed: {exc}")
 
 
 def _row_to_dialog(row: tuple | None) -> Optional[DialogRow]:
@@ -1522,9 +1580,15 @@ async def handle_private_incoming(
         if dialog.status != "active" or _dialog_has_sent_offer(dialog.id):
             return
 
-        max_followups = _safe_int(
-            "AI_MAX_FOLLOWUP_MESSAGES", 7, min_value=3, max_value=12
-        )
+        module = normalize_first_dm_module(dialog.dialog_module)
+        if module == AI_FIRST_DM_MODULE:
+            max_followups = _safe_int(
+                "AI_FIRST_DM_MAX_FOLLOWUPS", 3, min_value=2, max_value=4
+            )
+        else:
+            max_followups = _safe_int(
+                "AI_MAX_FOLLOWUP_MESSAGES", 7, min_value=3, max_value=12
+            )
         followup_count = _current_cycle_followup_count(dialog.id)
         # The configured number limits ordinary follow-ups. If an old or unusual
         # cycle has already reached it without a link, allow exactly one final
@@ -1538,7 +1602,15 @@ async def handle_private_incoming(
 
         history = _current_cycle_history(dialog.id)
         try:
-            if normalize_first_dm_module(dialog.dialog_module) == KIRILL_VIP_MODULE:
+            if module == AI_FIRST_DM_MODULE:
+                plan = build_ai_first_dm_short_plan(
+                    stage=dialog.stage,
+                    history=history,
+                    source_chat_title=dialog.source_chat_title,
+                    followup_count=effective_followup_count,
+                    max_followups=max_followups,
+                )
+            elif module == KIRILL_VIP_MODULE:
                 plan = build_kirill_vip_plan(
                     stage=dialog.stage,
                     history=history,
@@ -1558,7 +1630,15 @@ async def handle_private_incoming(
             logger.error(
                 f"[AI DM] Maxim generation error for dialog={dialog.id}, user={sender.id}: {exc}"
             )
-            if normalize_first_dm_module(dialog.dialog_module) == KIRILL_VIP_MODULE:
+            if module == AI_FIRST_DM_MODULE:
+                plan = build_ai_first_dm_short_plan(
+                    stage=dialog.stage,
+                    history=history,
+                    source_chat_title=dialog.source_chat_title,
+                    followup_count=effective_followup_count,
+                    max_followups=max_followups,
+                )
+            elif module == KIRILL_VIP_MODULE:
                 plan = build_kirill_vip_plan(
                     stage=dialog.stage,
                     history=history,

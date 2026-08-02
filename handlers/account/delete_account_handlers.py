@@ -44,6 +44,72 @@ async def delete_account(event: callback_query) -> None:
                 (user_id,),
             )
             conn.execute("UPDATE broadcasts SET is_active = 0 WHERE user_id = ?", (user_id,))
+            # Cancel unfinished first-DM rows for this account only.
+            # Global contact history / opt-out / completed registry stay intact.
+            try:
+                conn.execute(
+                    """
+                    UPDATE dm_pending_queue
+                       SET status='cancelled',
+                           last_error='account_deleted',
+                           claim_token=NULL,
+                           claimed_at=NULL,
+                           updated_at=strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
+                     WHERE account_user_id=?
+                       AND status IN (
+                            'pending','claimed','sending','retry_wait',
+                            'unresolved_peer','uncertain_delivery'
+                       )
+                    """,
+                    (user_id,),
+                )
+            except Exception:
+                pass
+            try:
+                conn.execute(
+                    "DELETE FROM dm_account_dispatch WHERE account_user_id=?",
+                    (user_id,),
+                )
+            except Exception:
+                pass
+            try:
+                conn.execute(
+                    """
+                    UPDATE dm_unified_leads
+                       SET preferred_account_user_id=CASE
+                             WHEN preferred_account_user_id=? THEN NULL
+                             ELSE preferred_account_user_id
+                           END,
+                           reserved_by_account_user_id=CASE
+                             WHEN reserved_by_account_user_id=? THEN NULL
+                             ELSE reserved_by_account_user_id
+                           END,
+                           status=CASE
+                             WHEN status='reserved'
+                              AND reserved_by_account_user_id=? THEN 'pending'
+                             ELSE status
+                           END,
+                           reserve_token=CASE
+                             WHEN reserved_by_account_user_id=? THEN NULL
+                             ELSE reserve_token
+                           END,
+                           reserved_at=CASE
+                             WHEN reserved_by_account_user_id=? THEN NULL
+                             ELSE reserved_at
+                           END,
+                           updated_at=strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
+                     WHERE preferred_account_user_id=?
+                        OR reserved_by_account_user_id=?
+                        OR source_account_user_id=?
+                    """,
+                    (user_id, user_id, user_id, user_id, user_id, user_id, user_id, user_id),
+                )
+                conn.execute(
+                    "DELETE FROM dm_unified_lead_accounts WHERE account_user_id=?",
+                    (user_id,),
+                )
+            except Exception:
+                pass
             conn.execute("DELETE FROM groups WHERE user_id = ?", (user_id,))
             conn.execute("DELETE FROM discovered_groups WHERE user_id = ?", (user_id,))
             conn.execute("DELETE FROM dm_spambot_monitor WHERE account_user_id = ?", (user_id,))

@@ -319,8 +319,25 @@ def maybe_auto_resume_after_free(account_user_id: int) -> bool:
     # Local import keeps startup free of circular module initialization.
     from services.dm_task_queue import resume_account
 
+    # Resume account first; monitor state is marked free->idle in the same try.
+    # If monitor mark fails, force-idle in a second attempt so UI is not stuck on
+    # free_detected while DMs are already allowed.
     resume_account(int(account_user_id))
-    mark_spambot_manual_resume(int(account_user_id))
+    try:
+        mark_spambot_manual_resume(int(account_user_id))
+    except Exception as exc:
+        logger.error(
+            f"[SpamBot monitor] auto-resume monitor mark failed "
+            f"account={int(account_user_id)}: {exc}"
+        )
+        try:
+            mark_spambot_manual_resume(int(account_user_id))
+        except Exception as exc2:
+            logger.error(
+                f"[SpamBot monitor] auto-resume monitor mark retry failed "
+                f"account={int(account_user_id)}: {exc2}"
+            )
+            # Account is already resumed; still report success so dispatcher starts.
     logger.info(
         f"[SpamBot monitor] auto-resume applied account={int(account_user_id)}"
     )

@@ -1138,15 +1138,30 @@ async def _openai_generate(
     input_text: str,
     max_tokens: int,
 ) -> tuple[list[str], int]:
+    import asyncio
+
     from openai import AsyncOpenAI
 
-    client = AsyncOpenAI(api_key=api_key)
-    response = await client.responses.create(
-        model=model,
-        instructions=instructions,
-        input=[{"role": "user", "content": input_text}],
-        max_output_tokens=max_tokens,
+    timeout_seconds = float(
+        config("AI_MAXIM_TIMEOUT_SECONDS", default="45") or 45
     )
+    timeout_seconds = max(8.0, min(timeout_seconds, 120.0))
+    client = AsyncOpenAI(api_key=api_key)
+    try:
+        async def _call():
+            return await client.responses.create(
+                model=model,
+                instructions=instructions,
+                input=[{"role": "user", "content": input_text}],
+                max_output_tokens=max_tokens,
+            )
+
+        response = await asyncio.wait_for(_call(), timeout=timeout_seconds)
+    finally:
+        try:
+            await client.close()
+        except Exception:
+            pass
     usage: Any = getattr(response, "usage", None)
     tokens = int(getattr(usage, "total_tokens", 0) or 0) if usage is not None else 0
     raw = getattr(response, "output_text", None)
@@ -1159,6 +1174,108 @@ async def _openai_generate(
                     parts.append(str(value))
         raw = "\n".join(parts)
     return _parse_model_messages(str(raw or "")), tokens
+
+
+
+def build_ai_first_dm_short_plan(
+    *,
+    stage: str,
+    history: Sequence[tuple[str, str]],
+    source_chat_title: str | None,
+    followup_count: int,
+    max_followups: int = 3,
+) -> FunnelPlan:
+    """Compact path for AI First DM: link by bot message 2–3, total 3–4 outs.
+
+    Outbound budget after the engaging first DM (which is link-free):
+    1) short value + invite link
+    2) optional final help / repeat link
+    3) hard stop
+    """
+    del stage
+    last_user = ""
+    for direction, body in reversed(list(history or [])):
+        if direction == "incoming":
+            last_user = str(body or "")
+            break
+    if is_explicit_stop(last_user):
+        return FunnelPlan(
+            action="soft_decline",
+            next_stage="completed",
+            close_after=True,
+            messages=["Понял, больше не пишу."],
+            model="local_ai_first_dm",
+        )
+    if is_soft_decline(last_user):
+        return FunnelPlan(
+            action="soft_decline",
+            next_stage="completed",
+            close_after=True,
+            messages=["Ок, без проблем. Не буду навязывать."],
+            model="local_ai_first_dm",
+        )
+    if is_human_takeover_request(last_user):
+        return FunnelPlan(
+            action="human_takeover",
+            next_stage="human_needed",
+            close_after=True,
+            messages=["Ок, передам человеку."],
+            model="local_ai_first_dm",
+        )
+
+    free_count = _config_int(
+        "AI_FREE_VIP_SOURCE_COUNT", DEFAULT_FREE_SOURCE_COUNT, 1, 999
+    )
+    title = _clean_source_title(source_chat_title)
+    title_bit = f" из «{title}»" if title else ""
+    norm = _normalize(last_user)
+    link_help = any(
+        marker in norm
+        for marker in (
+            "не открыв",
+            "не работает",
+            "плашк",
+            "заблокир",
+            "добавить",
+            "не клика",
+        )
+    )
+
+    # Second+ follow-up: final answer then close.
+    if followup_count >= max(1, int(max_followups) - 1):
+        if link_help:
+            return FunnelPlan(
+                action="link_access_help",
+                next_stage="completed",
+                close_after=True,
+                messages=[LINK_ACCESS_HELP_VARIANTS[0]],
+                model="local_ai_first_dm",
+            )
+        return FunnelPlan(
+            action="concise_link",
+            next_stage="completed",
+            close_after=True,
+            messages=[
+                "Если коротко: бесплатный канал со сливами VIP-сигналов"
+                f"{title_bit}. Вот ссылка: {PIRATE_VIP_LINK}"
+            ],
+            model="local_ai_first_dm",
+        )
+
+    # First reply after first DM → value + link (this is bot message #2 overall).
+    return FunnelPlan(
+        action="concise_link",
+        next_stage="link_sent_waiting_final",
+        close_after=False,
+        messages=[
+            (
+                f"Коротко по делу{title_bit}: есть бесплатный канал, куда выкладывают "
+                f"сливы с ~{free_count} платных VIP. Без воды — можно глянуть самому."
+            ),
+            f"Ссылка: {PIRATE_VIP_LINK}",
+        ],
+        model="local_ai_first_dm",
+    )
 
 
 async def generate_plan(
