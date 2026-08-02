@@ -1127,9 +1127,12 @@ def prepare_unified_send_for_account(account_user_id: int) -> Optional[dict[str,
     now_iso = _iso(now)
     try:
         with _db_lock, conn:
-            # Preferred leads for this account first, then any eligible / username fallback.
+            # Any due lead is claimable by any active account.
+            # Prefer: this account as preferred → linked in lead_accounts → others.
+            # Old filter (must have username OR account link) blocked most of the
+            # pool: UI "ready" counted all due rows, but send found none.
             lead_row = conn.execute(
-                f"""
+                """
                 SELECT l.id, l.target_user_id, l.preferred_account_user_id,
                        l.source_account_user_id, l.dm_task_id, l.source_chat_id,
                        l.source_chat_title, l.source_chat_username, l.source_message_id,
@@ -1139,18 +1142,15 @@ def prepare_unified_send_for_account(account_user_id: int) -> Optional[dict[str,
                   FROM dm_unified_leads AS l
                  WHERE l.status IN ('pending','retry_wait','unresolved_peer')
                    AND l.eligible_at<=?
-                   AND (
-                        EXISTS (
-                            SELECT 1 FROM dm_unified_lead_accounts AS a
-                             WHERE a.lead_id=l.id AND a.account_user_id=?
-                        )
-                        OR (
-                            l.target_username IS NOT NULL
-                            AND TRIM(l.target_username)<>''
-                        )
-                   )
                  ORDER BY
-                    CASE WHEN l.preferred_account_user_id=? THEN 0 ELSE 1 END,
+                    CASE
+                      WHEN l.preferred_account_user_id=? THEN 0
+                      WHEN EXISTS (
+                        SELECT 1 FROM dm_unified_lead_accounts AS a
+                         WHERE a.lead_id=l.id AND a.account_user_id=?
+                      ) THEN 1
+                      ELSE 2
+                    END,
                     l.eligible_at,
                     l.id
                  LIMIT 1
@@ -1158,6 +1158,22 @@ def prepare_unified_send_for_account(account_user_id: int) -> Optional[dict[str,
                 (now_iso, account_user_id, account_user_id),
             ).fetchone()
             if not lead_row:
+                # Diagnostic: how many look "ready" but were not selected.
+                try:
+                    due_count = conn.execute(
+                        """
+                        SELECT COUNT(*) FROM dm_unified_leads
+                         WHERE status IN ('pending','retry_wait','unresolved_peer')
+                           AND eligible_at<=?
+                        """,
+                        (now_iso,),
+                    ).fetchone()[0]
+                    logger.info(
+                        f"[DM unified] no lead for account={account_user_id} "
+                        f"due_in_pool={int(due_count or 0)}"
+                    )
+                except Exception:
+                    pass
                 release_global_send_lease(retry_seconds=2)
                 return None
 
