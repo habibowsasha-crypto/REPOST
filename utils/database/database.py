@@ -522,6 +522,21 @@ def create_dm_tables() -> None:
             )
             """
         )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dm_spambot_monitor (
+                account_user_id INTEGER PRIMARY KEY,
+                is_enabled INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'disabled',
+                next_check_at TEXT,
+                restriction_until TEXT,
+                last_checked_at TEXT,
+                last_response_text TEXT,
+                last_error TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
         conn.commit()
     finally:
         cursor.close()
@@ -737,6 +752,12 @@ def create_dm_tables() -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_dm_pending_source_task
             ON dm_pending_sources(dm_task_id, source_chat_id, pending_id)
+            """
+        )
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_dm_spambot_due
+            ON dm_spambot_monitor(is_enabled, status, next_check_at)
             """
         )
         cursor.execute(

@@ -103,6 +103,7 @@ from services.first_dm_modules import (
 from services.first_message_ai_quick_offer import choose_ai_quick_offer_first_dm_text
 from services.first_message_kirill_vip import choose_kirill_vip_first_dm_text
 from services.menu_ui import render_menu
+from services.spambot_monitor import trigger_peer_flood_monitor
 from utils.database.database import create_dm_tables
 from utils.telegram import gid_key
 
@@ -469,6 +470,7 @@ async def _send_pending_row(row: dict) -> str:
                 claim_token=queue_claim,
             )
             pause_account(account_user_id, "PeerFlood: ручное возобновление")
+            _queue_spambot_check_after_peer_flood(account_user_id)
             logger.error(
                 f"[DM account {account_user_id}] PeerFlood while resolving peer; paused"
             )
@@ -577,6 +579,7 @@ async def _send_pending_row(row: dict) -> str:
             return "flood_wait"
         except PeerFloodError:
             pause_account(account_user_id, "PeerFlood: ручное возобновление")
+            _queue_spambot_check_after_peer_flood(account_user_id)
             if partial_delivery:
                 mark_uncertain(row_id, "photo_delivered_then_peer_flood")
                 mark_account_send_completed(account_user_id)
@@ -745,6 +748,36 @@ def ensure_account_dispatcher(account_user_id: int) -> None:
         _account_dispatch_loop(account_user_id),
         name=f"dm-account-dispatch-{account_user_id}",
     )
+
+
+def get_connected_dm_account_client(account_user_id: int) -> Optional[TelegramClient]:
+    """Return one live task client for the account without creating a second session."""
+    account_user_id = int(account_user_id)
+    for task_id, client in list(dm_monitor_clients.items()):
+        task = _get_task(int(task_id))
+        if not task or int(task.get("user_id") or 0) != account_user_id:
+            continue
+        try:
+            if client.is_connected():
+                return client
+        except Exception:
+            continue
+    return None
+
+
+def _queue_spambot_check_after_peer_flood(account_user_id: int) -> bool:
+    try:
+        queued = trigger_peer_flood_monitor(int(account_user_id))
+    except Exception as exc:
+        logger.exception(
+            f"[SpamBot monitor] failed to queue account={account_user_id}: {exc}"
+        )
+        return False
+    if queued:
+        logger.info(
+            f"[SpamBot monitor] immediate status check queued account={account_user_id}"
+        )
+    return queued
 
 
 def _detect_private_message_kind(event) -> str | None:

@@ -46,6 +46,7 @@ async def delete_account(event: callback_query) -> None:
             conn.execute("UPDATE broadcasts SET is_active = 0 WHERE user_id = ?", (user_id,))
             conn.execute("DELETE FROM groups WHERE user_id = ?", (user_id,))
             conn.execute("DELETE FROM discovered_groups WHERE user_id = ?", (user_id,))
+            conn.execute("DELETE FROM dm_spambot_monitor WHERE account_user_id = ?", (user_id,))
             conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
     finally:
         cursor.close()

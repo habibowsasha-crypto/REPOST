@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import os
 import sys
 
 from loguru import logger
+from telethon import Button
 
 # Importing handlers registers Telethon callbacks on the shared bot client.
 from handlers import *  # noqa: F401,F403
 from config import (
+    ADMIN_ID_LIST,
     BOT_TOKEN,
     DB_PATH,
     bot,
@@ -18,13 +21,15 @@ from config import (
 from handlers.dm.dm_handlers import (
     dm_account_dispatcher_tasks,
     dm_monitor_tasks,
+    get_connected_dm_account_client,
     restore_dm_tasks,
     set_dm_runtime_shutting_down,
 )
-from services.account_profiles import refresh_stale_account_profiles
+from services.account_profiles import format_account_label, refresh_stale_account_profiles
 from services.ai_dialog_service import create_ai_tables
 from services.dm_contact_analytics import create_contact_tables, expire_stale_dialogs
 from services.dm_task_queue import recover_stale_queue
+from services.spambot_monitor import SpamBotCheckResult, process_due_spambot_checks
 from utils.database import create_table, delete_table
 from utils.database.database import create_dm_tables
 
@@ -100,6 +105,45 @@ async def _run_queue_recovery_job() -> None:
         logger.exception(f"[DM queue] periodic recovery failed: {exc}")
 
 
+async def _notify_spambot_free(result: SpamBotCheckResult) -> None:
+    account_user_id = int(result.account_user_id)
+    label = html.escape(format_account_label(account_user_id, include_id=True, max_length=60))
+    text = (
+        "✅ <b>@SpamBot: ограничений больше нет</b>\n\n"
+        f"👤 Аккаунт: <b>{label}</b>\n"
+        "Первые DM остаются на паузе. Возобновление выполняется только вручную."
+    )
+    buttons = [
+        [Button.inline("▶️ Возобновить первые DM", f"spambot_monitor_resume_{account_user_id}".encode())],
+        [Button.inline("👤 Открыть аккаунт", f"account_info_{account_user_id}".encode())],
+    ]
+    for admin_id in ADMIN_ID_LIST:
+        try:
+            await bot.send_message(int(admin_id), text, buttons=buttons, parse_mode="html")
+        except Exception as exc:
+            logger.exception(
+                f"[SpamBot monitor] admin notification failed admin={admin_id} "
+                f"account={account_user_id}: {exc}"
+            )
+
+
+async def _run_spambot_monitor_job() -> None:
+    """Check only accounts whose persisted @SpamBot timer is due."""
+    try:
+        results = await process_due_spambot_checks(
+            get_connected_dm_account_client,
+            on_free=_notify_spambot_free,
+        )
+        for result in results:
+            if result.outcome not in {"not_due", "waiting_client"}:
+                logger.info(
+                    f"[SpamBot monitor] account={result.account_user_id} "
+                    f"outcome={result.outcome} next={result.next_check_at}"
+                )
+    except Exception as exc:
+        logger.exception(f"[SpamBot monitor] scheduler job failed: {exc}")
+
+
 async def setup_scheduler() -> None:
     if scheduler.get_job("dm-queue-recovery") is None:
         scheduler.add_job(
@@ -117,6 +161,16 @@ async def setup_scheduler() -> None:
             "interval",
             hours=1,
             id="dm-dialog-expiry",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+    if scheduler.get_job("dm-spambot-monitor") is None:
+        scheduler.add_job(
+            _run_spambot_monitor_job,
+            "interval",
+            seconds=30,
+            id="dm-spambot-monitor",
             replace_existing=True,
             max_instances=1,
             coalesce=True,

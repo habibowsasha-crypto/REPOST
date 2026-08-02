@@ -35,6 +35,7 @@ from services.dm_task_queue import (
     set_account_pacing,
 )
 from services.menu_ui import render_menu
+from services.spambot_monitor import get_spambot_monitor_state, mark_spambot_manual_resume
 from .dm_handlers import (
     delete_dm_task_runtime,
     dm_monitor_tasks,
@@ -792,8 +793,12 @@ async def dm_account_resume(event: callback_query) -> None:
     if task_id is None or not task:
         await event.answer("Задача не найдена", alert=True)
         return
-    resume_account(int(task["user_id"]))
-    ensure_account_dispatcher(int(task["user_id"]))
+    account_user_id = int(task["user_id"])
+    resume_account(account_user_id)
+    monitor = get_spambot_monitor_state(account_user_id)
+    if monitor.is_enabled:
+        mark_spambot_manual_resume(account_user_id)
+    ensure_account_dispatcher(account_user_id)
     await event.answer("Первые DM аккаунта возобновлены")
     await _show_task(event, task_id)
 
