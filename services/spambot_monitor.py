@@ -307,7 +307,7 @@ def maybe_auto_resume_after_free(account_user_id: int) -> bool:
     """Resume PeerFlood-paused first DMs when auto_resume is enabled.
 
     Returns True only when the account pause was actually cleared.
-    FloodWait cooldown is left intact by resume_account().
+    FloodWait and PeerFlood cooldowns are left intact.
     """
     state = get_spambot_monitor_state(account_user_id)
     if not state.is_enabled or not state.auto_resume:
@@ -317,11 +317,24 @@ def maybe_auto_resume_after_free(account_user_id: int) -> bool:
     if not _account_is_peer_flood_paused(account_user_id):
         return False
     # Local import keeps startup free of circular module initialization.
-    from services.dm_task_queue import resume_account
+    from services.dm_task_queue import (
+        get_account_dispatch_state,
+        parse_iso,
+        resume_account,
+    )
 
-    # Resume account first; monitor state is marked free->idle in the same try.
-    # If monitor mark fails, force-idle in a second attempt so UI is not stuck on
-    # free_detected while DMs are already allowed.
+    # Do not resume while PeerFlood cooldown is still active (SpamBot free
+    # often arrives earlier than Telegram allows cold DMs again).
+    dispatch = get_account_dispatch_state(int(account_user_id))
+    cool = parse_iso(dispatch.cooldown_until)
+    if cool is not None and cool > utc_now():
+        remaining = int((cool - utc_now()).total_seconds())
+        logger.info(
+            f"[SpamBot monitor] free but PeerFlood cooldown active "
+            f"account={int(account_user_id)} remaining={remaining}s — skip auto-resume"
+        )
+        return False
+
     resume_account(int(account_user_id))
     try:
         mark_spambot_manual_resume(int(account_user_id))

@@ -507,8 +507,7 @@ async def _send_pending_row(row: dict) -> str:
                 status="retry_wait",
                 claim_token=queue_claim,
             )
-            pause_account(account_user_id, "PeerFlood: ручное возобновление")
-            _queue_spambot_check_after_peer_flood(account_user_id)
+            _apply_peer_flood_pause(account_user_id)
             logger.error(
                 f"[DM account {account_user_id}] PeerFlood while resolving peer; paused"
             )
@@ -651,8 +650,7 @@ async def _send_pending_row(row: dict) -> str:
             )
             return "flood_wait"
         except PeerFloodError:
-            pause_account(account_user_id, "PeerFlood: ручное возобновление")
-            _queue_spambot_check_after_peer_flood(account_user_id)
+            _apply_peer_flood_pause(account_user_id)
             if partial_delivery:
                 mark_uncertain(row_id, "photo_delivered_then_peer_flood")
                 mark_account_send_completed(account_user_id)
@@ -982,6 +980,27 @@ def get_connected_dm_account_client(account_user_id: int) -> Optional[TelegramCl
         except Exception:
             continue
     return None
+
+
+
+def _apply_peer_flood_pause(account_user_id: int) -> None:
+    """Pause account and enforce a long cooldown even if SpamBot says free."""
+    from decouple import config as _cfg
+    from services.dm_task_queue import pause_account, set_account_cooldown
+
+    account_user_id = int(account_user_id)
+    pause_account(account_user_id, "PeerFlood: cooldown + resume")
+    try:
+        minutes = int(_cfg("PEER_FLOOD_COOLDOWN_MINUTES", default="45") or 45)
+    except Exception:
+        minutes = 45
+    minutes = max(15, min(minutes, 240))
+    set_account_cooldown(
+        account_user_id,
+        minutes * 60,
+        f"PeerFlood cooldown {minutes}m",
+    )
+    _queue_spambot_check_after_peer_flood(account_user_id)
 
 
 def _queue_spambot_check_after_peer_flood(account_user_id: int) -> bool:
