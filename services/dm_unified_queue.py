@@ -1219,6 +1219,35 @@ def prepare_unified_send_for_account(account_user_id: int) -> Optional[dict[str,
                 release_global_send_lease(retry_seconds=5)
                 return None
 
+            # Skip targets that can never be written (completed / opt-out)
+            try:
+                from services.dm_contact_analytics import is_completed_contact
+                from services.dm_opt_out import is_opted_out
+                tid = int(lead["target_user_id"])
+                if is_completed_contact(account_user_id, tid) or is_opted_out(tid):
+                    conn.execute(
+                        """
+                        UPDATE dm_unified_leads
+                           SET status='cancelled',
+                               last_error=?,
+                               reserved_by_account_user_id=NULL,
+                               reserved_at=NULL,
+                               reserve_token=NULL,
+                               updated_at=?
+                         WHERE target_user_id=?
+                           AND status NOT IN ('sent','cancelled')
+                        """,
+                        (
+                            "completed_or_opt_out",
+                            now_iso,
+                            tid,
+                        ),
+                    )
+                    release_global_send_lease(retry_seconds=0)
+                    return None
+            except Exception as exc:
+                logger.debug(f"[DM unified] completed/opt-out check skipped: {exc}")
+
             # Reserve lead for this account.
             cursor = conn.execute(
                 """
@@ -1389,9 +1418,23 @@ def release_unified_lead_for_pending(
         else None
     )
     mapped = _map_pending_status(status)
+    # cancelled/sent are terminal — must NOT fall back to pending
+    # (old bug: cancelled not in ACTIVE_LEAD_STATUSES → forced pending → infinite loop)
+    if mapped in {"cancelled", "sent"}:
+        final_status = mapped
+    elif mapped in ACTIVE_LEAD_STATUSES:
+        final_status = mapped
+    else:
+        final_status = "pending"
     with _db_lock, conn:
+        # Resolve target for terminal cancel of all duplicates
+        target_row = conn.execute(
+            "SELECT target_user_id FROM dm_pending_queue WHERE id=?",
+            (int(pending_id),),
+        ).fetchone()
+        target_user_id = int(target_row[0]) if target_row else None
         conn.execute(
-            f"""
+            """
             UPDATE dm_unified_leads
                SET status=?,
                    eligible_at=COALESCE(?, eligible_at),
@@ -1409,7 +1452,7 @@ def release_unified_lead_for_pending(
                 )
             """,
             (
-                mapped if mapped in ACTIVE_LEAD_STATUSES else "pending",
+                final_status,
                 due_iso,
                 _clean(error),
                 now_iso,
@@ -1417,6 +1460,22 @@ def release_unified_lead_for_pending(
                 int(pending_id),
             ),
         )
+        # If terminal cancel/sent, drop every other active lead for same user
+        if final_status in {"cancelled", "sent"} and target_user_id is not None:
+            conn.execute(
+                """
+                UPDATE dm_unified_leads
+                   SET status=?,
+                       last_error=COALESCE(?, last_error),
+                       reserved_by_account_user_id=NULL,
+                       reserved_at=NULL,
+                       reserve_token=NULL,
+                       updated_at=?
+                 WHERE target_user_id=?
+                   AND status NOT IN ('sent', 'cancelled')
+                """,
+                (final_status, _clean(error), now_iso, target_user_id),
+            )
 
 
 
