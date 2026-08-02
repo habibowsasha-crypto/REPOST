@@ -329,9 +329,26 @@ def maybe_auto_resume_after_free(account_user_id: int) -> bool:
     cool = parse_iso(dispatch.cooldown_until)
     if cool is not None and cool > utc_now():
         remaining = int((cool - utc_now()).total_seconds())
+        # FREE normally has next_check=NULL and would never retry auto-resume.
+        retry_at = cool + dt.timedelta(seconds=30)
+        with _db_lock, conn:
+            conn.execute(
+                """
+                UPDATE dm_spambot_monitor
+                   SET next_check_at=?, updated_at=?
+                 WHERE account_user_id=? AND is_enabled=1 AND status=?
+                """,
+                (
+                    _iso(retry_at),
+                    _iso(utc_now()),
+                    int(account_user_id),
+                    _STATUS_FREE,
+                ),
+            )
         logger.info(
             f"[SpamBot monitor] free but PeerFlood cooldown active "
-            f"account={int(account_user_id)} remaining={remaining}s — skip auto-resume"
+            f"account={int(account_user_id)} remaining={remaining}s — "
+            f"auto-resume deferred until {_iso(retry_at)}"
         )
         return False
 
@@ -397,6 +414,7 @@ def mark_spambot_manual_resume(account_user_id: int) -> SpamBotMonitorState:
 
 def list_due_spambot_accounts(limit: int = 20) -> list[int]:
     now = _iso(utc_now())
+    # Include FREE rows that have a deferred next_check (auto-resume after cooldown).
     rows = conn.execute(
         """
         SELECT account_user_id
@@ -408,7 +426,7 @@ def list_due_spambot_accounts(limit: int = 20) -> list[int]:
          ORDER BY next_check_at, account_user_id
          LIMIT ?
         """,
-        (now, _STATUS_FREE, max(1, min(int(limit), 100))),
+        (now, _STATUS_CHECKING, max(1, min(int(limit), 100))),
     ).fetchall()
     return [int(row[0]) for row in rows]
 
@@ -443,7 +461,7 @@ def _claim_due(account_user_id: int) -> bool:
                 _iso(now),
                 int(account_user_id),
                 _iso(now),
-                _STATUS_FREE,
+                _STATUS_CHECKING,
             ),
         )
     return int(cursor.rowcount or 0) == 1
@@ -576,6 +594,37 @@ async def check_spambot_account(
 ) -> SpamBotCheckResult:
     account_user_id = int(account_user_id)
     async with _runtime_lock(account_user_id):
+        pre = get_spambot_monitor_state(account_user_id)
+        # Deferred auto-resume after PeerFlood cooldown (no new /start to @SpamBot).
+        if (
+            pre.is_enabled
+            and pre.status == _STATUS_FREE
+            and pre.next_check_at
+        ):
+            next_at = None
+            try:
+                from services.dm_task_queue import parse_iso as _parse_iso
+
+                next_at = _parse_iso(pre.next_check_at)
+            except Exception:
+                next_at = None
+            if next_at is not None and next_at <= utc_now():
+                resumed = maybe_auto_resume_after_free(account_user_id)
+                if resumed:
+                    return SpamBotCheckResult(
+                        account_user_id=account_user_id,
+                        outcome=_STATUS_FREE,
+                        response_text=pre.last_response_text,
+                        auto_resumed=True,
+                    )
+                # Still in cooldown or not paused — leave scheduled retry as set.
+                return SpamBotCheckResult(
+                    account_user_id=account_user_id,
+                    outcome=_STATUS_FREE,
+                    response_text=pre.last_response_text,
+                    next_check_at=get_spambot_monitor_state(account_user_id).next_check_at,
+                )
+
         if not _claim_due(account_user_id):
             return SpamBotCheckResult(account_user_id, "not_due")
 

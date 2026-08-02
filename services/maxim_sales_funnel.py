@@ -119,6 +119,29 @@ def canonical_project_explanation(source_count: int = DEFAULT_FREE_SOURCE_COUNT)
 
 # Curated help messages sent automatically after every invitation link.  The
 # wording changes, while the practical instruction remains exact and safe.
+
+# Varied first-offer lines for AI First DM short path (same facts, different words).
+# {from_bit} is either "" or a natural "я из «Chat»," / "я из чата," — never bare "из «Chat»".
+AI_FIRST_DM_OFFER_VARIANTS: tuple[str, ...] = (
+    "Слушай, {from_bit}есть бесплатный канал — софт сам кидает туда посты из ~{free_count} закрытых випок. Платить не нужно.",
+    "Кстати, {from_bit}нашёл канал где автоматом появляются посты с ~{free_count} платных випок. Всё бесплатно смотришь.",
+    "Если кратко: {from_bit}один бесплатный канал, туда софт копирует с закрытых випок (~{free_count} штук). Деньги не просят.",
+    "Без воды: {from_bit}есть канал со сливами випок, посты летят туда сами. Платить ничего не надо.",
+    "{from_bit}могу скинуть бесплатный канал, куда дублируют посты из закрытых випок (~{free_count}). Просто смотришь.",
+    "Суть: {from_bit}софт копирует посты из платных випок в один бесплатный канал. Покупка доступов не нужна.",
+    "Глянь: {from_bit}канал бесплатный, туда моментально падают посты с ~{free_count} випок. Без оплаты.",
+    "Короче: {from_bit}вместо покупки кучи випок — один бесплатный канал со сливами. Софт сам тащит посты.",
+)
+
+AI_FIRST_DM_LINK_INTROS: tuple[str, ...] = (
+    "Вот:",
+    "Ссылка:",
+    "Держи:",
+    "Сюда:",
+    "Вот канал:",
+    "Заходи:",
+)
+
 LINK_ACCESS_HELP_VARIANTS: tuple[str, ...] = (
     "Если ссылка не нажимается, сверху над чатом закрой крестиком плашку «Заблокировать / Добавить». Потом попробуй снова. Не поможет — скопируй ссылку и вставь её в Telegram.",
     "Кстати, если ссылка не кликается, нажми крестик справа у плашки «Заблокировать / Добавить». После этого попробуй ещё раз. Если нет — скопируй её в Telegram.",
@@ -1230,7 +1253,7 @@ def build_ai_first_dm_short_plan(
         "AI_FREE_VIP_SOURCE_COUNT", DEFAULT_FREE_SOURCE_COUNT, 1, 999
     )
     title = _clean_source_title(source_chat_title)
-    title_bit = f" из «{title}»" if title else ""
+    from_bit = (f"я из «{title}», " if title else "")
     norm = _normalize(last_user)
     link_help = any(
         marker in norm
@@ -1251,31 +1274,33 @@ def build_ai_first_dm_short_plan(
                 action="link_access_help",
                 next_stage="completed",
                 close_after=True,
-                messages=[LINK_ACCESS_HELP_VARIANTS[0]],
+                messages=[random.choice(LINK_ACCESS_HELP_VARIANTS)],
                 model="local_ai_first_dm",
             )
+        offer = random.choice(AI_FIRST_DM_OFFER_VARIANTS).format(
+            from_bit=from_bit, free_count=free_count
+        )
+        intro = random.choice(AI_FIRST_DM_LINK_INTROS)
         return FunnelPlan(
             action="concise_link",
             next_stage="completed",
             close_after=True,
-            messages=[
-                "Если коротко: бесплатный канал, софт моментально копирует посты с випок"
-                f"{title_bit}. Платить не нужно. Вот: {PIRATE_VIP_LINK}"
-            ],
+            messages=[f"{offer} {intro} {PIRATE_VIP_LINK}"],
             model="local_ai_first_dm",
         )
 
     # First reply after first DM → value + link (this is bot message #2 overall).
+    offer = random.choice(AI_FIRST_DM_OFFER_VARIANTS).format(
+        from_bit=from_bit, free_count=free_count
+    )
+    intro = random.choice(AI_FIRST_DM_LINK_INTROS)
     return FunnelPlan(
         action="concise_link",
         next_stage="link_sent_waiting_final",
         close_after=False,
         messages=[
-            (
-                f"Слушай{title_bit}: есть бесплатный канал — софт моментально кидает туда "
-                f"посты из ~{free_count} закрытых випок. Платить не нужно, просто смотришь."
-            ),
-            f"Вот: {PIRATE_VIP_LINK}",
+            offer,
+            f"{intro} {PIRATE_VIP_LINK}",
         ],
         model="local_ai_first_dm",
     )
@@ -1318,6 +1343,13 @@ async def generate_plan(
 Ты Максим — обычный человек из чата, не менеджер и не продавец.
 По факту ты привлекаешь людей в бесплатный Telegram-канал со сливами VIP-каналов и получаешь за это зарплату, но в переписке звучишь как свой, который просто подсказал полезную штуку.
 Не владелец проекта, не трейдер-гуру, не финансовый консультант. Не выдумывай личный опыт, сделки, доходность или винрейт.
+УНИКАЛЬНОСТЬ ФОРМУЛИРОВОК
+Каждый ответ пиши по-новому: другие слова, другой порядок, другая длина.
+Не копируй шаблон «софт моментально кидает туда посты из ~6 закрытых випок».
+Факты те же (бесплатный канал / сливы випок / софт копирует / платить не нужно / одна ссылка),
+но формулировка каждый раз разная, как у живого человека в переписке.
+Ссылку используй только точную: https://telegram.me/+pvPjmt2KW_QyZTAy
+
 Ты НЕ продаёшь платный VIP и НЕ оформляешь оплату. Оффер — бесплатный канал.
 Платный расширенный доступ создателя (~{paid_count} VIP) упоминай только если спросили, и сразу: брать не обязательно.
 

@@ -1,1 +1,1 @@
-worker: python -m laika_bot.app
+worker: python main.py

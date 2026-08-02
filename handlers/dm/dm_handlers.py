@@ -991,10 +991,10 @@ def _apply_peer_flood_pause(account_user_id: int) -> None:
     account_user_id = int(account_user_id)
     pause_account(account_user_id, "PeerFlood: cooldown + resume")
     try:
-        minutes = int(_cfg("PEER_FLOOD_COOLDOWN_MINUTES", default="45") or 45)
+        minutes = int(_cfg("PEER_FLOOD_COOLDOWN_MINUTES", default="5") or 5)
     except Exception:
         minutes = 45
-    minutes = max(15, min(minutes, 240))
+    minutes = max(5, min(minutes, 240))
     set_account_cooldown(
         account_user_id,
         minutes * 60,
