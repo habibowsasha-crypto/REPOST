@@ -124,17 +124,19 @@ _unified_lead_snapshots: dict[int, list[int]] = {}
 
 
 def _format_queue_mode_screen() -> tuple[str, list]:
+    from services.account_profiles import format_account_label
     from services.dm_unified_queue import (
         MODE_UNIFIED,
+        list_unified_participating_accounts,
         unified_queue_stats,
     )
 
     stats = unified_queue_stats()
     enabled = stats["mode"] == MODE_UNIFIED
     if enabled:
-        mode_line = "🟢 <b>Включена</b> — аккаунты пишут из общего пула"
+        mode_line = "🟢 <b>Включена</b> — пишут только из общего пула"
     else:
-        mode_line = "⚪ <b>Выключена</b> — очередь по аккаунтам (соло)"
+        mode_line = "⚪ <b>Выключена</b> — каждый аккаунт из своей очереди"
 
     next_line = "—"
     if stats["next_global_send_in_seconds"] is not None:
@@ -161,6 +163,41 @@ def _format_queue_mode_screen() -> tuple[str, list]:
     preferred_paused = int(stats["preferred_account_paused_leads"])
     spacing = f"{stats['global_spacing_min']}–{stats['global_spacing_max']} сек"
 
+    accounts = list_unified_participating_accounts()
+    if accounts:
+        acc_lines = []
+        for acc in accounts[:15]:
+            try:
+                label = html.escape(
+                    format_account_label(
+                        int(acc["account_user_id"]),
+                        include_id=True,
+                        max_length=40,
+                    )
+                )
+            except Exception:
+                label = str(acc["account_user_id"])
+            if acc.get("is_paused"):
+                flag = "⏸"
+            else:
+                flag = "🟢" if enabled else "⚪"
+            acc_lines.append(
+                f"{flag} {label} · задач: {acc['task_count']}"
+            )
+        if len(accounts) > 15:
+            acc_lines.append(f"… и ещё {len(accounts) - 15}")
+        accounts_block = "\n".join(acc_lines)
+    else:
+        accounts_block = "<i>Нет активных DM-задач с сессией</i>"
+
+    if enabled:
+        solo_line = (
+            "📋 <b>Соло-отправка:</b> на паузе\n"
+            "📡 <b>Мониторинг чатов:</b> работает (люди попадают в общий пул)"
+        )
+    else:
+        solo_line = "📋 <b>Соло-отправка:</b> активна (каждый из своей очереди)"
+
     text = (
         "🌐 <b>Общая очередь первых DM</b>\n"
         f"{mode_line}\n\n"
@@ -173,10 +210,11 @@ def _format_queue_mode_screen() -> tuple[str, list]:
         f"⏸ <b>Preferred на паузе:</b> {preferred_paused}\n\n"
         f"⏱ <b>Общая пауза:</b> {spacing}\n"
         f"🚀 <b>Слот:</b> {next_line}\n\n"
-        "📦 <b>Модуль:</b> 🤖 AI Первый DM\n"
-        "📋 <b>Соло-задачи:</b> мониторинг чатов работает, "
-        "отправка из их очередей на паузе\n"
-        "🔁 После отправки человек снимается из очередей всех аккаунтов"
+        f"📦 <b>Модуль:</b> 🤖 AI Первый DM\n"
+        f"{solo_line}\n"
+        "🔁 После отправки человек снимается из очередей всех аккаунтов\n\n"
+        f"<b>Аккаунты в общей очереди ({len(accounts)}):</b>\n"
+        f"{accounts_block}"
     )
     toggle_label = (
         "↩️ Выключить общую очередь"

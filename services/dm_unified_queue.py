@@ -690,6 +690,43 @@ def count_active_unified_leads() -> int:
     return int(row[0] if row else 0)
 
 
+
+def list_unified_participating_accounts() -> list[dict]:
+    """Accounts that can send from the unified pool right now.
+
+    Rule: has an active DM task with a non-empty session_string.
+    """
+    ensure_unified_queue_schema()
+    rows = conn.execute(
+        """
+        SELECT t.user_id,
+               COUNT(DISTINCT t.id) AS task_count,
+               COALESCE(d.is_paused, 0) AS is_paused,
+               d.pause_reason,
+               d.cooldown_until
+          FROM dm_tasks AS t
+          LEFT JOIN dm_account_dispatch AS d ON d.account_user_id = t.user_id
+         WHERE t.is_active = 1
+           AND t.session_string IS NOT NULL
+           AND TRIM(t.session_string) <> ''
+         GROUP BY t.user_id
+         ORDER BY t.user_id
+        """
+    ).fetchall()
+    result = []
+    for row in rows:
+        result.append(
+            {
+                "account_user_id": int(row[0]),
+                "task_count": int(row[1] or 0),
+                "is_paused": bool(row[2]),
+                "pause_reason": row[3],
+                "cooldown_until": row[4],
+            }
+        )
+    return result
+
+
 def unified_queue_stats() -> dict[str, Any]:
     """Admin-facing snapshot of the unified pool and runtime mode."""
     from services.dm_task_queue import parse_iso
@@ -1459,6 +1496,7 @@ __all__ = [
     "complete_global_send_window",
     "count_active_unified_leads",
     "unified_queue_stats",
+    "list_unified_participating_accounts",
     "ensure_unified_queue_schema",
     "get_queue_runtime_state",
     "global_gate_wait_seconds",

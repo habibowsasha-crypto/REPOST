@@ -1560,15 +1560,33 @@ async def cmd_dm_list(event: callback_message) -> None:
             "⏸ **ГЛОБАЛЬНАЯ ПАУЗА ПЕРВЫХ DM**\n"
             "Новые первые сообщения не отправляются. Пользователи продолжают добавляться в очередь."
         )
+    try:
+        from services.dm_unified_queue import is_unified_queue_mode
+        if is_unified_queue_mode():
+            lines.append(
+                "🌐 **Общая очередь ВКЛ** — соло-отправка на паузе.\n"
+                "Задачи мониторят чаты, first DM идут только из общего пула (AI Первый DM)."
+            )
+    except Exception:
+        pass
     lines.append(f"🧹 Неактуальных задач: **{inactive_count}**")
     lines.append("👥 Команда очереди: `/dm_queue ID` — показать @username и Telegram ID")
     buttons = []
     for task_id, account_id, active, created, low, high, first_dm_module, chats, sent, privacy in rows:
         running_task = dm_monitor_tasks.get(int(task_id))
         running = bool(running_task and not running_task.done())
+        unified_on = False
+        try:
+            from services.dm_unified_queue import is_unified_queue_mode
+            unified_on = is_unified_queue_mode()
+        except Exception:
+            unified_on = False
         if active and global_pause.is_paused:
             status = "⏸ глобальная пауза"
             status_icon = "⏸"
+        elif active and unified_on:
+            status = "🌐 общая очередь (соло-отправка пауза)"
+            status_icon = "🌐"
         elif active and running:
             status = "🟢 активна"
             status_icon = "🟢"
