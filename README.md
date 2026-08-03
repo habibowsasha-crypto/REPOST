@@ -1,4 +1,4 @@
-# Channel DM Bot v1.0.15
+# Channel DM Bot v1.0.161.0.15
 
 Telegram-бот для мягкой DM-рекламы канала.
 

@@ -13,7 +13,7 @@ STAGE_EXPLAINED = "explained"
 STAGE_LINK_SENT = "link_sent"
 STAGE_CLOSED = "closed"
 
-MAX_OUTGOING = 5
+MAX_OUTGOING = 4
 
 
 def _now() -> dt.datetime:

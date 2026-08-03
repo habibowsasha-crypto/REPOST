@@ -1,4 +1,8 @@
-"""Start/stop dispatcher worker UI — unified style."""
+"""Start / pause dispatcher worker UI — unified style.
+
+Pause stops first DM + dialog funnel / auto-link.
+Group monitoring keeps collecting leads into the queue.
+"""
 
 from __future__ import annotations
 
@@ -31,33 +35,55 @@ def _worker_body() -> str:
     elif st["enabled"]:
         flag, loop = f"{ON} вкл", f"{WAIT} остановлен"
     else:
-        flag, loop = f"{OFF} выкл", f"{OFF} остановлен"
+        flag, loop = f"{OFF} пауза", f"{OFF} остановлен"
     return join(
-        f"Флаг: **{flag}**",
+        f"Рассылка: **{flag}**",
         f"Цикл: **{loop}**",
         kv("Глобальная пауза", f"{st['global_wait_sec']} сек"),
-        kv("Мониторинг", f"{mon['connected_count']} акк."),
+        kv("Мониторинг (очередь)", f"{mon['connected_count']} акк.", icon="📡"),
         kv("Pending", str(pending), icon="⏳"),
+        "",
+        "Пауза = нет first DM и ответов воронки.",
+        "Сбор юзеров из групп **не** останавливается.",
     )
 
 
+def _toggle_row():
+    st = dispatcher_svc.worker_status()
+    if st.get("enabled"):
+        return [btn("⏸ Пауза", b"bc_toggle")]
+    return [btn("▶️ Запустить", b"bc_toggle")]
+
+
+@bot.on(events.CallbackQuery(data=b"bc_toggle"))
+async def cb_bc_toggle(event: events.CallbackQuery.Event) -> None:
+    if not is_admin(event.sender_id):
+        await event.answer(DENIED, alert=True)
+        return
+    st = dispatcher_svc.worker_status()
+    if st.get("enabled"):
+        await dispatcher_svc.stop_worker()
+        await event.answer("Пауза: рассылка остановлена")
+    else:
+        await dispatcher_svc.start_worker()
+        await event.answer("Запущено")
+    # Always return to main menu so the toggle label updates.
+    from handlers.menu import show_main_menu
+
+    await show_main_menu(event, edit=True)
+
+
+# Keep legacy callbacks working (redirect to toggle behavior / status)
 @bot.on(events.CallbackQuery(data=b"bc_start"))
 async def cb_bc_start(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
         await event.answer(DENIED, alert=True)
         return
     await dispatcher_svc.start_worker()
-    text = screen("▶️", "Старт", "Воркер включён — first DM идут.", _worker_body())
-    await render_menu(
-        event,
-        text,
-        [
-            [btn("⏹ Стоп", b"bc_stop")],
-            [btn("🔄 Обновить", b"bc_worker_status")],
-            back_home_row(),
-        ],
-    )
-    await event.answer("Воркер запущен")
+    from handlers.menu import show_main_menu
+
+    await show_main_menu(event, edit=True)
+    await event.answer("Запущено")
 
 
 @bot.on(events.CallbackQuery(data=b"bc_stop"))
@@ -66,22 +92,10 @@ async def cb_bc_stop(event: events.CallbackQuery.Event) -> None:
         await event.answer(DENIED, alert=True)
         return
     await dispatcher_svc.stop_worker()
-    text = screen(
-        "⏹",
-        "Стоп",
-        "Новые first DM не отправляются.",
-        _worker_body(),
-    )
-    await render_menu(
-        event,
-        text,
-        [
-            [btn("▶️ Старт", b"bc_start")],
-            [btn("🔄 Обновить", b"bc_worker_status")],
-            back_home_row(),
-        ],
-    )
-    await event.answer("Воркер остановлен")
+    from handlers.menu import show_main_menu
+
+    await show_main_menu(event, edit=True)
+    await event.answer("Пауза")
 
 
 @bot.on(events.CallbackQuery(data=b"bc_worker_status"))
@@ -90,19 +104,13 @@ async def cb_bc_worker_status(event: events.CallbackQuery.Event) -> None:
         await event.answer(DENIED, alert=True)
         return
     st = dispatcher_svc.worker_status()
-    title = "Рассылка"
-    if st["enabled"] and st["loop_running"]:
-        emoji = "🟢"
-    elif st["enabled"]:
-        emoji = "🟡"
-    else:
-        emoji = "🔴"
-    text = screen(emoji, title, _worker_body())
+    emoji = "🟢" if st.get("enabled") else "⏸"
+    text = screen(emoji, "Рассылка", _worker_body())
     await render_menu(
         event,
         text,
         [
-            [btn("▶️ Старт", b"bc_start"), btn("⏹ Стоп", b"bc_stop")],
+            _toggle_row(),
             [btn("🔄 Обновить", b"bc_worker_status")],
             back_home_row(),
         ],

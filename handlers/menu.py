@@ -47,9 +47,18 @@ from services.ui import (
 
 
 def _main_menu_buttons():
+    from services import dispatcher as dispatcher_svc
+
+    st = dispatcher_svc.worker_status()
+    running = bool(st.get("enabled"))
+    toggle = (
+        btn("⏸ Пауза", b"bc_toggle")
+        if running
+        else btn("▶️ Запустить", b"bc_toggle")
+    )
     return [
-        [btn("▶️ Старт", b"bc_start"), btn("⏹ Стоп", b"bc_stop")],
-        [btn("🔄 Обновить", b"menu_refresh"), btn("📊 Статус", b"bc_status")],
+        [toggle, btn("🔄 Обновить", b"menu_refresh")],
+        [btn("📊 Статус", b"bc_status")],
         [btn("👤 Аккаунты", b"menu_accounts"), btn("📬 Очередь", b"bc_queue")],
         [btn("⚙️ Настройки", b"menu_settings"), btn("🚫 Opt-out", b"menu_optout")],
         [btn("ℹ️ Помощь", b"menu_help")],
@@ -189,8 +198,8 @@ async def cb_refresh(event: events.CallbackQuery.Event) -> None:
 
 def _settings_buttons():
     return [
-        [btn("⏱ Темп", b"bc_pacing")],
-        [btn("⚠️ PeerFlood", b"bc_peerflood")],
+        [btn("⏱ Темп рассылки", b"bc_pacing")],
+        [btn("⚠️ После PeerFlood", b"bc_peerflood")],
         [btn("🔗 Канал", b"bc_link")],
         [btn("🤖 AI", b"menu_ai")],
         back_home_row(),
@@ -208,18 +217,21 @@ async def cb_settings(event: events.CallbackQuery.Event) -> None:
     ai = f"{ON} `{AI_MODEL}`" if AI_DM_ENABLED else f"{OFF} выкл"
     link = CHANNEL_LINK or "(не задана)"
     link_short = link if len(link) <= 40 else link[:37] + "…"
+    acc_min_m = DM_ACCOUNT_INTERVAL_MIN // 60
+    acc_max_m = DM_ACCOUNT_INTERVAL_MAX // 60
     text = screen(
         "⚙️",
         "Настройки",
-        "Всё, что влияет на рассылку.",
         join(
-            kv("PeerFlood", pf, icon="⚠️"),
-            kv("AI", ai, icon="🤖"),
-            f"🔗 `{link_short}`",
+            "Две разные вещи:",
+            "• **Темп** — как часто писать, когда всё ок",
+            "• **После PeerFlood** — сколько ждать после ограничения Telegram",
         ),
         join(
-            "Темп и канал — через Railway Variables.",
-            "PeerFlood — меняется кнопками ниже.",
+            kv("Темп (акк.)", f"{acc_min_m}–{acc_max_m} мин", icon="⏱"),
+            kv("После PeerFlood", pf, icon="⚠️"),
+            kv("AI", ai, icon="🤖"),
+            f"🔗 `{link_short}`",
         ),
     )
     await render_menu(event, text, _settings_buttons())
@@ -296,32 +308,28 @@ async def cb_bc_status(event: events.CallbackQuery.Event) -> None:
 
 
 def _pacing_text() -> str:
-    from services import runtime as runtime_svc
-
     acc_min_m = DM_ACCOUNT_INTERVAL_MIN // 60
     acc_max_m = DM_ACCOUNT_INTERVAL_MAX // 60
-    pf = runtime_svc.format_peer_flood_pause()
     return screen(
-        "⚙️",
-        "Темп",
+        "⏱",
+        "Темп рассылки",
+        "Плановый ритм, пока аккаунт **не** в PeerFlood.",
         join(
-            kv("На аккаунт", f"{acc_min_m}–{acc_max_m} мин между first DM"),
-            kv("Глобально", f"{DM_GLOBAL_SPACING_MIN}–{DM_GLOBAL_SPACING_MAX} сек"),
-            kv("Лимит / сутки", str(DM_DAILY_LIMIT_PER_ACCOUNT)),
-            kv("Ответ AI", f"{AI_REPLY_DELAY_MIN}–{AI_REPLY_DELAY_MAX} сек"),
-            kv("Авто-ссылка", f"{AI_AUTO_LINK_DELAY_MIN}–{AI_AUTO_LINK_DELAY_MAX} сек"),
-            kv("PeerFlood пауза", pf, icon="⚠️"),
-            kv("SpamBot auto-resume", "да" if SPAMBOT_AUTO_RESUME else "нет"),
+            kv("Между DM одного аккаунта", f"{acc_min_m}–{acc_max_m} мин"),
+            kv("Между любыми DM в боте", f"{DM_GLOBAL_SPACING_MIN}–{DM_GLOBAL_SPACING_MAX} сек"),
+            kv("Макс. first DM / сутки", str(DM_DAILY_LIMIT_PER_ACCOUNT)),
+            kv("Пауза перед ответом AI", f"{AI_REPLY_DELAY_MIN}–{AI_REPLY_DELAY_MAX} сек"),
+            kv("Авто-ссылка при тишине", f"{AI_AUTO_LINK_DELAY_MIN}–{AI_AUTO_LINK_DELAY_MAX} сек"),
         ),
-        "Интервалы DM — через Railway Variables.\nPeerFlood паузу можно менять кнопками ниже.",
+        join(
+            "Эти значения задаются в **Railway Variables**.",
+            "Здесь только просмотр — кнопками не меняются.",
+        ),
     )
 
 
 def _pacing_buttons():
-    from services.ui import btn
-
     return [
-        [btn("⚠️ Пауза PeerFlood", b"bc_peerflood")],
         back_row(b"menu_settings"),
         back_home_row(),
     ]
@@ -342,10 +350,15 @@ def _peerflood_screen() -> str:
     pf = runtime_svc.format_peer_flood_range()
     return screen(
         "⚠️",
-        "Пауза PeerFlood",
-        f"Сейчас: **{pf}** (рандом при каждом PeerFlood)",
-        "После PeerFlood аккаунт ждёт случайное время из диапазона,",
-        "даже если @SpamBot уже «зелёный».",
+        "После PeerFlood",
+        "Это **не** обычный темп.",
+        join(
+            "Когда Telegram кидает PeerFlood:",
+            "• аккаунт на паузу",
+            "• бот пишет @SpamBot",
+            "• ждём случайное время из диапазона ниже",
+        ),
+        f"Сейчас: **{pf}** (рандом каждый раз)",
         "Пресет или свой `min max` в **секундах**:",
     )
 
@@ -405,7 +418,7 @@ async def cb_pf_set(event: events.CallbackQuery.Event) -> None:
     runtime_svc.set_peer_flood_range_seconds(seconds, seconds)
     label = runtime_svc.format_peer_flood_range()
     await render_menu(event, _peerflood_screen(), _peerflood_buttons())
-    await event.answer(f"Пауза: {label}")
+    await event.answer(f"После PeerFlood: {label}")
 
 
 @bot.on(events.CallbackQuery(data=b"pf_custom"))
@@ -558,7 +571,7 @@ async def cb_help(event: events.CallbackQuery.Event) -> None:
             [
                 "Аккаунты → добавить → включить участие",
                 "Чаты → обновить → выбрать / режим «все»",
-                "На главной → Старт",
+                "На главной → Запустить",
             ],
         ),
         section(
@@ -574,7 +587,7 @@ async def cb_help(event: events.CallbackQuery.Event) -> None:
         join(
             "1. Добавь аккаунт → включи участие",
             "2. Чаты → обнови → выбери / режим «все»",
-            "3. Главная → Старт",
+            "3. Главная → Запустить",
         ),
         section(
             "Команды",

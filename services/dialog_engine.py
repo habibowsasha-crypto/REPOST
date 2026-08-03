@@ -99,6 +99,18 @@ async def _handle_incoming_private_body(
         )
         return
 
+    # Pause: no funnel replies / auto-link while worker is off.
+    # Group monitoring still fills the queue independently.
+    from services import runtime as runtime_svc
+
+    if not runtime_svc.is_worker_enabled():
+        logger.info(
+            "Dialog paused (worker off) target={} account={}",
+            target_user_id,
+            account_user_id,
+        )
+        return
+
     stage = dialog.get("stage")
     outgoing = int(dialog.get("outgoing_count") or 0)
 
@@ -176,30 +188,40 @@ async def _handle_incoming_private_body(
         return
 
     if stage == store.STAGE_LINK_SENT:
-        if ai_dialog.is_soft_decline(text) or outgoing >= store.MAX_OUTGOING:
+        # Budget: first + explain + link (+ optional close/apology).
+        # After link — no more pitch, only short close.
+        if ai_dialog.is_soft_decline(text):
             await _send_and_close(
                 account_user_id,
                 target_user_id,
-                "Ок, на связи не буду. Удачного дня.",
+                ai_dialog.soft_close_text(),
                 opt_out=False,
-                reason="done",
+                reason="soft_no",
             )
             return
-        await asyncio.sleep(_delay_reply())
-        history = (store.get_dialog(target_user_id) or {}).get("history") or []
-        reply = await ai_dialog.generate_contextual_reply(history, include_link=False)
-        ok = await _send_private(account_user_id, target_user_id, reply)
-        if ok:
-            store.append_history(target_user_id, "assistant", reply)
-            store.set_stage(target_user_id, store.STAGE_LINK_SENT, bump_outgoing=True)
-            d2 = store.get_dialog(target_user_id)
-            if d2 and int(d2.get("outgoing_count") or 0) >= store.MAX_OUTGOING:
-                store.set_stage(target_user_id, store.STAGE_CLOSED)
-                store.mark_contact_completed(target_user_id)
+        # Any further chat: one short goodbye, then closed (uses last slot).
+        await _send_and_close(
+            account_user_id,
+            target_user_id,
+            random.choice(
+                [
+                    "Если что - ссылка выше. Больше не отвлекаю.",
+                    "Ок, глянь по ссылке если интересно. Больше не пишу.",
+                    "На связи не буду, ссылка уже выше. Хорошего дня.",
+                ]
+            ),
+            opt_out=False,
+            reason="funnel_done",
+        )
+        return
 
 
 async def process_due_auto_links() -> int:
     """Send link messages for explained dialogs past auto_link_at."""
+    from services import runtime as runtime_svc
+
+    if not runtime_svc.is_worker_enabled():
+        return 0
     due = store.list_due_auto_links()
     n = 0
     for d in due:

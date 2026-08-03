@@ -26,15 +26,16 @@ from services import phrases as phrases_svc
 from services.ai_first_dm import sanitize_dashes
 
 _STOP_RE = re.compile(
-    r"(не\s+пиши|не\s+пишите|отстань|отстаньте|заблокирую|в\s+блок|"
+    r"(не\s+пиши|не\s+пишите|отстань|отстаньте|заблокирую|в\s+блок|жалоб|"
     r"не\s+пиш(и|ите)\s+мне|leave\s+me|stop\s+writing|do\s+not\s+write|"
     r"fuck\s+off|пошёл\s+на|пошел\s+на|иди\s+нахуй|отвали)",
     re.IGNORECASE,
 )
 
 _SOFT_NO_RE = re.compile(
-    r"(неинтересно|не\s+интересно|не\s+надо|не\s+нужно|нет\s+спасибо|"
-    r"не\s+хочу|не\s+актуально)",
+    r"(^\s*нет\s*[.!?]?\s*$|"
+    r"неинтересно|не\s+интересно|не\s+надо|не\s+нужно|нет\s+спасибо|"
+    r"не\s+хочу|не\s+актуально|не\s+сейчас)",
     re.IGNORECASE,
 )
 
