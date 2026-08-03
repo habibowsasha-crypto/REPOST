@@ -47,6 +47,8 @@ async def show_chats_menu(event, account_user_id: int, page: int = 0, *, edit: b
         f"Найдено групп: **{total}**\n"
         f"Будет мониториться: **{watchable}**\n"
     )
+    if watchable == 0:
+        text += "⚠ **Ни один чат не мониторится — очередь будет пустой.**\n"
     if mode == chats_svc.CHAT_MODE_MANUAL:
         text += f"Выбрано вручную: **{len(selected)}**\n"
         text += "\nОтметьте чаты для мониторинга:"

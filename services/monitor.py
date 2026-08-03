@@ -138,10 +138,18 @@ async def _handle_group(
 
     chat_id = int(event.chat_id)
     if not chats_svc.is_chat_watchable(account_user_id, chat_id):
+        logger.debug(
+            "Skip chat {} for account {} (not watchable / mode filter)",
+            chat_id,
+            account_user_id,
+        )
         return
 
     sender = await event.get_sender()
     if sender is None or not isinstance(sender, User):
+        logger.debug(
+            "Skip non-user sender in chat {} account={}", chat_id, account_user_id
+        )
         return
     if getattr(sender, "bot", False) or getattr(sender, "is_self", False):
         return
@@ -166,8 +174,19 @@ async def _handle_group(
             account_user_id,
         )
     elif action == "refreshed":
-        logger.debug(
-            "Lead refreshed target={} via account={}", target_id, account_user_id
+        logger.info(
+            "Lead refreshed target={} via account={} chat={}",
+            target_id,
+            account_user_id,
+            chat_id,
+        )
+    else:
+        logger.info(
+            "Lead skip target={} action={} account={} chat={}",
+            target_id,
+            action,
+            account_user_id,
+            chat_id,
         )
 
 

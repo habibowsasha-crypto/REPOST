@@ -277,11 +277,11 @@ def is_chat_watchable(account_user_id: int, chat_id: int) -> bool:
     """Return True if this chat should be monitored for the account."""
     chat_id = int(chat_id)
     mode = get_chat_mode(account_user_id)
-    discovered_ids = {int(d["chat_id"]) for d in list_discovered(account_user_id)}
-    if chat_id not in discovered_ids:
-        return False
     if mode == CHAT_MODE_MANUAL:
+        # Manual: only explicitly selected chats (must be in selection table).
         return chat_id in list_selected_ids(account_user_id)
+    # all_with_exclusions: any group message except excluded.
+    # Do NOT require prior discovery - newly joined groups still collect leads.
     return chat_id not in list_excluded_ids(account_user_id)
 
 

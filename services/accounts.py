@@ -109,8 +109,8 @@ def upsert_account(
                 """
                 INSERT INTO accounts (
                     user_id, session_string, phone, username, first_name, last_name,
-                    participates, is_paused, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
+                    participates, is_paused, chat_mode, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 'all_with_exclusions', ?, ?)
                 """,
                 (
                     int(user_id),
