@@ -121,25 +121,26 @@ def _list_ready_accounts() -> list[dict[str, Any]]:
 def _order_accounts_for_lead(
     lead: dict[str, Any], ready: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    """Prefer source account, then accounts watching source chat, then others."""
+    """Random order among ready accounts.
+
+    Soft preference: ~35% chance to try source account first if it is ready;
+    otherwise pure shuffle so one account is not sticky.
+    """
+    if not ready:
+        return []
+    pool = list(ready)
+    random.shuffle(pool)
     source = lead.get("source_account_user_id")
-    source_chat = lead.get("source_chat_id")
-    preferred: list[dict[str, Any]] = []
-    same_chat: list[dict[str, Any]] = []
-    others: list[dict[str, Any]] = []
-    for acc in ready:
-        uid = int(acc["user_id"])
-        if source is not None and uid == int(source):
-            preferred.append(acc)
-        elif source_chat is not None and chats_svc.is_chat_watchable(
-            uid, int(source_chat)
-        ):
-            same_chat.append(acc)
-        else:
-            others.append(acc)
-    random.shuffle(same_chat)
-    random.shuffle(others)
-    return preferred + same_chat + others
+    if source is None:
+        return pool
+    source_id = int(source)
+    for i, acc in enumerate(pool):
+        if int(acc["user_id"]) == source_id:
+            if random.random() < 0.35:
+                # move source to front
+                pool.insert(0, pool.pop(i))
+            break
+    return pool
 
 
 async def _tick() -> bool:
@@ -150,7 +151,8 @@ async def _tick() -> bool:
         return False
 
     # Temporary claim by any ready account, then reassign to preferred sender.
-    lead = queue_svc.claim_random_pending(int(ready[0]["user_id"]))
+    claimer = random.choice(ready)
+    lead = queue_svc.claim_random_pending(int(claimer["user_id"]))
     if not lead:
         return False
     target_id = int(lead["target_user_id"])
@@ -169,11 +171,13 @@ async def _tick() -> bool:
 
     for acc in ordered:
         account_id = int(acc["user_id"])
-        ok, _reason = pacing.account_is_send_ready(acc)
+        # Re-read from DB: earlier PeerFlood in this tick may have paused someone.
+        fresh = accounts_svc.get_account(account_id) or acc
+        ok, _reason = pacing.account_is_send_ready(fresh)
         if not ok:
             continue
         client = monitor_svc.get_client(account_id)
-        if client is None:
+        if client is None or not client.is_connected():
             continue
 
         # Previous attempt may have released the claim (PeerFlood/error).

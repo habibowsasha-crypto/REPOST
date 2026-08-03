@@ -98,6 +98,21 @@ def init_db() -> None:
         _ensure_column(
             conn, "accounts", "dm_interval_max_sec", "dm_interval_max_sec INTEGER"
         )
+        _ensure_column(
+            conn, "accounts", "peerflood_streak", "peerflood_streak INTEGER NOT NULL DEFAULT 0"
+        )
+        _ensure_column(
+            conn, "accounts", "peerflood_last_at", "peerflood_last_at TEXT"
+        )
+        _ensure_column(
+            conn, "accounts", "interval_backup_min", "interval_backup_min INTEGER"
+        )
+        _ensure_column(
+            conn, "accounts", "interval_backup_max", "interval_backup_max INTEGER"
+        )
+        _ensure_column(
+            conn, "accounts", "interval_backoff_until", "interval_backoff_until TEXT"
+        )
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_accounts_participates

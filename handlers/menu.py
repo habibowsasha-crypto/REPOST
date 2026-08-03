@@ -311,6 +311,12 @@ async def cb_bc_status(event: events.CallbackQuery.Event) -> None:
     await event.answer()
 
 
+def _fmt_min_range(lo: int, hi: int) -> str:
+    if lo >= 60 and hi >= 60:
+        return f"{lo // 60}–{hi // 60} мин"
+    return f"{lo}–{hi} сек"
+
+
 def _pacing_text() -> str:
     from services import runtime as runtime_svc
 
@@ -321,37 +327,34 @@ def _pacing_text() -> str:
     l_lo, l_hi = runtime_svc.get_auto_link_delay_range()
 
     return join(
-        f"⏱ **Темп рассылки**",
+        "⏱ **Темп рассылки**",
         DIV,
         "Плановый ритм, пока нет PeerFlood.",
         "",
-        f"👤 Между DM одного аккаунта",
-        f"   **{a_lo // 60}–{a_hi // 60} мин**",
-        "",
-        f"🌐 Между любыми DM в боте",
-        f"   **{g_lo}–{g_hi} сек**",
-        "",
-        f"📊 Макс. first DM / сутки",
-        f"   **{daily}**",
-        "",
-        f"🤖 Пауза перед ответом AI",
-        f"   **{r_lo}–{r_hi} сек**",
-        "",
-        f"🔗 Авто-ссылка при тишине",
-        f"   **{l_lo}–{l_hi} сек**",
+        f"👤 Аккаунт: **{_fmt_min_range(a_lo, a_hi)}**",
+        f"🌐 Global: **{g_lo}–{g_hi} сек**",
+        f"📊 Лимит: **{daily}**/сутки",
+        f"🤖 AI-ответ: **{r_lo}–{r_hi} сек**",
+        f"🔗 Авто-ссылка: **{l_lo}–{l_hi} сек**",
         DIV,
-        "Меняется кнопками ниже (не Railway).",
+        "Нажми параметр, чтобы изменить.",
     )
 
 
 def _pacing_buttons():
+    from services import runtime as runtime_svc
+
+    a_lo, a_hi = runtime_svc.get_account_interval_range()
+    g_lo, g_hi = runtime_svc.get_global_spacing_range()
+    daily = runtime_svc.get_daily_limit()
+    r_lo, r_hi = runtime_svc.get_ai_reply_delay_range()
+    l_lo, l_hi = runtime_svc.get_auto_link_delay_range()
     return [
-        [btn("👤 Аккаунт 10–15м", b"pace_acc_600_900"), btn("15–25м", b"pace_acc_900_1500")],
-        [btn("🌐 Global 90–180с", b"pace_glob_90_180"), btn("120–240с", b"pace_glob_120_240")],
-        [btn("📊 Лимит 30", b"pace_daily_30"), btn("45", b"pace_daily_45"), btn("60", b"pace_daily_60")],
-        [btn("🤖 AI 20–60с", b"pace_ai_20_60"), btn("30–90с", b"pace_ai_30_90")],
-        [btn("🔗 Link 60–120с", b"pace_link_60_120"), btn("90–180с", b"pace_link_90_180")],
-        [btn("✏️ Свой интервал", b"pace_custom")],
+        [btn(f"👤 Аккаунт · {_fmt_min_range(a_lo, a_hi)}", b"pace_edit_acc")],
+        [btn(f"🌐 Global · {g_lo}–{g_hi}с", b"pace_edit_glob")],
+        [btn(f"📊 Лимит · {daily}/сутки", b"pace_edit_daily")],
+        [btn(f"🤖 AI · {r_lo}–{r_hi}с", b"pace_edit_ai")],
+        [btn(f"🔗 Ссылка · {l_lo}–{l_hi}с", b"pace_edit_link")],
         back_row(b"menu_settings"),
         back_home_row(),
     ]
@@ -366,104 +369,95 @@ async def cb_bc_pacing(event: events.CallbackQuery.Event) -> None:
     await event.answer()
 
 
-@bot.on(events.CallbackQuery(pattern=rb"^pace_acc_(\d+)_(\d+)$"))
-async def cb_pace_acc(event: events.CallbackQuery.Event) -> None:
-    if not is_admin(event.sender_id):
-        await event.answer(DENIED, alert=True)
-        return
+def _pace_edit_screen(kind: str):
+    """Return (text, buttons) for one parameter editor."""
     from services import runtime as runtime_svc
 
-    m = event.pattern_match
-    lo, hi = int(m.group(1)), int(m.group(2))
-    runtime_svc.set_account_interval_range(lo, hi)
-    await render_menu(event, _pacing_text(), _pacing_buttons())
-    await event.answer(f"Аккаунт: {lo // 60}–{hi // 60} мин")
+    hints = {
+        "acc": (
+            "👤",
+            "Между DM одного аккаунта",
+            "Пауза после first DM у **одного** аккаунта, перед следующим.",
+            "Пришли два числа в **минутах**: `мин макс`\nПример: `10 15`",
+            "acc",
+        ),
+        "glob": (
+            "🌐",
+            "Между любыми DM в боте",
+            "Минимальный зазор между **любыми** first DM (все аккаунты).",
+            "Пришли два числа в **секундах**: `мин макс`\nПример: `90 180`",
+            "glob",
+        ),
+        "daily": (
+            "📊",
+            "Макс. first DM / сутки",
+            "Лимит first DM **на один аккаунт** за сутки (UTC).",
+            "Пришли одно число:\nПример: `45`",
+            "daily",
+        ),
+        "ai": (
+            "🤖",
+            "Пауза перед ответом AI",
+            "Сколько ждать перед ответом в воронке (explain / link).",
+            "Пришли два числа в **секундах**: `мин макс`\nПример: `20 60`",
+            "ai",
+        ),
+        "link": (
+            "🔗",
+            "Авто-ссылка при тишине",
+            "После explain, если юзер молчит — через сколько кинуть ссылку.",
+            "Пришли два числа в **секундах**: `мин макс`\nПример: `60 120`",
+            "link",
+        ),
+    }
+    emoji, title, desc, how, step = hints[kind]
+    if kind == "acc":
+        lo, hi = runtime_svc.get_account_interval_range()
+        cur = f"Сейчас: **{_fmt_min_range(lo, hi)}**"
+    elif kind == "glob":
+        lo, hi = runtime_svc.get_global_spacing_range()
+        cur = f"Сейчас: **{lo}–{hi} сек**"
+    elif kind == "daily":
+        cur = f"Сейчас: **{runtime_svc.get_daily_limit()}**/сутки"
+    elif kind == "ai":
+        lo, hi = runtime_svc.get_ai_reply_delay_range()
+        cur = f"Сейчас: **{lo}–{hi} сек**"
+    else:
+        lo, hi = runtime_svc.get_auto_link_delay_range()
+        cur = f"Сейчас: **{lo}–{hi} сек**"
+
+    text = join(
+        f"{emoji} **{title}**",
+        DIV,
+        desc,
+        "",
+        cur,
+        DIV,
+        how,
+        "",
+        "Отмена: /cancel",
+    )
+    buttons = [back_row(b"bc_pacing"), back_home_row()]
+    return text, buttons, step
 
 
-@bot.on(events.CallbackQuery(pattern=rb"^pace_glob_(\d+)_(\d+)$"))
-async def cb_pace_glob(event: events.CallbackQuery.Event) -> None:
-    if not is_admin(event.sender_id):
-        await event.answer(DENIED, alert=True)
-        return
-    from services import runtime as runtime_svc
-
-    m = event.pattern_match
-    lo, hi = int(m.group(1)), int(m.group(2))
-    runtime_svc.set_global_spacing_range(lo, hi)
-    await render_menu(event, _pacing_text(), _pacing_buttons())
-    await event.answer(f"Global: {lo}–{hi}с")
-
-
-@bot.on(events.CallbackQuery(pattern=rb"^pace_daily_(\d+)$"))
-async def cb_pace_daily(event: events.CallbackQuery.Event) -> None:
-    if not is_admin(event.sender_id):
-        await event.answer(DENIED, alert=True)
-        return
-    from services import runtime as runtime_svc
-
-    n = int(event.pattern_match.group(1))
-    runtime_svc.set_daily_limit(n)
-    await render_menu(event, _pacing_text(), _pacing_buttons())
-    await event.answer(f"Лимит: {n}/сутки")
-
-
-@bot.on(events.CallbackQuery(pattern=rb"^pace_ai_(\d+)_(\d+)$"))
-async def cb_pace_ai(event: events.CallbackQuery.Event) -> None:
-    if not is_admin(event.sender_id):
-        await event.answer(DENIED, alert=True)
-        return
-    from services import runtime as runtime_svc
-
-    m = event.pattern_match
-    lo, hi = int(m.group(1)), int(m.group(2))
-    runtime_svc.set_ai_reply_delay_range(lo, hi)
-    await render_menu(event, _pacing_text(), _pacing_buttons())
-    await event.answer(f"AI: {lo}–{hi}с")
-
-
-@bot.on(events.CallbackQuery(pattern=rb"^pace_link_(\d+)_(\d+)$"))
-async def cb_pace_link(event: events.CallbackQuery.Event) -> None:
-    if not is_admin(event.sender_id):
-        await event.answer(DENIED, alert=True)
-        return
-    from services import runtime as runtime_svc
-
-    m = event.pattern_match
-    lo, hi = int(m.group(1)), int(m.group(2))
-    runtime_svc.set_auto_link_delay_range(lo, hi)
-    await render_menu(event, _pacing_text(), _pacing_buttons())
-    await event.answer(f"Link: {lo}–{hi}с")
-
-
-@bot.on(events.CallbackQuery(data=b"pace_custom"))
-async def cb_pace_custom(event: events.CallbackQuery.Event) -> None:
+@bot.on(events.CallbackQuery(pattern=rb"^pace_edit_(acc|glob|daily|ai|link)$"))
+async def cb_pace_edit(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
         await event.answer(DENIED, alert=True)
         return
     from services.admin_state import set_state
 
-    set_state(event.sender_id, flow="pacing", step="custom")
-    text = join(
-        "✏️ **Свой темп**",
-        DIV,
-        "Пришли одной строкой:",
-        "`acc_min acc_max glob_min glob_max daily ai_min ai_max link_min link_max`",
-        "",
-        "Все в **секундах**, daily — число.",
-        "Пример:",
-        "`600 900 90 180 45 30 90 60 120`",
-        "",
-        "Отмена: /cancel",
-    )
-    await render_menu(
-        event,
-        text,
-        [back_row(b"bc_pacing"), back_home_row()],
-    )
+    kind = event.pattern_match.group(1)
+    if isinstance(kind, (bytes, bytearray)):
+        kind = kind.decode()
+    text, buttons, step = _pace_edit_screen(kind)
+    set_state(event.sender_id, flow="pacing", step=step)
+    await render_menu(event, text, buttons)
     await event.answer()
 
 
-def _is_pacing_custom(event) -> bool:
+def _is_pacing_edit(event) -> bool:
     if not getattr(event, "is_private", False):
         return False
     if not is_admin(event.sender_id):
@@ -471,36 +465,64 @@ def _is_pacing_custom(event) -> bool:
     from services.admin_state import get_state
 
     st = get_state(int(event.sender_id)) or {}
-    return st.get("flow") == "pacing" and st.get("step") == "custom"
+    return st.get("flow") == "pacing" and st.get("step") in {
+        "acc",
+        "glob",
+        "daily",
+        "ai",
+        "link",
+    }
 
 
-@bot.on(events.NewMessage(func=_is_pacing_custom))
-async def on_pacing_custom(event: events.NewMessage.Event) -> None:
-    from services.admin_state import clear_state
+@bot.on(events.NewMessage(func=_is_pacing_edit))
+async def on_pacing_edit(event: events.NewMessage.Event) -> None:
+    from services.admin_state import clear_state, get_state
     from services import runtime as runtime_svc
 
+    st = get_state(event.sender_id) or {}
+    step = st.get("step")
     raw = (event.raw_text or "").strip()
     if raw.startswith("/"):
         return
-    parts = raw.replace(",", " ").split()
-    if len(parts) != 9 or not all(p.lstrip("-").isdigit() for p in parts):
+    parts = raw.replace(",", " ").replace("–", " ").replace("-", " ").split()
+    try:
+        if step == "daily":
+            if len(parts) != 1 or not parts[0].isdigit():
+                raise ValueError("need 1 int")
+            n = runtime_svc.set_daily_limit(int(parts[0]))
+            msg = f"Лимит: **{n}**/сутки"
+        else:
+            if len(parts) != 2 or not all(p.isdigit() for p in parts):
+                raise ValueError("need 2 ints")
+            a, b = int(parts[0]), int(parts[1])
+            if step == "acc":
+                # minutes → seconds
+                lo, hi = runtime_svc.set_account_interval_range(a * 60, b * 60)
+                msg = f"Аккаунт: **{_fmt_min_range(lo, hi)}**"
+            elif step == "glob":
+                lo, hi = runtime_svc.set_global_spacing_range(a, b)
+                msg = f"Global: **{lo}–{hi} сек**"
+            elif step == "ai":
+                lo, hi = runtime_svc.set_ai_reply_delay_range(a, b)
+                msg = f"AI: **{lo}–{hi} сек**"
+            elif step == "link":
+                lo, hi = runtime_svc.set_auto_link_delay_range(a, b)
+                msg = f"Ссылка: **{lo}–{hi} сек**"
+            else:
+                raise ValueError("bad step")
+    except Exception:
         await event.respond(
-            notice(
-                "warn",
-                "Нужно 9 чисел. Пример: `600 900 90 180 45 30 90 60 120`",
-            )
+            notice("warn", "Неверный формат. Смотри пример на экране или /cancel")
         )
         return
-    vals = [int(x) for x in parts]
+
     clear_state(event.sender_id)
-    runtime_svc.set_account_interval_range(vals[0], vals[1])
-    runtime_svc.set_global_spacing_range(vals[2], vals[3])
-    runtime_svc.set_daily_limit(vals[4])
-    runtime_svc.set_ai_reply_delay_range(vals[5], vals[6])
-    runtime_svc.set_auto_link_delay_range(vals[7], vals[8])
     await event.respond(
-        join("⏱ **Темп сохранён**", DIV, _pacing_text()),
-        buttons=[back_home_row()],
+        join("✅ " + msg, DIV, _pacing_text()),
+        buttons=[
+            [btn("⏱ Темп", b"bc_pacing")],
+            back_home_row(),
+        ],
     )
 
 

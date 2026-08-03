@@ -129,6 +129,11 @@ def record_successful_send(account_user_id: int) -> None:
     from services import accounts as accounts_svc
 
     acc = accounts_svc.get_account(int(account_user_id))
+    try:
+        accounts_svc.maybe_restore_interval_after_success(int(account_user_id))
+        acc = accounts_svc.get_account(int(account_user_id)) or acc
+    except Exception:
+        pass
     interval = random_account_interval_seconds(acc)
     next_send = (now + dt.timedelta(seconds=interval)).isoformat()
     conn = get_connection()

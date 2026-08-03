@@ -37,13 +37,23 @@ def _account_label(account_user_id: int) -> str:
     return accounts_svc.format_account_label(acc, include_id=True)
 
 
-def _notify_peerflood(label: str, seconds: int) -> str:
+def _notify_peerflood(label: str, seconds: int, *, streak: int = 1, interval_bumped: bool = False) -> str:
     from services import runtime as runtime_svc
     pause = runtime_svc.format_duration(int(seconds))
     rng = runtime_svc.format_peer_flood_range()
     line1 = f"⚠️ Аккаунт **{label}** словил PeerFlood."
-    line2 = f"Пауза **{pause}** (рандом {rng}). Спрашиваю @SpamBot."
-    return line1 + "\n" + line2
+    if streak >= 2 or seconds >= 25 * 60:
+        line2 = (
+            f"Повтор быстрее 10–15 мин → пауза **{pause}** "
+            f"(обычно {rng}). Спрашиваю @SpamBot."
+        )
+        extra = "\n🔁 Временный cooldown, потом как в настройках."
+    else:
+        line2 = f"Пауза **{pause}** (настройки {rng}). Спрашиваю @SpamBot."
+        extra = ""
+    if interval_bumped:
+        extra += "\n⏱ На 30 мин увеличена задержка first DM на этом аккаунте."
+    return line1 + "\n" + line2 + extra
 
 def _notify_free_manual(label: str) -> str:
     return (
@@ -183,9 +193,30 @@ async def on_peer_flood(account_user_id: int) -> None:
             )
             return
 
-    seconds = int(runtime_svc.pick_peer_flood_seconds())
+    info = accounts_svc.register_peerflood_hit(account_user_id)
+    streak = int(info.get("streak") or 1)
+    interval_bumped = bool(info.get("interval_bumped"))
+    rapid = bool(info.get("rapid"))
+    if info.get("pause_seconds") is not None:
+        seconds = int(info["pause_seconds"])
+    else:
+        seconds = int(runtime_svc.pick_peer_flood_seconds())
     min_until = _now() + dt.timedelta(seconds=seconds)
     pacing.set_paused(account_user_id, "PeerFlood", paused=True)
+    # Push next_send_at past cooldown so this account is not the only
+    # "ready" sender the moment pause lifts (others may still be in 10–15m window).
+    acc_row = accounts_svc.get_account(account_user_id) or {}
+    lo = acc_row.get("dm_interval_min_sec")
+    hi = acc_row.get("dm_interval_max_sec")
+    if lo is not None and hi is not None:
+        import random as _rnd
+        a, b = int(lo), int(hi)
+        if a > b:
+            a, b = b, a
+        gap = _rnd.randint(max(60, a), max(60, b))
+    else:
+        gap = max(60, int(runtime_svc.get_account_interval_range()[0]))
+    next_send = min_until + dt.timedelta(seconds=int(gap))
     conn = get_connection()
     with db_lock(), conn:
         conn.execute(
@@ -194,12 +225,14 @@ async def on_peer_flood(account_user_id: int) -> None:
                SET cooldown_until=?,
                    pause_reason=?,
                    is_paused=1,
+                   next_send_at=?,
                    updated_at=?
              WHERE user_id=?
             """,
             (
                 min_until.isoformat(),
                 "PeerFlood",
+                next_send.isoformat(),
                 _now_iso(),
                 account_user_id,
             ),
@@ -213,7 +246,7 @@ async def on_peer_flood(account_user_id: int) -> None:
         limited_until=None,
     )
     label = _account_label(account_user_id)
-    await notify_admins(_notify_peerflood(label, seconds))
+    await notify_admins(_notify_peerflood(label, seconds, streak=streak, interval_bumped=interval_bumped))
     await check_account(account_user_id, force=True)
 
 

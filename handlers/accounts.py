@@ -169,6 +169,7 @@ async def show_account_card(event, user_id: int, *, edit: bool = True) -> None:
             f"Статус: {status}",
             kv("Монитор", mon_line, icon=mon_icon),
             kv("Задержка DM", accounts_svc.format_dm_interval(acc), icon="⏱"),
+            *( [f"🔁 PeerFlood цикл: **{int(acc.get('peerflood_streak') or 0)}**"] if int(acc.get("peerflood_streak") or 0) else [] ),
             f"Cooldown: `{cooldown}`",
             f"SpamBot: **{sb_status}** · next `{sb_next}`",
             sb_block,
