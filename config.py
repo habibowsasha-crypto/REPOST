@@ -96,3 +96,19 @@ def is_admin(user_id: int | None) -> bool:
     if user_id is None:
         return False
     return int(user_id) in ADMIN_ID_LIST
+
+
+def app_version() -> str:
+    """Read VERSION file next to the package, fallback to 1.0.0."""
+    import pathlib
+    for candidate in (
+        pathlib.Path(__file__).resolve().parent / "VERSION",
+        pathlib.Path("VERSION"),
+    ):
+        try:
+            v = candidate.read_text(encoding="utf-8").strip()
+            if v:
+                return v
+        except Exception:
+            continue
+    return "1.0.0"

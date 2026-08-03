@@ -5,6 +5,7 @@ from __future__ import annotations
 from telethon import events
 
 from config import (
+    app_version,
     ADMIN_ID_LIST,
     AI_AUTO_LINK_DELAY_MAX,
     AI_AUTO_LINK_DELAY_MIN,
@@ -99,7 +100,7 @@ def _dashboard_text() -> str:
 
     return screen(
         "✨",
-        "Channel DM Bot",
+        f"Channel DM Bot · v{app_version()}",
         join(
             kv("Рассылка", w_txt, icon=w_icon),
             kv("Мониторинг", mon_txt, icon=mon_icon),

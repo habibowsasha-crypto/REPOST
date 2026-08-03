@@ -495,3 +495,17 @@ def clear_sending_contact(target_user_id: int) -> None:
             """,
             (int(target_user_id),),
         )
+
+
+def format_target_label(lead: dict[str, Any]) -> str:
+    """Nice label for lead: @user or name or id."""
+    username = (lead.get("username") or "").strip().lstrip("@")
+    first = (lead.get("first_name") or "").strip()
+    last = (lead.get("last_name") or "").strip()
+    name = " ".join(p for p in (first, last) if p).strip()
+    tid = int(lead.get("target_user_id") or 0)
+    if username:
+        return f"@{username}"
+    if name:
+        return name
+    return f"id {tid}"

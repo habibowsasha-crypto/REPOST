@@ -198,6 +198,44 @@ async def _tick() -> bool:
     return False
 
 
+def _target_label(lead: dict[str, Any]) -> str:
+    return queue_svc.format_target_label(lead)
+
+
+def _account_label(account_id: int) -> str:
+    acc = accounts_svc.get_account(int(account_id))
+    if not acc:
+        return f"id {account_id}"
+    return accounts_svc.format_account_label(acc, include_id=False)
+
+
+def _notify_first_dm(account_id: int, lead: dict[str, Any], text: str) -> str:
+    """Pretty admin card for a successful first DM."""
+    from_label = _account_label(account_id)
+    to_label = _target_label(lead)
+    snippet = (text or "").replace("\n", " ").strip()
+    if len(snippet) > 80:
+        snippet = snippet[:77].rstrip() + "…"
+    lines = [
+        "💌  **First DM**",
+        "━━━━━━━━━━━━",
+        f"📤  **{from_label}**",
+        f"📥  **{to_label}**",
+        "━━━━━━━━━━━━",
+        f"💬  _{snippet}_",
+    ]
+    return "\n".join(lines)
+
+
+async def _notify_admins_first_dm(account_id: int, lead: dict[str, Any], text: str) -> None:
+    try:
+        from services.spambot import notify_admins
+
+        await notify_admins(_notify_first_dm(account_id, lead, text))
+    except Exception as exc:
+        logger.debug("first dm notify failed: {}", exc)
+
+
 def _remember_text(text: str) -> None:
     _recent_texts.append(text)
     if len(_recent_texts) > 50:
@@ -252,6 +290,7 @@ async def _send_first_dm(
             target_id,
             text[:40],
         )
+        await _notify_admins_first_dm(account_id, lead, text)
         return "sent"
 
     except FloodWaitError as exc:
