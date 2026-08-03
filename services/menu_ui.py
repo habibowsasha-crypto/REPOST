@@ -29,26 +29,37 @@ async def render_menu(
     """
     Show a menu screen.
 
-    - CallbackQuery: edit the message when possible.
-    - NewMessage / fallback: respond with a new message.
+    - CallbackQuery + edit=True: always try to edit the same message.
+      If content is unchanged (Telegram "not modified") - stay on same message.
+      Never spawn a duplicate menu from a button press.
+    - NewMessage / edit=False: send a new message.
     """
     btn_list = [list(row) for row in buttons] if buttons else None
 
-    query = getattr(event, "query", None)
-    if edit and query is not None:
+    is_callback = getattr(event, "query", None) is not None
+
+    if edit and is_callback:
         try:
             await event.edit(text, buttons=btn_list, link_preview=False)
             return
-        except Exception:
-            # Message not modified / can't edit - fall through to respond.
-            pass
+        except Exception as exc:
+            err = str(exc).lower()
+            # Same text/buttons - Telegram rejects edit. Keep current message.
+            if (
+                "not modified" in err
+                or "message is not modified" in err
+                or "content of the message" in err
+            ):
+                return
+            # Other edit failures: still do NOT open a second menu from a callback.
+            # Admin can re-send /menu if the message was deleted.
+            return
 
     respond = getattr(event, "respond", None)
     if callable(respond):
         await respond(text, buttons=btn_list, link_preview=False)
         return
 
-    # Last resort for unusual event wrappers in tests.
     answer = getattr(event, "answer", None)
     if callable(answer):
         await answer(text[:200])
