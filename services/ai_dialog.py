@@ -41,6 +41,11 @@ _SOFT_NO_RE = re.compile(
 _BAD_DASHES = ("\u2014", "\u2013", "\u2212")
 
 # Small-talk that must NOT appear as "explain"
+_GREETING_RE = re.compile(
+    r"^\s*(привет|здравствуй|здравствуйте|добрый\s+(день|вечер|утро)|hello|hi)\b",
+    re.IGNORECASE,
+)
+
 _SMALLTALK_RE = re.compile(
     r"(как\s+дела|что\s+делаешь|чем\s+занима|как\s+настроен|"
     r"как\s+жизнь|что\s+нового|как\s+сам|как\s+ты\b|"
@@ -107,6 +112,8 @@ def _explain_ok(text: str) -> bool:
     """Reject pure greetings / small talk as explain."""
     t = (text or "").strip()
     if not t or len(t) < 20:
+        return False
+    if _GREETING_RE.search(t):
         return False
     if _SMALLTALK_RE.search(t):
         return False

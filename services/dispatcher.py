@@ -187,8 +187,8 @@ async def _tick() -> bool:
             pacing.mark_global_sent()
             return True
         if result == "flood":
-            # Account-level cooldown only — do not stall global spacing for all.
-            return True
+            # Account-level cooldown only; try next ready account.
+            continue
         if result == "peerflood":
             # Account paused; try next ready account for this lead.
             continue

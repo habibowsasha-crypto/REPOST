@@ -48,10 +48,11 @@ from services.ui import (
 
 def _main_menu_buttons():
     return [
-        [btn("🔄 Обновить", b"menu_refresh"), btn("📊 Детали", b"bc_status")],
-        [btn("👤 Аккаунты", b"menu_accounts"), btn("🚀 Рассылка", b"menu_broadcast")],
-        [btn("📥 Очередь", b"bc_queue"), btn("🚫 Opt-out", b"menu_optout")],
-        [btn("🤖 AI", b"menu_ai"), btn("ℹ️ Помощь", b"menu_help")],
+        [btn("▶️ Старт", b"bc_start"), btn("⏹ Стоп", b"bc_stop")],
+        [btn("🔄 Обновить", b"menu_refresh"), btn("📊 Статус", b"bc_status")],
+        [btn("👤 Аккаунты", b"menu_accounts"), btn("📬 Очередь", b"bc_queue")],
+        [btn("⚙️ Настройки", b"menu_settings"), btn("🚫 Opt-out", b"menu_optout")],
+        [btn("ℹ️ Помощь", b"menu_help")],
     ]
 
 
@@ -62,11 +63,11 @@ def _dashboard_text() -> str:
     from services import monitor as monitor_svc
     from services import opt_out as opt_out_svc
     from services import queue as queue_svc
+    from services import runtime as runtime_svc
 
     total_acc = accounts_svc.count_accounts()
-    active_acc = accounts_svc.count_participating()
     mon = monitor_svc.monitor_status()
-    mon_n = mon.get("connected_count") or 0
+    mon_n = int(mon.get("connected_count") or 0)
 
     wst = dispatcher_svc.worker_status()
     if wst.get("enabled") and wst.get("loop_running"):
@@ -76,15 +77,10 @@ def _dashboard_text() -> str:
     else:
         w_icon, w_txt = OFF, "выключена"
 
-    mon_icon = ON if mon.get("running") and mon_n else OFF
-    mon_txt = f"{mon_n} онлайн" if mon.get("running") else "выкл"
-
     pending = queue_svc.count_by_status(queue_svc.STATUS_PENDING)
     claimed = queue_svc.count_by_status(queue_svc.STATUS_CLAIMED)
-    sent = queue_svc.count_by_status(queue_svc.STATUS_SENT)
-    cancelled = queue_svc.count_by_status(queue_svc.STATUS_CANCELLED)
-    dialogs = dialog_store_svc.count_active()
     first_today = queue_svc.count_first_dm_today()
+    dialogs = dialog_store_svc.count_active()
     optouts = opt_out_svc.count()
 
     link = CHANNEL_LINK or "не задана"
@@ -97,31 +93,33 @@ def _dashboard_text() -> str:
     else:
         ai_line = f"{OFF} AI выкл"
 
+    wait = float(wst.get("global_wait_sec") or 0)
+    wait_txt = f"~{int(wait)}с" if wait else "сейчас"
+    pf = runtime_svc.format_peer_flood_range()
+
     return screen(
         "✨",
         f"Channel DM Bot · v{app_version()}",
         join(
-            kv("Рассылка", w_txt, icon=w_icon),
-            kv("Мониторинг", mon_txt, icon=mon_icon),
-            kv("Аккаунты", f"{active_acc} из {total_acc}", icon="👤"),
+            f"{w_icon} Рассылка   **{w_txt}**",
+            f"⏳ До след. DM   **{wait_txt}**",
         ),
         section(
             "📬 Очередь",
             tree(
                 [
-                    ("⏳", "ждут DM", pending),
+                    ("⏳", "ждут", pending),
                     ("🔄", "в работе", claimed),
-                    ("✅", "написали", sent),
-                    ("🗑", "отменены", cancelled),
+                    ("✅", "сегодня", first_today),
                 ]
             ),
         ),
         join(
             kv("Диалоги", str(dialogs), icon="💬"),
-            kv("First DM сегодня", str(first_today), icon="📨"),
             kv("Opt-out", str(optouts), icon="🚫"),
+            kv("В сети", f"{mon_n} / {total_acc} акк.", icon="👤"),
         ),
-        join(f"🔗 `{link_short}`", ai_line),
+        join(f"🔗 `{link_short}`", ai_line, f"⚠️ PeerFlood  {pf}"),
         hint="👇 разделы ниже",
     )
 
@@ -189,56 +187,42 @@ async def cb_refresh(event: events.CallbackQuery.Event) -> None:
     await event.answer(UPDATED)
 
 
-def _broadcast_buttons():
+def _settings_buttons():
     return [
-        [btn("▶️ Старт", b"bc_start"), btn("⏹ Стоп", b"bc_stop")],
-        [btn("📊 Статус", b"bc_status")],
-        [btn("📥 Очередь", b"bc_queue")],
-        [btn("⚙️ Темп", b"bc_pacing")],
-        [btn("🔗 Ссылка канала", b"bc_link")],
+        [btn("⏱ Темп", b"bc_pacing")],
+        [btn("⚠️ PeerFlood", b"bc_peerflood")],
+        [btn("🔗 Канал", b"bc_link")],
+        [btn("🤖 AI", b"menu_ai")],
         back_home_row(),
     ]
 
 
-@bot.on(events.CallbackQuery(data=b"menu_broadcast"))
-async def cb_broadcast(event: events.CallbackQuery.Event) -> None:
+@bot.on(events.CallbackQuery(data=b"menu_settings"))
+async def cb_settings(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
         await event.answer(DENIED, alert=True)
         return
-    from services import dispatcher as dispatcher_svc
-    from services import queue as queue_svc
+    from services import runtime as runtime_svc
 
-    wst = dispatcher_svc.worker_status()
-    if wst.get("enabled") and wst.get("loop_running"):
-        w_icon, w = ON, "работает"
-    elif wst.get("enabled"):
-        w_icon, w = WAIT, "пауза цикла"
-    else:
-        w_icon, w = OFF, "выкл"
-
-    pending = queue_svc.count_by_status(queue_svc.STATUS_PENDING)
-    sent = queue_svc.count_by_status(queue_svc.STATUS_SENT)
-    today = queue_svc.count_first_dm_today()
-
+    pf = runtime_svc.format_peer_flood_range()
+    ai = f"{ON} `{AI_MODEL}`" if AI_DM_ENABLED else f"{OFF} выкл"
+    link = CHANNEL_LINK or "(не задана)"
+    link_short = link if len(link) <= 40 else link[:37] + "…"
     text = screen(
-        "🚀",
-        "Рассылка",
+        "⚙️",
+        "Настройки",
+        "Всё, что влияет на рассылку.",
         join(
-            kv("Статус", w, icon=w_icon),
-            kv("В очереди", str(pending), icon="⏳"),
-            kv("Уже написали", str(sent), icon="✅"),
-            kv("Сегодня", str(today), icon="📨"),
+            kv("PeerFlood", pf, icon="⚠️"),
+            kv("AI", ai, icon="🤖"),
+            f"🔗 `{link_short}`",
         ),
-        bullets(
-            [
-                "Старт — раздать first DM",
-                "Стоп — остановить",
-                "Очередь — кто ждёт",
-                "Темп — паузы",
-            ]
+        join(
+            "Темп и канал — через Railway Variables.",
+            "PeerFlood — меняется кнопками ниже.",
         ),
     )
-    await render_menu(event, text, _broadcast_buttons())
+    await render_menu(event, text, _settings_buttons())
     await event.answer()
 
 
@@ -274,7 +258,7 @@ def _status_text() -> str:
 
     return screen(
         "📊",
-        "Подробный статус",
+        "Статус",
         join(
             f"Рассылка: {w_txt}",
             kv("Пауза до след. DM", f"~{wait:.0f}с"),
@@ -306,7 +290,7 @@ async def cb_bc_status(event: events.CallbackQuery.Event) -> None:
     await render_menu(
         event,
         _status_text(),
-        [back_row(b"menu_broadcast"), back_home_row()],
+        [[btn("🔄 Обновить", b"bc_status")], back_home_row()],
     )
     await event.answer()
 
@@ -338,7 +322,7 @@ def _pacing_buttons():
 
     return [
         [btn("⚠️ Пауза PeerFlood", b"bc_peerflood")],
-        back_row(b"menu_broadcast"),
+        back_row(b"menu_settings"),
         back_home_row(),
     ]
 
@@ -380,7 +364,7 @@ def _peerflood_buttons():
             btn("10–30 мин", b"pf_rng_600_1800"),
         ],
         [btn("✏️ Свой min max (сек)", b"pf_custom")],
-        back_row(b"bc_pacing"),
+        back_row(b"menu_settings"),
         back_home_row(),
     ]
 
@@ -513,7 +497,7 @@ async def cb_bc_link(event: events.CallbackQuery.Event) -> None:
     await render_menu(
         event,
         text,
-        [back_row(b"menu_broadcast"), back_home_row()],
+        [back_row(b"menu_settings"), back_home_row()],
     )
     await event.answer()
 
@@ -554,7 +538,11 @@ async def cb_ai(event: events.CallbackQuery.Event) -> None:
             ),
         ),
     )
-    await render_menu(event, text, [back_home_row()])
+    await render_menu(
+        event,
+        text,
+        [back_row(b"menu_settings"), back_home_row()],
+    )
     await event.answer()
 
 
@@ -568,12 +556,11 @@ async def cb_help(event: events.CallbackQuery.Event) -> None:
         "Помощь",
         bullets(
             [
-                "Добавь аккаунт → включи участие",
-                "Чаты → обнови → выбери / режим «все»",
-                "Рассылка → Старт",
+                "Аккаунты → добавить → включить участие",
+                "Чаты → обновить → выбрать / режим «все»",
+                "На главной → Старт",
             ],
-            mark="1.",
-        ).replace("1. ", "1. ", 1),
+        ),
         section(
             "Команды",
             join("`/start`  `/menu`  `меню`", "`/ping`  `/status`  `/cancel`"),
@@ -587,7 +574,7 @@ async def cb_help(event: events.CallbackQuery.Event) -> None:
         join(
             "1. Добавь аккаунт → включи участие",
             "2. Чаты → обнови → выбери / режим «все»",
-            "3. Рассылка → Старт",
+            "3. Главная → Старт",
         ),
         section(
             "Команды",

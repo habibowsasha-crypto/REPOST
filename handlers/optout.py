@@ -34,10 +34,10 @@ def _optout_text() -> str:
         body = join(f"Показано {len(rows)} из {total}:", *lines)
     return screen(
         "🚫",
-        "Opt-out",
-        kv("Всего", str(total)),
+        "Кому не писать",
+        kv("Всего в стоп-листе", str(total)),
         body,
-        "Этим людям бот больше не пишет.",
+        "Это не очередь. Сюда — кого больше не беспокоить.",
     )
 
 
@@ -118,6 +118,6 @@ async def on_optout_text(event: events.NewMessage.Event) -> None:
         opt_out_svc.remove(target_id)
         msg = notice("ok", f"`{target_id}` снят с opt-out.")
     await event.respond(
-        screen("🚫", "Opt-out", msg),
+        screen("🚫", "Кому не писать", msg),
         buttons=[back_home_row()],
     )

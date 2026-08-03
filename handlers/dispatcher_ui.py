@@ -15,33 +15,11 @@ from services.ui import (
     ON,
     WAIT,
     back_home_row,
-    back_row,
     btn,
     join,
     kv,
     screen,
 )
-
-
-@bot.on(events.CallbackQuery(data=b"bc_start"))
-async def cb_bc_start(event: events.CallbackQuery.Event) -> None:
-    if not is_admin(event.sender_id):
-        await event.answer(DENIED, alert=True)
-        return
-    await dispatcher_svc.start_worker()
-    text = screen("▶️", "Старт", "Воркер включён.", _worker_body())
-    await render_menu(
-        event,
-        text,
-        [
-            [btn("⏹ Стоп", b"bc_stop")],
-            [btn("🔄 Обновить", b"bc_worker_status")],
-            back_row(b"menu_broadcast"),
-            back_home_row(),
-        ],
-    )
-    await event.answer("Воркер запущен")
-
 
 
 def _worker_body() -> str:
@@ -60,10 +38,26 @@ def _worker_body() -> str:
         kv("Глобальная пауза", f"{st['global_wait_sec']} сек"),
         kv("Мониторинг", f"{mon['connected_count']} акк."),
         kv("Pending", str(pending), icon="⏳"),
-        "",
-        "Random lead × свободный аккаунт.",
-        "AI first DM + fallback пул.",
     )
+
+
+@bot.on(events.CallbackQuery(data=b"bc_start"))
+async def cb_bc_start(event: events.CallbackQuery.Event) -> None:
+    if not is_admin(event.sender_id):
+        await event.answer(DENIED, alert=True)
+        return
+    await dispatcher_svc.start_worker()
+    text = screen("▶️", "Старт", "Воркер включён — first DM идут.", _worker_body())
+    await render_menu(
+        event,
+        text,
+        [
+            [btn("⏹ Стоп", b"bc_stop")],
+            [btn("🔄 Обновить", b"bc_worker_status")],
+            back_home_row(),
+        ],
+    )
+    await event.answer("Воркер запущен")
 
 
 @bot.on(events.CallbackQuery(data=b"bc_stop"))
@@ -83,7 +77,7 @@ async def cb_bc_stop(event: events.CallbackQuery.Event) -> None:
         text,
         [
             [btn("▶️ Старт", b"bc_start")],
-            back_row(b"menu_broadcast"),
+            [btn("🔄 Обновить", b"bc_worker_status")],
             back_home_row(),
         ],
     )
@@ -95,13 +89,21 @@ async def cb_bc_worker_status(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
         await event.answer(DENIED, alert=True)
         return
-    text = screen("🚀", "Воркер first DM", _worker_body())
+    st = dispatcher_svc.worker_status()
+    title = "Рассылка"
+    if st["enabled"] and st["loop_running"]:
+        emoji = "🟢"
+    elif st["enabled"]:
+        emoji = "🟡"
+    else:
+        emoji = "🔴"
+    text = screen(emoji, title, _worker_body())
     await render_menu(
         event,
         text,
         [
             [btn("▶️ Старт", b"bc_start"), btn("⏹ Стоп", b"bc_stop")],
-            back_row(b"menu_broadcast"),
+            [btn("🔄 Обновить", b"bc_worker_status")],
             back_home_row(),
         ],
     )

@@ -1,4 +1,4 @@
-"""Admin UI for the common lead queue — unified style."""
+"""Queue admin UI — unified style."""
 
 from __future__ import annotations
 
@@ -10,12 +10,9 @@ from services import queue as queue_svc
 from services.menu_ui import render_menu
 from services.ui import (
     DENIED,
-    DIV,
     OFF,
     ON,
-    UPDATED,
     back_home_row,
-    back_row,
     btn,
     join,
     kv,
@@ -44,12 +41,12 @@ def queue_screen_text() -> str:
         )
     else:
         recent_block = join(
-            "Последние pending:",
+            "Последние «ждут»:",
             *[queue_svc.format_lead_line(lead) for lead in recent],
         )
 
     return screen(
-        "📥",
+        "📬",
         "Очередь",
         mon_line,
         section(
@@ -70,8 +67,7 @@ def queue_screen_text() -> str:
 def _queue_buttons():
     return [
         [btn("🔄 Обновить", b"bc_queue")],
-        [btn("🧹 Очистить pending", b"bc_queue_clear")],
-        back_row(b"menu_broadcast"),
+        [btn("🧹 Очистить «ждут»", b"bc_queue_clear")],
         back_home_row(),
     ]
 
