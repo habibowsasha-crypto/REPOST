@@ -1557,7 +1557,7 @@ def release_unified_lead_for_pending(
                 )
             """,
             (
-                mapped if mapped in ACTIVE_LEAD_STATUSES or mapped == "cancelled" else "pending",
+                mapped if mapped in ACTIVE_LEAD_STATUSES or mapped in {"cancelled", "sent"} else "pending",
                 due_iso,
                 mapped,
                 _clean(error),
