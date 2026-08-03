@@ -593,3 +593,85 @@ def format_target_label(lead: dict[str, Any]) -> str:
     if name:
         return name
     return f"id {tid}"
+
+
+def force_requeue(
+    *,
+    target_user_id: int,
+    username: str | None = None,
+    first_name: str | None = None,
+    last_name: str | None = None,
+) -> bool:
+    """
+    Put target into pending for a new first DM even if previously sent.
+    Opt-out still blocks. Clears contact row so claim path allows send.
+    """
+    target_user_id = int(target_user_id)
+    if opt_out_svc.is_opted_out(target_user_id):
+        return False
+    now = _now_iso()
+    conn = get_connection()
+    with db_lock(), conn:
+        conn.execute(
+            "DELETE FROM contacts WHERE target_user_id=?",
+            (target_user_id,),
+        )
+        # Drop old funnel so auto-link / closed stage cannot fire on re-queue.
+        conn.execute(
+            "DELETE FROM dialogs WHERE target_user_id=?",
+            (target_user_id,),
+        )
+        existing = conn.execute(
+            "SELECT status FROM leads WHERE target_user_id=?",
+            (target_user_id,),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                """
+                UPDATE leads
+                   SET username=COALESCE(?, username),
+                       first_name=COALESCE(?, first_name),
+                       last_name=COALESCE(?, last_name),
+                       status=?,
+                       eligible_at=?,
+                       claimed_by_account=NULL,
+                       claimed_at=NULL,
+                       send_attempts=0,
+                       last_seen_at=?,
+                       updated_at=?
+                 WHERE target_user_id=?
+                """,
+                (
+                    username,
+                    first_name,
+                    last_name,
+                    STATUS_PENDING,
+                    now,
+                    now,
+                    now,
+                    target_user_id,
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO leads (
+                    target_user_id, username, first_name, last_name,
+                    source_chat_id, source_account_user_id, status,
+                    eligible_at, claimed_by_account, claimed_at,
+                    last_seen_at, created_at, updated_at, send_attempts
+                ) VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, NULL, NULL, ?, ?, ?, 0)
+                """,
+                (
+                    target_user_id,
+                    username,
+                    first_name,
+                    last_name,
+                    STATUS_PENDING,
+                    now,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+    return True

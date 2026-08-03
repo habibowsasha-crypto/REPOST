@@ -286,6 +286,18 @@ async def _send_first_dm(
         queue_svc.mark_sent(target_id, account_id)
         pacing.record_successful_send(account_id)
         try:
+            from services import audience as audience_svc
+
+            audience_svc.record_first_dm(
+                target_id,
+                username=lead.get("username"),
+                first_name=lead.get("first_name"),
+                last_name=lead.get("last_name"),
+                source_chat_id=lead.get("source_chat_id"),
+            )
+        except Exception as a_exc:
+            logger.exception("audience record after first DM: {}", a_exc)
+        try:
             from services import dialog_engine
 
             await dialog_engine.on_first_dm_sent(target_id, account_id, text)

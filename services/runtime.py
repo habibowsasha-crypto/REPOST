@@ -178,3 +178,131 @@ def format_peer_flood_pause(seconds: int | None = None) -> str:
     if seconds is None:
         return format_peer_flood_range()
     return format_duration(int(seconds))
+
+
+# --- Pacing (admin-editable; defaults from env/config) ---
+
+KEY_PACE_ACC_LO = "pace_account_lo_sec"
+KEY_PACE_ACC_HI = "pace_account_hi_sec"
+KEY_PACE_GLOB_LO = "pace_global_lo_sec"
+KEY_PACE_GLOB_HI = "pace_global_hi_sec"
+KEY_PACE_DAILY = "pace_daily_limit"
+KEY_PACE_AI_LO = "pace_ai_reply_lo_sec"
+KEY_PACE_AI_HI = "pace_ai_reply_hi_sec"
+KEY_PACE_LINK_LO = "pace_auto_link_lo_sec"
+KEY_PACE_LINK_HI = "pace_auto_link_hi_sec"
+
+
+def _int_or(default: int, raw: str | None, *, lo: int, hi: int) -> int:
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        n = int(str(raw).strip())
+    except ValueError:
+        return default
+    return max(lo, min(hi, n))
+
+
+def get_account_interval_range() -> tuple[int, int]:
+    from config import DM_ACCOUNT_INTERVAL_MAX, DM_ACCOUNT_INTERVAL_MIN
+
+    lo = _int_or(DM_ACCOUNT_INTERVAL_MIN, _get(KEY_PACE_ACC_LO), lo=60, hi=86400)
+    hi = _int_or(DM_ACCOUNT_INTERVAL_MAX, _get(KEY_PACE_ACC_HI), lo=60, hi=86400)
+    if lo > hi:
+        lo, hi = hi, lo
+    return lo, hi
+
+
+def set_account_interval_range(lo: int, hi: int) -> tuple[int, int]:
+    lo, hi = int(lo), int(hi)
+    if lo > hi:
+        lo, hi = hi, lo
+    lo = max(60, min(86400, lo))
+    hi = max(60, min(86400, hi))
+    _set(KEY_PACE_ACC_LO, str(lo))
+    _set(KEY_PACE_ACC_HI, str(hi))
+    return lo, hi
+
+
+def get_global_spacing_range() -> tuple[int, int]:
+    from config import DM_GLOBAL_SPACING_MAX, DM_GLOBAL_SPACING_MIN
+
+    lo = _int_or(DM_GLOBAL_SPACING_MIN, _get(KEY_PACE_GLOB_LO), lo=10, hi=3600)
+    hi = _int_or(DM_GLOBAL_SPACING_MAX, _get(KEY_PACE_GLOB_HI), lo=10, hi=3600)
+    if lo > hi:
+        lo, hi = hi, lo
+    return lo, hi
+
+
+def set_global_spacing_range(lo: int, hi: int) -> tuple[int, int]:
+    lo, hi = int(lo), int(hi)
+    if lo > hi:
+        lo, hi = hi, lo
+    lo = max(10, min(3600, lo))
+    hi = max(10, min(3600, hi))
+    _set(KEY_PACE_GLOB_LO, str(lo))
+    _set(KEY_PACE_GLOB_HI, str(hi))
+    return lo, hi
+
+
+def get_daily_limit() -> int:
+    from config import DM_DAILY_LIMIT_PER_ACCOUNT
+
+    return _int_or(DM_DAILY_LIMIT_PER_ACCOUNT, _get(KEY_PACE_DAILY), lo=1, hi=500)
+
+
+def set_daily_limit(n: int) -> int:
+    n = max(1, min(500, int(n)))
+    _set(KEY_PACE_DAILY, str(n))
+    return n
+
+
+def get_ai_reply_delay_range() -> tuple[int, int]:
+    from config import AI_REPLY_DELAY_MAX, AI_REPLY_DELAY_MIN
+
+    lo = _int_or(AI_REPLY_DELAY_MIN, _get(KEY_PACE_AI_LO), lo=0, hi=600)
+    hi = _int_or(AI_REPLY_DELAY_MAX, _get(KEY_PACE_AI_HI), lo=0, hi=600)
+    if lo > hi:
+        lo, hi = hi, lo
+    return lo, hi
+
+
+def set_ai_reply_delay_range(lo: int, hi: int) -> tuple[int, int]:
+    lo, hi = int(lo), int(hi)
+    if lo > hi:
+        lo, hi = hi, lo
+    lo = max(0, min(600, lo))
+    hi = max(0, min(600, hi))
+    _set(KEY_PACE_AI_LO, str(lo))
+    _set(KEY_PACE_AI_HI, str(hi))
+    return lo, hi
+
+
+def get_auto_link_delay_range() -> tuple[int, int]:
+    from config import AI_AUTO_LINK_DELAY_MAX, AI_AUTO_LINK_DELAY_MIN
+
+    lo = _int_or(AI_AUTO_LINK_DELAY_MIN, _get(KEY_PACE_LINK_LO), lo=10, hi=1800)
+    hi = _int_or(AI_AUTO_LINK_DELAY_MAX, _get(KEY_PACE_LINK_HI), lo=10, hi=1800)
+    if lo > hi:
+        lo, hi = hi, lo
+    return lo, hi
+
+
+def set_auto_link_delay_range(lo: int, hi: int) -> tuple[int, int]:
+    lo, hi = int(lo), int(hi)
+    if lo > hi:
+        lo, hi = hi, lo
+    lo = max(10, min(1800, lo))
+    hi = max(10, min(1800, hi))
+    _set(KEY_PACE_LINK_LO, str(lo))
+    _set(KEY_PACE_LINK_HI, str(hi))
+    return lo, hi
+
+
+def format_sec_range(lo: int, hi: int) -> str:
+    if lo == hi:
+        return format_duration(lo)
+    # prefer minutes when both >= 60
+    if lo >= 60 and hi >= 60:
+        return f"{lo // 60}–{hi // 60} мин"
+    return f"{lo}–{hi} сек"

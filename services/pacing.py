@@ -91,14 +91,19 @@ def account_is_send_ready(acc: dict[str, Any]) -> tuple[bool, str]:
     # Fallback if next_send_at missing but last_send_at recent (old rows).
     last_send = _parse_iso(acc.get("last_send_at"))
     if last_send and not next_send:
+        from services import runtime as runtime_svc
+
+        lo, _hi = runtime_svc.get_account_interval_range()
         elapsed = (_now() - last_send).total_seconds()
-        if elapsed < DM_ACCOUNT_INTERVAL_MIN:
+        if elapsed < lo:
             return False, "account_interval"
 
     today = _today_str()
     sent_date = (acc.get("daily_sent_date") or "")[:10]
     count = int(acc.get("daily_sent_count") or 0)
-    if sent_date == today and count >= DM_DAILY_LIMIT_PER_ACCOUNT:
+    from services import runtime as runtime_svc
+
+    if sent_date == today and count >= runtime_svc.get_daily_limit():
         return False, "daily_limit"
 
     return True, "ok"

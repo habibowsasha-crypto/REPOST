@@ -38,14 +38,16 @@ def _now() -> dt.datetime:
 
 
 def _delay_reply() -> float:
-    lo = min(AI_REPLY_DELAY_MIN, AI_REPLY_DELAY_MAX)
-    hi = max(AI_REPLY_DELAY_MIN, AI_REPLY_DELAY_MAX)
+    from services import runtime as runtime_svc
+
+    lo, hi = runtime_svc.get_ai_reply_delay_range()
     return float(random.randint(lo, hi))
 
 
 def _auto_link_delay() -> int:
-    lo = min(AI_AUTO_LINK_DELAY_MIN, AI_AUTO_LINK_DELAY_MAX)
-    hi = max(AI_AUTO_LINK_DELAY_MIN, AI_AUTO_LINK_DELAY_MAX)
+    from services import runtime as runtime_svc
+
+    lo, hi = runtime_svc.get_auto_link_delay_range()
     return random.randint(lo, hi)
 
 

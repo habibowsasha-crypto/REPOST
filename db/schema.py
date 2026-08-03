@@ -221,3 +221,25 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audience (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                source TEXT NOT NULL DEFAULT 'dm',
+                source_chat_id INTEGER,
+                first_seen_at TEXT NOT NULL,
+                first_dm_at TEXT,
+                last_touch_at TEXT NOT NULL,
+                notes TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_audience_last_touch
+            ON audience(last_touch_at DESC)
+            """
+        )

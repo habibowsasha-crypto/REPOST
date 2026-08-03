@@ -60,8 +60,8 @@ def _main_menu_buttons():
         [toggle, btn("🔄 Обновить", b"menu_refresh")],
         [btn("📊 Статус", b"bc_status")],
         [btn("👤 Аккаунты", b"menu_accounts"), btn("📬 Очередь", b"bc_queue")],
-        [btn("⚙️ Настройки", b"menu_settings"), btn("🚫 Opt-out", b"menu_optout")],
-        [btn("ℹ️ Помощь", b"menu_help")],
+        [btn("📁 База", b"menu_audience"), btn("🚫 Opt-out", b"menu_optout")],
+        [btn("⚙️ Настройки", b"menu_settings"), btn("ℹ️ Помощь", b"menu_help")],
     ]
 
 
@@ -69,26 +69,35 @@ def _dashboard_text() -> str:
     from services import accounts as accounts_svc
     from services import dialog_store as dialog_store_svc
     from services import dispatcher as dispatcher_svc
+    from services import audience as audience_svc
     from services import opt_out as opt_out_svc
     from services import queue as queue_svc
     from services import runtime as runtime_svc
 
     wst = dispatcher_svc.worker_status()
     if wst.get("enabled") and wst.get("loop_running"):
-        w_icon, w_txt = ON, "работает"
+        w_line = f"{ON} Рассылка работает"
     elif wst.get("enabled"):
-        w_icon, w_txt = WAIT, "пауза цикла"
+        w_line = f"{WAIT} Рассылка пауза цикла"
     else:
-        w_icon, w_txt = OFF, "выключена"
+        w_line = f"{OFF} Рассылка выкл"
+
+    wait = float(wst.get("global_wait_sec") or 0)
+    wait_txt = f"~{int(wait)}с" if wait else "сейчас"
 
     pending = queue_svc.count_by_status(queue_svc.STATUS_PENDING)
     claimed = queue_svc.count_by_status(queue_svc.STATUS_CLAIMED)
     first_today = queue_svc.count_first_dm_today()
     dialogs = dialog_store_svc.count_active()
     optouts = opt_out_svc.count()
+    audience_n = audience_svc.count()
 
     link = CHANNEL_LINK or "не задана"
-    link_short = link[:33] + "…" if len(link) > 36 else link
+    # show full invite link if fits; Telegram allows long messages
+    if len(link) > 48:
+        link_show = link[:45] + "…"
+    else:
+        link_show = link
 
     if AI_DM_ENABLED and OPENAI_API_KEY:
         ai_line = f"{ON} AI · `{AI_MODEL}`"
@@ -97,35 +106,36 @@ def _dashboard_text() -> str:
     else:
         ai_line = f"{OFF} AI выкл"
 
-    wait = float(wst.get("global_wait_sec") or 0)
-    wait_txt = f"~{int(wait)}с" if wait else "сейчас"
     pf = runtime_svc.format_peer_flood_range()
     acc_block = accounts_svc.dashboard_accounts_block(limit=8)
 
-    return screen(
-        "✨",
-        f"Channel DM Bot · v{app_version()}",
-        join(
-            f"{w_icon} Рассылка   **{w_txt}**",
-            f"⏳ До след. DM   **{wait_txt}**",
-        ),
-        section(
-            "📬 Очередь",
-            tree(
-                [
-                    ("⏳", "ждут", pending),
-                    ("🔄", "в работе", claimed),
-                    ("✅", "сегодня", first_today),
-                ]
-            ),
-        ),
-        section("👤 Аккаунты", acc_block),
-        join(
-            kv("Диалоги", str(dialogs), icon="💬"),
-            kv("Opt-out", str(optouts), icon="🚫"),
-        ),
-        join(f"🔗 `{link_short}`", ai_line, f"⚠️ PeerFlood  {pf}"),
-        hint="Таймер паузы · 🔄 Обновить",
+    queue_block = tree(
+        [
+            ("⏳", "ждут", pending),
+            ("🔄", "в работе", claimed),
+            ("✅", "сегодня", first_today),
+        ]
+    )
+
+    return join(
+        f"✨ **Channel DM Bot · v{app_version()}**",
+        DIV,
+        w_line,
+        f"⏳ До след. DM {wait_txt}",
+        "📬 Очередь",
+        queue_block,
+        DIV,
+        "👤 Аккаунты",
+        acc_block,
+        DIV,
+        f"💬 Диалоги: {dialogs}",
+        f"📁 База: {audience_n}",
+        f"🚫 Opt-out: {optouts}",
+        f"🔗 {link_show}",
+        ai_line,
+        f"⚠️ PeerFlood {pf}",
+        DIV,
+        "Таймер паузы · 🔄 Обновить",
     )
 
 
@@ -213,18 +223,16 @@ async def cb_settings(event: events.CallbackQuery.Event) -> None:
     ai = f"{ON} `{AI_MODEL}`" if AI_DM_ENABLED else f"{OFF} выкл"
     link = CHANNEL_LINK or "(не задана)"
     link_short = link if len(link) <= 40 else link[:37] + "…"
-    acc_min_m = DM_ACCOUNT_INTERVAL_MIN // 60
-    acc_max_m = DM_ACCOUNT_INTERVAL_MAX // 60
+    a_lo, a_hi = runtime_svc.get_account_interval_range()
     text = screen(
         "⚙️",
         "Настройки",
         join(
-            "Две разные вещи:",
-            "• **Темп** — как часто писать, когда всё ок",
-            "• **После PeerFlood** — сколько ждать после ограничения Telegram",
+            "• **Темп** — как часто писать (меняется в меню)",
+            "• **После PeerFlood** — пауза после ограничения",
         ),
         join(
-            kv("Темп (акк.)", f"{acc_min_m}–{acc_max_m} мин", icon="⏱"),
+            kv("Темп (акк.)", f"{a_lo // 60}–{a_hi // 60} мин", icon="⏱"),
             kv("После PeerFlood", pf, icon="⚠️"),
             kv("AI", ai, icon="🤖"),
             f"🔗 `{link_short}`",
@@ -304,28 +312,46 @@ async def cb_bc_status(event: events.CallbackQuery.Event) -> None:
 
 
 def _pacing_text() -> str:
-    acc_min_m = DM_ACCOUNT_INTERVAL_MIN // 60
-    acc_max_m = DM_ACCOUNT_INTERVAL_MAX // 60
-    return screen(
-        "⏱",
-        "Темп рассылки",
-        "Плановый ритм, пока аккаунт **не** в PeerFlood.",
-        join(
-            kv("Между DM одного аккаунта", f"{acc_min_m}–{acc_max_m} мин"),
-            kv("Между любыми DM в боте", f"{DM_GLOBAL_SPACING_MIN}–{DM_GLOBAL_SPACING_MAX} сек"),
-            kv("Макс. first DM / сутки", str(DM_DAILY_LIMIT_PER_ACCOUNT)),
-            kv("Пауза перед ответом AI", f"{AI_REPLY_DELAY_MIN}–{AI_REPLY_DELAY_MAX} сек"),
-            kv("Авто-ссылка при тишине", f"{AI_AUTO_LINK_DELAY_MIN}–{AI_AUTO_LINK_DELAY_MAX} сек"),
-        ),
-        join(
-            "Эти значения задаются в **Railway Variables**.",
-            "Здесь только просмотр — кнопками не меняются.",
-        ),
+    from services import runtime as runtime_svc
+
+    a_lo, a_hi = runtime_svc.get_account_interval_range()
+    g_lo, g_hi = runtime_svc.get_global_spacing_range()
+    daily = runtime_svc.get_daily_limit()
+    r_lo, r_hi = runtime_svc.get_ai_reply_delay_range()
+    l_lo, l_hi = runtime_svc.get_auto_link_delay_range()
+
+    return join(
+        f"⏱ **Темп рассылки**",
+        DIV,
+        "Плановый ритм, пока нет PeerFlood.",
+        "",
+        f"👤 Между DM одного аккаунта",
+        f"   **{a_lo // 60}–{a_hi // 60} мин**",
+        "",
+        f"🌐 Между любыми DM в боте",
+        f"   **{g_lo}–{g_hi} сек**",
+        "",
+        f"📊 Макс. first DM / сутки",
+        f"   **{daily}**",
+        "",
+        f"🤖 Пауза перед ответом AI",
+        f"   **{r_lo}–{r_hi} сек**",
+        "",
+        f"🔗 Авто-ссылка при тишине",
+        f"   **{l_lo}–{l_hi} сек**",
+        DIV,
+        "Меняется кнопками ниже (не Railway).",
     )
 
 
 def _pacing_buttons():
     return [
+        [btn("👤 Аккаунт 10–15м", b"pace_acc_600_900"), btn("15–25м", b"pace_acc_900_1500")],
+        [btn("🌐 Global 90–180с", b"pace_glob_90_180"), btn("120–240с", b"pace_glob_120_240")],
+        [btn("📊 Лимит 30", b"pace_daily_30"), btn("45", b"pace_daily_45"), btn("60", b"pace_daily_60")],
+        [btn("🤖 AI 20–60с", b"pace_ai_20_60"), btn("30–90с", b"pace_ai_30_90")],
+        [btn("🔗 Link 60–120с", b"pace_link_60_120"), btn("90–180с", b"pace_link_90_180")],
+        [btn("✏️ Свой интервал", b"pace_custom")],
         back_row(b"menu_settings"),
         back_home_row(),
     ]
@@ -338,6 +364,144 @@ async def cb_bc_pacing(event: events.CallbackQuery.Event) -> None:
         return
     await render_menu(event, _pacing_text(), _pacing_buttons())
     await event.answer()
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^pace_acc_(\d+)_(\d+)$"))
+async def cb_pace_acc(event: events.CallbackQuery.Event) -> None:
+    if not is_admin(event.sender_id):
+        await event.answer(DENIED, alert=True)
+        return
+    from services import runtime as runtime_svc
+
+    m = event.pattern_match
+    lo, hi = int(m.group(1)), int(m.group(2))
+    runtime_svc.set_account_interval_range(lo, hi)
+    await render_menu(event, _pacing_text(), _pacing_buttons())
+    await event.answer(f"Аккаунт: {lo // 60}–{hi // 60} мин")
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^pace_glob_(\d+)_(\d+)$"))
+async def cb_pace_glob(event: events.CallbackQuery.Event) -> None:
+    if not is_admin(event.sender_id):
+        await event.answer(DENIED, alert=True)
+        return
+    from services import runtime as runtime_svc
+
+    m = event.pattern_match
+    lo, hi = int(m.group(1)), int(m.group(2))
+    runtime_svc.set_global_spacing_range(lo, hi)
+    await render_menu(event, _pacing_text(), _pacing_buttons())
+    await event.answer(f"Global: {lo}–{hi}с")
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^pace_daily_(\d+)$"))
+async def cb_pace_daily(event: events.CallbackQuery.Event) -> None:
+    if not is_admin(event.sender_id):
+        await event.answer(DENIED, alert=True)
+        return
+    from services import runtime as runtime_svc
+
+    n = int(event.pattern_match.group(1))
+    runtime_svc.set_daily_limit(n)
+    await render_menu(event, _pacing_text(), _pacing_buttons())
+    await event.answer(f"Лимит: {n}/сутки")
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^pace_ai_(\d+)_(\d+)$"))
+async def cb_pace_ai(event: events.CallbackQuery.Event) -> None:
+    if not is_admin(event.sender_id):
+        await event.answer(DENIED, alert=True)
+        return
+    from services import runtime as runtime_svc
+
+    m = event.pattern_match
+    lo, hi = int(m.group(1)), int(m.group(2))
+    runtime_svc.set_ai_reply_delay_range(lo, hi)
+    await render_menu(event, _pacing_text(), _pacing_buttons())
+    await event.answer(f"AI: {lo}–{hi}с")
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^pace_link_(\d+)_(\d+)$"))
+async def cb_pace_link(event: events.CallbackQuery.Event) -> None:
+    if not is_admin(event.sender_id):
+        await event.answer(DENIED, alert=True)
+        return
+    from services import runtime as runtime_svc
+
+    m = event.pattern_match
+    lo, hi = int(m.group(1)), int(m.group(2))
+    runtime_svc.set_auto_link_delay_range(lo, hi)
+    await render_menu(event, _pacing_text(), _pacing_buttons())
+    await event.answer(f"Link: {lo}–{hi}с")
+
+
+@bot.on(events.CallbackQuery(data=b"pace_custom"))
+async def cb_pace_custom(event: events.CallbackQuery.Event) -> None:
+    if not is_admin(event.sender_id):
+        await event.answer(DENIED, alert=True)
+        return
+    from services.admin_state import set_state
+
+    set_state(event.sender_id, flow="pacing", step="custom")
+    text = join(
+        "✏️ **Свой темп**",
+        DIV,
+        "Пришли одной строкой:",
+        "`acc_min acc_max glob_min glob_max daily ai_min ai_max link_min link_max`",
+        "",
+        "Все в **секундах**, daily — число.",
+        "Пример:",
+        "`600 900 90 180 45 30 90 60 120`",
+        "",
+        "Отмена: /cancel",
+    )
+    await render_menu(
+        event,
+        text,
+        [back_row(b"bc_pacing"), back_home_row()],
+    )
+    await event.answer()
+
+
+def _is_pacing_custom(event) -> bool:
+    if not getattr(event, "is_private", False):
+        return False
+    if not is_admin(event.sender_id):
+        return False
+    from services.admin_state import get_state
+
+    st = get_state(int(event.sender_id)) or {}
+    return st.get("flow") == "pacing" and st.get("step") == "custom"
+
+
+@bot.on(events.NewMessage(func=_is_pacing_custom))
+async def on_pacing_custom(event: events.NewMessage.Event) -> None:
+    from services.admin_state import clear_state
+    from services import runtime as runtime_svc
+
+    raw = (event.raw_text or "").strip()
+    if raw.startswith("/"):
+        return
+    parts = raw.replace(",", " ").split()
+    if len(parts) != 9 or not all(p.lstrip("-").isdigit() for p in parts):
+        await event.respond(
+            notice(
+                "warn",
+                "Нужно 9 чисел. Пример: `600 900 90 180 45 30 90 60 120`",
+            )
+        )
+        return
+    vals = [int(x) for x in parts]
+    clear_state(event.sender_id)
+    runtime_svc.set_account_interval_range(vals[0], vals[1])
+    runtime_svc.set_global_spacing_range(vals[2], vals[3])
+    runtime_svc.set_daily_limit(vals[4])
+    runtime_svc.set_ai_reply_delay_range(vals[5], vals[6])
+    runtime_svc.set_auto_link_delay_range(vals[7], vals[8])
+    await event.respond(
+        join("⏱ **Темп сохранён**", DIV, _pacing_text()),
+        buttons=[back_home_row()],
+    )
 
 
 def _peerflood_screen() -> str:
