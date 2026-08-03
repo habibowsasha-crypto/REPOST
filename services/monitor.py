@@ -60,11 +60,15 @@ async def stop_monitor() -> None:
 
 async def refresh_monitor() -> None:
     """Re-read DB and reconnect clients (call after participates / chat changes)."""
+    global _started
     async with _lock:
-        if not _started:
-            return
         await _sync_clients_unlocked()
-        logger.info("Monitor refreshed, active accounts: {}", list(_clients.keys()))
+        _started = True
+        logger.info(
+            "Monitor refreshed, active accounts: {} connected={}",
+            list(_clients.keys()),
+            list(_clients.keys()),
+        )
 
 
 async def _sync_clients_unlocked() -> None:
@@ -123,6 +127,13 @@ def _register_handler(client: TelegramClient, account_user_id: int) -> None:
             if event.is_private:
                 await _handle_private(account_user_id, event)
             elif event.is_group or event.is_channel:
+                logger.info(
+                    "Group msg account={} chat_id={} is_group={} is_channel={}",
+                    account_user_id,
+                    int(event.chat_id),
+                    bool(event.is_group),
+                    bool(event.is_channel),
+                )
                 await _handle_group(account_user_id, event)
         except Exception as exc:
             logger.exception(

@@ -125,6 +125,9 @@ async def show_account_card(event, user_id: int, *, edit: bool = True) -> None:
         else "вручную"
     )
     watchable = chats_svc.count_watchable(user_id)
+    from services import monitor as monitor_svc
+    connected = int(user_id) in set(monitor_svc.connected_account_ids())
+    mon_line = "online" if connected else "offline"
     discovered_n = len(chats_svc.list_discovered(user_id))
     from services import spambot as spambot_svc
 
@@ -141,6 +144,7 @@ async def show_account_card(event, user_id: int, *, edit: bool = True) -> None:
         f"ID: `{acc['user_id']}`\n"
         f"Телефон: `{phone}`\n"
         f"Статус: {status}\n"
+        f"Клиент монитора: **{mon_line}**\n"
         f"Cooldownoldown: `{cooldown}`\n"
         f"SpamBot: **{sb_status}** | next `{sb_next}`\n"
         f"{('Ответ: ' + sb_reply + chr(10)) if sb_reply else ''}"

@@ -1,4 +1,4 @@
-"""Admin menu navigation (Step 2: full tree, section stubs)."""
+"""Admin menu navigation."""
 
 from __future__ import annotations
 
@@ -27,30 +27,29 @@ from config import (
 )
 from services.menu_ui import back_home_row, back_row, render_menu
 
-# ---------------------------------------------------------------------------
-# Main menu
-# ---------------------------------------------------------------------------
-
 
 def _main_menu_buttons() -> list[list[Button]]:
     return [
         [
             Button.inline("🔄 Обновить", b"menu_refresh"),
-            Button.inline("📊 Статус", b"bc_status"),
+            Button.inline("📊 Детали", b"bc_status"),
         ],
-        [Button.inline("👤 Аккаунты", b"menu_accounts")],
-        [Button.inline("🚀 Рассылка", b"menu_broadcast")],
+        [
+            Button.inline("👤 Аккаунты", b"menu_accounts"),
+            Button.inline("🚀 Рассылка", b"menu_broadcast"),
+        ],
         [
             Button.inline("📥 Очередь", b"bc_queue"),
             Button.inline("🚫 Opt-out", b"menu_optout"),
         ],
-        [Button.inline("🤖 AI", b"menu_ai")],
-        [Button.inline("ℹ️ Помощь", b"menu_help")],
+        [
+            Button.inline("🤖 AI", b"menu_ai"),
+            Button.inline("ℹ️ Помощь", b"menu_help"),
+        ],
     ]
 
 
 def _dashboard_text() -> str:
-    """Live snapshot for the home screen."""
     from services import accounts as accounts_svc
     from services import dialog_store as dialog_store_svc
     from services import dispatcher as dispatcher_svc
@@ -62,15 +61,17 @@ def _dashboard_text() -> str:
     active_acc = accounts_svc.count_participating()
     mon = monitor_svc.monitor_status()
     mon_n = mon.get("connected_count") or 0
-    mon_txt = f"онлайн {mon_n}" if mon.get("running") else "выкл"
 
     wst = dispatcher_svc.worker_status()
     if wst.get("enabled") and wst.get("loop_running"):
-        w_txt = "▶ работает"
+        w_icon, w_txt = "🟢", "работает"
     elif wst.get("enabled"):
-        w_txt = "⏸ включён, цикл стоп"
+        w_icon, w_txt = "🟡", "пауза цикла"
     else:
-        w_txt = "⏹ выкл"
+        w_icon, w_txt = "🔴", "выключена"
+
+    mon_icon = "🟢" if mon.get("running") and mon_n else "🔴"
+    mon_txt = f"{mon_n} онлайн" if mon.get("running") else "выкл"
 
     pending = queue_svc.count_by_status(queue_svc.STATUS_PENDING)
     claimed = queue_svc.count_by_status(queue_svc.STATUS_CLAIMED)
@@ -80,42 +81,44 @@ def _dashboard_text() -> str:
     first_today = queue_svc.count_first_dm_today()
     optouts = opt_out_svc.count()
 
-    link = CHANNEL_LINK or "⚠ не задана"
-    if len(link) > 40:
-        link_short = link[:37] + "..."
+    link = CHANNEL_LINK or "не задана"
+    link_short = link[:33] + "…" if len(link) > 36 else link
+
+    if AI_DM_ENABLED and OPENAI_API_KEY:
+        ai_line = f"🟢 AI · `{AI_MODEL}`"
+    elif AI_DM_ENABLED:
+        ai_line = "🟡 AI без ключа · шаблоны"
     else:
-        link_short = link
+        ai_line = "🔴 AI выкл"
 
-    ai_txt = "вкл" if AI_DM_ENABLED else "выкл"
-    if AI_DM_ENABLED and not OPENAI_API_KEY:
-        ai_txt = "вкл, но нет ключа → шаблоны"
-
-    return (
-        "**Channel DM Bot** · v1.0.2\n\n"
-        f"**Рассылка:** {w_txt}\n"
-        f"**Мониторинг:** {mon_txt}\n"
-        f"**Аккаунты:** {active_acc} участвуют / {total_acc} всего\n\n"
-        f"**Очередь**\n"
-        f"• ждут first DM: **{pending}**\n"
-        f"• в работе (claimed): **{claimed}**\n"
-        f"• уже написали (sent): **{sent}**\n"
-        f"• отменены: **{cancelled}**\n\n"
-        f"**Диалоги сейчас:** {dialogs}\n"
-        f"**First DM сегодня:** {first_today}\n"
-        f"**Opt-out (не писать):** {optouts}\n\n"
-        f"**Канал:** `{link_short}`\n"
-        f"**AI:** {ai_txt} · `{AI_MODEL}`\n\n"
-        "Нажми **Обновить**, чтобы освежить цифры."
+    return "\n".join(
+        [
+            "✨ **Channel DM Bot**",
+            "──────────────",
+            f"{w_icon} Рассылка: **{w_txt}**",
+            f"{mon_icon} Мониторинг: **{mon_txt}**",
+            f"👤 Аккаунты: **{active_acc}** из {total_acc}",
+            "",
+            "📬 **Очередь**",
+            f"├ ⏳ ждут DM  **{pending}**",
+            f"├ 🔄 в работе  **{claimed}**",
+            f"├ ✅ написали  **{sent}**",
+            f"└ 🗑 отменены  **{cancelled}**",
+            "",
+            f"💬 Диалоги: **{dialogs}**",
+            f"📨 First DM сегодня: **{first_today}**",
+            f"🚫 Opt-out: **{optouts}**",
+            "",
+            f"🔗 `{link_short}`",
+            ai_line,
+            "──────────────",
+            "👇 разделы ниже",
+        ]
     )
 
 
 async def show_main_menu(event, *, edit: bool = True) -> None:
     await render_menu(event, _dashboard_text(), _main_menu_buttons(), edit=edit)
-
-
-# ---------------------------------------------------------------------------
-# Commands
-# ---------------------------------------------------------------------------
 
 
 @bot.on(events.NewMessage(pattern=r"^/start(?:@\w+)?$"))
@@ -135,7 +138,6 @@ async def cmd_menu(event: events.NewMessage.Event) -> None:
 
 @bot.on(events.NewMessage(pattern=r"(?i)^меню$"))
 async def cmd_menu_ru(event: events.NewMessage.Event) -> None:
-    """Open main menu on plain text: меню / Меню / МЕНЮ."""
     if not is_admin(event.sender_id):
         return
     await show_main_menu(event, edit=False)
@@ -178,13 +180,6 @@ async def cb_refresh(event: events.CallbackQuery.Event) -> None:
     await event.answer("Обновлено")
 
 
-# 👤 Accounts handlers live in handlers/accounts.py (Step 3).
-
-# ---------------------------------------------------------------------------
-# 🚀 Broadcast / outreach submenu
-# ---------------------------------------------------------------------------
-
-
 def _broadcast_buttons() -> list[list[Button]]:
     return [
         [
@@ -208,28 +203,32 @@ async def cb_broadcast(event: events.CallbackQuery.Event) -> None:
     from services import queue as queue_svc
 
     wst = dispatcher_svc.worker_status()
-    w = "▶ работает" if (wst.get("enabled") and wst.get("loop_running")) else (
-        "⏸ стоп цикла" if wst.get("enabled") else "⏹ выкл"
-    )
+    if wst.get("enabled") and wst.get("loop_running"):
+        w = "🟢 работает"
+    elif wst.get("enabled"):
+        w = "🟡 пауза цикла"
+    else:
+        w = "🔴 выкл"
     pending = queue_svc.count_by_status(queue_svc.STATUS_PENDING)
     sent = queue_svc.count_by_status(queue_svc.STATUS_SENT)
     today = queue_svc.count_first_dm_today()
-    await render_menu(
-        event,
-        "**🚀 Рассылка**\n\n"
-        f"Воркер: **{w}**\n"
-        f"В очереди: **{pending}** · уже написали: **{sent}**\n"
-        f"First DM сегодня: **{today}**\n\n"
-        "Старт — начать раздачу first DM.\n"
-        "Стоп — остановить.\n"
-        "Очередь — кто ждёт.\n"
-        "Темп — паузы между сообщениями.",
-        _broadcast_buttons(),
+    text = "\n".join(
+        [
+            "🚀 **Рассылка**",
+            "──────────────",
+            f"Статус: **{w}**",
+            f"⏳ В очереди: **{pending}**",
+            f"✅ Уже написали: **{sent}**",
+            f"📨 Сегодня: **{today}**",
+            "──────────────",
+            "▶️ Старт — раздать first DM",
+            "⏹ Стоп — остановить",
+            "📥 Очередь — кто ждёт",
+            "⚙️ Темп — паузы",
+        ]
     )
+    await render_menu(event, text, _broadcast_buttons())
     await event.answer()
-
-
-# bc_start / bc_stop live in handlers/dispatcher_ui.py (Step 6).
 
 
 def _status_text() -> str:
@@ -240,18 +239,15 @@ def _status_text() -> str:
     from services import opt_out as opt_out_svc
     from services import queue as queue_svc
 
-    admins = (
-        ", ".join(f"`{x}`" for x in ADMIN_ID_LIST)
-        or "(пусто - задайте ADMIN_ID_LIST)"
-    )
+    admins = ", ".join(f"`{x}`" for x in ADMIN_ID_LIST) or "(пусто)"
     link = CHANNEL_LINK or "(не задана)"
     total = accounts_svc.count_accounts()
     active = accounts_svc.count_participating()
     mon = monitor_svc.monitor_status()
     mon_txt = (
-        f"вкл, подключено {mon['connected_count']}"
+        f"🟢 вкл · {mon['connected_count']} акк."
         if mon["running"]
-        else "выкл"
+        else "🔴 выкл"
     )
     pending = queue_svc.count_by_status(queue_svc.STATUS_PENDING)
     claimed = queue_svc.count_by_status(queue_svc.STATUS_CLAIMED)
@@ -261,27 +257,33 @@ def _status_text() -> str:
     first_dm_today = queue_svc.count_first_dm_today()
     optouts = opt_out_svc.count()
     wst = dispatcher_svc.worker_status()
-    w_txt = "▶ работает" if wst["enabled"] and wst["loop_running"] else (
-        "⏸ включён / цикл стоп" if wst["enabled"] else "⏹ выкл"
-    )
+    if wst["enabled"] and wst["loop_running"]:
+        w_txt = "🟢 работает"
+    elif wst["enabled"]:
+        w_txt = "🟡 цикл стоп"
+    else:
+        w_txt = "🔴 выкл"
     wait = wst.get("global_wait_sec") or 0
-    return (
-        "**📊 Статус**\n\n"
-        f"**Воркер:** {w_txt}\n"
-        f"Пауза до след. first DM: ~{wait:.0f} сек\n"
-        f"**Мониторинг:** {mon_txt}\n"
-        f"**Аккаунты:** {active} участвуют / {total} всего\n\n"
-        f"**Очередь**\n"
-        f"• ждут: **{pending}**\n"
-        f"• claimed: **{claimed}**\n"
-        f"• написали: **{sent}**\n"
-        f"• отменены: **{cancelled}**\n\n"
-        f"**Диалоги активны:** {dialog_active}\n"
-        f"**First DM сегодня:** {first_dm_today}\n"
-        f"**Opt-out:** {optouts}\n\n"
-        f"Ссылка: `{link}`\n"
-        f"AI: {'вкл' if AI_DM_ENABLED else 'выкл'} | `{AI_MODEL}`\n"
-        f"Админы: {admins}"
+    return "\n".join(
+        [
+            "📊 **Подробный статус**",
+            "──────────────",
+            f"Рассылка: {w_txt}",
+            f"Пауза до след. DM: **~{wait:.0f}с**",
+            f"Мониторинг: {mon_txt}",
+            f"Аккаунты: **{active}** / {total}",
+            "",
+            "📬 **Очередь**",
+            f"⏳ {pending}  ·  🔄 {claimed}  ·  ✅ {sent}  ·  🗑 {cancelled}",
+            "",
+            f"💬 Диалоги: **{dialog_active}**",
+            f"📨 Сегодня first DM: **{first_dm_today}**",
+            f"🚫 Opt-out: **{optouts}**",
+            "",
+            f"🔗 `{link}`",
+            f"🤖 AI: {'вкл' if AI_DM_ENABLED else 'выкл'} · `{AI_MODEL}`",
+            f"👮 Админы: {admins}",
+        ]
     )
 
 
@@ -298,24 +300,23 @@ async def cb_bc_status(event: events.CallbackQuery.Event) -> None:
     await event.answer()
 
 
-# bc_queue UI lives in handlers/queue_ui.py (Step 5).
-
-
 def _pacing_text() -> str:
     acc_min_m = DM_ACCOUNT_INTERVAL_MIN // 60
     acc_max_m = DM_ACCOUNT_INTERVAL_MAX // 60
-    return (
-        "**⚙️ Темп (из env)**\n\n"
-        f"На аккаунт между first DM: **{acc_min_m}–{acc_max_m} мин** "
-        f"({DM_ACCOUNT_INTERVAL_MIN}–{DM_ACCOUNT_INTERVAL_MAX} сек)\n"
-        f"Глобально между first DM: **{DM_GLOBAL_SPACING_MIN}–{DM_GLOBAL_SPACING_MAX} сек**\n"
-        f"Лимит first DM / аккаунт / сутки: **{DM_DAILY_LIMIT_PER_ACCOUNT}**\n"
-        f"Задержка AI-ответа: **{AI_REPLY_DELAY_MIN}–{AI_REPLY_DELAY_MAX} сек**\n"
-        f"Авто-ссылка при тишине: **{AI_AUTO_LINK_DELAY_MIN}–{AI_AUTO_LINK_DELAY_MAX} сек**\n"
-        f"PeerFlood min cooldown: **{PEER_FLOOD_MIN_COOLDOWN_MINUTES} мин**\n"
-        f"SpamBot auto-resume: **{'да' if SPAMBOT_AUTO_RESUME else 'нет'}**\n\n"
-        "Сейчас только просмотр. Изменение через кнопки - позже; "
-        "пока правьте Variables в Railway."
+    return "\n".join(
+        [
+            "⚙️ **Темп**",
+            "──────────────",
+            f"На аккаунт: **{acc_min_m}–{acc_max_m} мин** между first DM",
+            f"Глобально: **{DM_GLOBAL_SPACING_MIN}–{DM_GLOBAL_SPACING_MAX} сек**",
+            f"Лимит / аккаунт / сутки: **{DM_DAILY_LIMIT_PER_ACCOUNT}**",
+            f"Ответ AI: **{AI_REPLY_DELAY_MIN}–{AI_REPLY_DELAY_MAX} сек**",
+            f"Авто-ссылка: **{AI_AUTO_LINK_DELAY_MIN}–{AI_AUTO_LINK_DELAY_MAX} сек**",
+            f"PeerFlood cooldown: **{PEER_FLOOD_MIN_COOLDOWN_MINUTES} мин**",
+            f"SpamBot auto-resume: **{'да' if SPAMBOT_AUTO_RESUME else 'нет'}**",
+            "",
+            "Меняется через Variables в Railway.",
+        ]
     )
 
 
@@ -337,22 +338,25 @@ async def cb_bc_link(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
         await event.answer("Нет доступа", alert=True)
         return
-    link = CHANNEL_LINK or "(не задана - укажите CHANNEL_LINK в Railway)"
+    link = CHANNEL_LINK or "(не задана — CHANNEL_LINK в Railway)"
     pitch = CHANNEL_PITCH or "(пусто)"
+    text = "\n".join(
+        [
+            "🔗 **Ссылка канала**",
+            "──────────────",
+            f"`{link}`",
+            "",
+            f"Pitch: {pitch}",
+            "",
+            "Сейчас только через env Railway.",
+        ]
+    )
     await render_menu(
         event,
-        "**🔗 Ссылка канала**\n\n"
-        f"Ссылка:\n`{link}`\n\n"
-        f"Описание (pitch):\n{pitch}\n\n"
-        "Смена из меню - в следующих шагах. Сейчас задаётся через env.",
+        text,
         [back_row(b"menu_broadcast"), back_home_row()],
     )
     await event.answer()
-
-
-# ---------------------------------------------------------------------------
-# 🤖 AI
-# ---------------------------------------------------------------------------
 
 
 @bot.on(events.CallbackQuery(data=b"menu_ai"))
@@ -360,33 +364,29 @@ async def cb_ai(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
         await event.answer("Нет доступа", alert=True)
         return
-    key_ok = "задан" if OPENAI_API_KEY else "не задан"
-    await render_menu(
-        event,
-        "**🤖 AI**\n\n"
-        f"Ответы AI: **{'включены' if AI_DM_ENABLED else 'выключены'}** "
-        f"(`AI_DM_ENABLED`)\n"
-        f"Модель: `{AI_MODEL}`\n"
-        f"OPENAI_API_KEY: {key_ok}\n\n"
-        "First DM (шаг 8):\n"
-        "- AI короткий вопрос без ссылки\n"
-        "- validator: без t.me, без опросников, без длинного тире\n"
-        "- антиповтор + fallback пул\n\n"
-        "Диалог (шаг 9):\n"
-        "- после ответа: объяснение канала\n"
-        "- тишина 60–120 сек → авто-ссылка\n"
-        "- «не пиши» / агрессия → opt-out",
-        [back_home_row()],
+    key_ok = "есть" if OPENAI_API_KEY else "нет"
+    ai_on = "🟢 включён" if AI_DM_ENABLED else "🔴 выкл"
+    text = "\n".join(
+        [
+            "🤖 **AI**",
+            "──────────────",
+            f"Статус: **{ai_on}**",
+            f"Ключ OpenAI: **{key_ok}**",
+            f"Модель: `{AI_MODEL}`",
+            "",
+            "**First DM**",
+            "• короткий вопрос без ссылки",
+            "• без t.me / опросов / тире —",
+            "• антиповтор + запасной пул",
+            "",
+            "**Диалог**",
+            "• ответ → объяснение канала",
+            "• тишина 60–120с → ссылка",
+            "• «не пиши» → opt-out",
+        ]
     )
+    await render_menu(event, text, [back_home_row()])
     await event.answer()
-
-
-# 🚫 Opt-out handlers live in handlers/optout.py (Step 10).
-
-
-# ---------------------------------------------------------------------------
-# ℹ️ Help
-# ---------------------------------------------------------------------------
 
 
 @bot.on(events.CallbackQuery(data=b"menu_help"))
@@ -394,19 +394,20 @@ async def cb_help(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
         await event.answer("Нет доступа", alert=True)
         return
-    await render_menu(
-        event,
-        "**ℹ️ Помощь**\n\n"
-        "Бот для мягкой DM-рекламы канала:\n"
-        "1. Аккаунты слушают выбранные группы\n"
-        "2. Активные люди → одна общая очередь\n"
-        "3. Random лид × random свободный аккаунт\n"
-        "4. AI: короткий вопрос → объяснение → ссылка\n"
-        "5. «Не пиши» → opt-out навсегда\n\n"
-        "**Команды:** `/start` `/menu` `меню` `/ping` `/status` `/cancel`\nНа главном экране — живые цифры очереди и рассылки.\n\n"
-        "**Сейчас:** шаг 10 - меню Opt-out.\n"
-        "**Дальше:** шаг 11 - тесты и релиз.\n\n"
-        "Railway: Volume `/data`, переменные из `.env.example`.",
-        [back_home_row()],
+    text = "\n".join(
+        [
+            "ℹ️ **Помощь**",
+            "──────────────",
+            "1. Добавь аккаунт → включи участие",
+            "2. Чаты → обнови → выбери / режим «все»",
+            "3. Рассылка → Старт",
+            "",
+            "**Команды**",
+            "`/start`  `/menu`  `меню`",
+            "`/ping`  `/status`  `/cancel`",
+            "",
+            "На главном экране — живые цифры очереди.",
+        ]
     )
+    await render_menu(event, text, [back_home_row()])
     await event.answer()
