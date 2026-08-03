@@ -1,5 +1,0 @@
-TgBlaster v1.0.22b19 VERIFY — audit P1/P2 fixes
-pytest: 170 passed, 38 subtests
-first_message SHA: a34f2613c338b1f89284335d2462cc1ed1b1e43b3063dcdf4a511a3b7f0f32aa
-kirill_vip SHA unchanged
-kirill_vip_funnel SHA unchanged
