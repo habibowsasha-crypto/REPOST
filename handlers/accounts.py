@@ -168,7 +168,8 @@ async def show_account_card(event, user_id: int, *, edit: bool = True) -> None:
             f"Телефон: `{phone}`",
             f"Статус: {status}",
             kv("Монитор", mon_line, icon=mon_icon),
-            f"Cooldownoldown: `{cooldown}`",
+            kv("Задержка DM", accounts_svc.format_dm_interval(acc), icon="⏱"),
+            f"Cooldown: `{cooldown}`",
             f"SpamBot: **{sb_status}** · next `{sb_next}`",
             sb_block,
             kv("Чаты", f"{mode_label} · найдено {discovered_n} · монитор {watchable}"),
@@ -177,6 +178,7 @@ async def show_account_card(event, user_id: int, *, edit: bool = True) -> None:
     )
     buttons = [
         [btn(toggle_label, f"acc_toggle_{user_id}")],
+        [btn("⏱ Задержка DM", f"acc_delay_{user_id}")],
         [btn("💬 Чаты", f"acc_chats_{user_id}")],
         [btn("🤖 Проверить @SpamBot", f"acc_spambot_{user_id}")],
         [btn("▶️ Снять паузу", f"acc_unpause_{user_id}")],
@@ -527,3 +529,60 @@ async def cb_acc_unpause(event: events.CallbackQuery.Event) -> None:
     await spambot_svc.resume_account(user_id, source="manual")
     await show_account_card(event, user_id)
     await event.answer("Пауза снята")
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^acc_delay_(\d+)$"))
+async def cb_acc_delay(event: events.CallbackQuery.Event) -> None:
+    if not is_admin(event.sender_id):
+        await event.answer(DENIED, alert=True)
+        return
+    user_id = int(event.pattern_match.group(1))
+    acc = accounts_svc.get_account(user_id)
+    if not acc:
+        await event.answer("Не найден", alert=True)
+        return
+    label = accounts_svc.format_account_label(acc, include_id=False)
+    cur = accounts_svc.format_dm_interval(acc)
+    text = screen(
+        "⏱",
+        "Задержка DM",
+        f"Аккаунт: **{label}**",
+        f"Сейчас: {cur}",
+        "",
+        "По умолчанию — как в **Настройки → Темп**.",
+        "Свой интервал только для этого аккаунта (между first DM).",
+    )
+    buttons = [
+        [btn("Как в настройках", f"acc_delayset_{user_id}_0_0")],
+        [
+            btn("5–10 мин", f"acc_delayset_{user_id}_300_600"),
+            btn("10–15 мин", f"acc_delayset_{user_id}_600_900"),
+        ],
+        [
+            btn("15–25 мин", f"acc_delayset_{user_id}_900_1500"),
+            btn("20–40 мин", f"acc_delayset_{user_id}_1200_2400"),
+        ],
+        [btn("30–60 мин", f"acc_delayset_{user_id}_1800_3600")],
+        back_row(f"acc_card_{user_id}"),
+        back_home_row(),
+    ]
+    await render_menu(event, text, buttons)
+    await event.answer()
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^acc_delayset_(\d+)_(\d+)_(\d+)$"))
+async def cb_acc_delayset(event: events.CallbackQuery.Event) -> None:
+    if not is_admin(event.sender_id):
+        await event.answer(DENIED, alert=True)
+        return
+    user_id = int(event.pattern_match.group(1))
+    lo = int(event.pattern_match.group(2))
+    hi = int(event.pattern_match.group(3))
+    if lo == 0 and hi == 0:
+        accounts_svc.set_dm_interval(user_id, None, None)
+        msg = "как в настройках"
+    else:
+        accounts_svc.set_dm_interval(user_id, lo, hi)
+        msg = f"{lo // 60}–{hi // 60} мин"
+    await show_account_card(event, user_id)
+    await event.answer(f"Задержка: {msg}")

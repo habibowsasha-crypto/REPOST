@@ -154,15 +154,38 @@ def _upsert_state(
 
 async def on_peer_flood(account_user_id: int) -> None:
     """
-    Called when PeerFlood is detected.
-    Pauses account, sets min cooldown, schedules SpamBot check.
+    PeerFlood from Telegram on DM send.
+
+    Important: @SpamBot "free" != no PeerFlood. PeerFlood is a cold-DM rate limit.
+    Debounce: if already paused with active cooldown, do not re-notify or re-/start SpamBot.
     """
     account_user_id = int(account_user_id)
     from services import runtime as runtime_svc
+
+    acc = accounts_svc.get_account(account_user_id)
+    st = get_state(account_user_id) or {}
+    st_status = str(st.get("status") or "")
+
+    if acc and acc.get("is_paused"):
+        cd = _parse_iso(acc.get("cooldown_until"))
+        if cd and cd > _now():
+            logger.info(
+                "PeerFlood debounced (cooldown until {}) account={}",
+                cd.isoformat(),
+                account_user_id,
+            )
+            return
+        if st_status in {STATUS_CHECKING, STATUS_FREE_PENDING, STATUS_LIMITED}:
+            logger.info(
+                "PeerFlood debounced (spambot status={}) account={}",
+                st_status,
+                account_user_id,
+            )
+            return
+
     seconds = int(runtime_svc.pick_peer_flood_seconds())
     min_until = _now() + dt.timedelta(seconds=seconds)
     pacing.set_paused(account_user_id, "PeerFlood", paused=True)
-    # Also set cooldown so resume cannot happen before min window.
     conn = get_connection()
     with db_lock(), conn:
         conn.execute(
@@ -182,17 +205,15 @@ async def on_peer_flood(account_user_id: int) -> None:
             ),
         )
 
+    # One check now; next_check only as safety net (not immediate re-queue)
     _upsert_state(
         account_user_id,
         status=STATUS_CHECKING,
-        next_check_at=_now_iso(),  # check ASAP
+        next_check_at=(_now() + dt.timedelta(hours=12)).isoformat(),
         limited_until=None,
     )
     label = _account_label(account_user_id)
-    await notify_admins(
-        _notify_peerflood(label, seconds)
-    )
-    # Immediate check attempt
+    await notify_admins(_notify_peerflood(label, seconds))
     await check_account(account_user_id, force=True)
 
 
@@ -360,7 +381,7 @@ async def _apply_parse(
 ) -> None:
     result = parsed.get("result")
     if result == "free":
-        # Resume only after min cooldown (cooldown_until on account).
+        # Resume only after account cooldown_until (PeerFlood pause window).
         acc = accounts_svc.get_account(account_user_id)
         cooldown = _parse_iso((acc or {}).get("cooldown_until"))
         if cooldown and cooldown > _now():
@@ -477,16 +498,31 @@ async def process_due_checks() -> int:
     for row in rows:
         uid = int(row["account_user_id"])
         status = str(row["status"] or "")
-        if status == STATUS_FREE_PENDING and SPAMBOT_AUTO_RESUME:
+        if status == STATUS_FREE_PENDING:
+            if not SPAMBOT_AUTO_RESUME:
+                continue
             acc = accounts_svc.get_account(uid)
             cooldown = _parse_iso((acc or {}).get("cooldown_until"))
             if cooldown and cooldown > _now():
+                # push next_check to cooldown so we do not spin
+                _upsert_state(
+                    uid,
+                    status=STATUS_FREE_PENDING,
+                    next_check_at=cooldown.isoformat(),
+                )
                 continue
             await resume_account(uid, source="spambot_auto")
             actions += 1
             continue
-        await check_account(uid, force=True)
-        actions += 1
+        if status == STATUS_CHECKING:
+            # Already checked inline in on_peer_flood; do not /start again
+            continue
+        if status in {STATUS_LIMITED, STATUS_ERROR}:
+            await check_account(uid, force=True)
+            actions += 1
+            continue
+        # idle or unknown: clear stale next_check
+        _upsert_state(uid, status=status or STATUS_IDLE, next_check_at=None)
     return actions
 
 

@@ -340,11 +340,13 @@ async def _send_first_dm(
 
     except (UserPrivacyRestrictedError, UserIsBlockedError, ChatWriteForbiddenError):
         logger.info("Cannot write target={} from account={}", target_id, account_id)
+        queue_svc.clear_sending_contact(target_id)
         queue_svc.cancel_lead(target_id, "privacy_or_blocked")
         return "privacy"
 
     except (InputUserDeactivatedError, UserBannedInChannelError, ValueError):
         logger.info("Invalid target={} from account={}", target_id, account_id)
+        queue_svc.clear_sending_contact(target_id)
         queue_svc.cancel_lead(target_id, "invalid_target")
         return "invalid"
 

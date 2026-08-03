@@ -39,6 +39,7 @@ def list_accounts() -> list[dict[str, Any]]:
                last_send_at, next_send_at, COALESCE(chat_mode, 'manual') AS chat_mode,
                COALESCE(daily_sent_count, 0) AS daily_sent_count,
                daily_sent_date,
+               dm_interval_min_sec, dm_interval_max_sec,
                created_at, updated_at
           FROM accounts
          ORDER BY created_at DESC
@@ -56,6 +57,7 @@ def get_account(user_id: int) -> Optional[dict[str, Any]]:
                last_send_at, next_send_at, COALESCE(chat_mode, 'manual') AS chat_mode,
                COALESCE(daily_sent_count, 0) AS daily_sent_count,
                daily_sent_date,
+               dm_interval_min_sec, dm_interval_max_sec,
                created_at, updated_at
           FROM accounts
          WHERE user_id=?
@@ -249,3 +251,45 @@ def dashboard_accounts_block(*, limit: int = 8) -> str:
     if extra > 0:
         lines.append(f"… ещё {extra} в 👤 Аккаунты")
     return "\n".join(lines)
+
+
+def set_dm_interval(
+    user_id: int,
+    min_sec: int | None,
+    max_sec: int | None,
+) -> None:
+    """None/None = use global pacing. Otherwise per-account range in seconds."""
+    if min_sec is not None and max_sec is not None:
+        lo, hi = int(min_sec), int(max_sec)
+        if lo > hi:
+            lo, hi = hi, lo
+        lo = max(30, min(86400, lo))
+        hi = max(30, min(86400, hi))
+    else:
+        lo, hi = None, None
+    conn = get_connection()
+    with db_lock(), conn:
+        conn.execute(
+            """
+            UPDATE accounts
+               SET dm_interval_min_sec=?,
+                   dm_interval_max_sec=?,
+                   updated_at=?
+             WHERE user_id=?
+            """,
+            (lo, hi, _now_iso(), int(user_id)),
+        )
+
+
+def format_dm_interval(acc: dict) -> str:
+    """Human label for account interval override or global."""
+    lo = acc.get("dm_interval_min_sec")
+    hi = acc.get("dm_interval_max_sec")
+    if lo is None or hi is None:
+        from services import runtime as runtime_svc
+        glo, ghi = runtime_svc.get_account_interval_range()
+        return f"как в настройках ({glo // 60}–{ghi // 60} мин)"
+    lo, hi = int(lo), int(hi)
+    if lo >= 60 and hi >= 60:
+        return f"свой: {lo // 60}–{hi // 60} мин"
+    return f"свой: {lo}–{hi} сек"

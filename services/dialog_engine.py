@@ -133,6 +133,14 @@ async def _handle_incoming_private_body(
         explain = await ai_dialog.generate_explain(history)
         ok = await _send_private(account_user_id, target_user_id, explain)
         if not ok:
+            # Follow-up timer was cleared above; restore so silence path still works.
+            if stage == store.STAGE_WAITING_REPLY:
+                later = (
+                    _now() + dt.timedelta(hours=store.FOLLOWUP_DELAY_HOURS)
+                ).isoformat()
+                store.set_stage(
+                    target_user_id, store.STAGE_WAITING_REPLY, auto_link_at=later
+                )
             return
         phrases_svc.remember(phrases_svc.KIND_EXPLAIN, explain)
         store.append_history(target_user_id, "assistant", explain)

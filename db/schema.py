@@ -92,6 +92,12 @@ def init_db() -> None:
         _ensure_column(
             conn, "accounts", "next_send_at", "next_send_at TEXT"
         )
+        _ensure_column(
+            conn, "accounts", "dm_interval_min_sec", "dm_interval_min_sec INTEGER"
+        )
+        _ensure_column(
+            conn, "accounts", "dm_interval_max_sec", "dm_interval_max_sec INTEGER"
+        )
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_accounts_participates

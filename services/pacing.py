@@ -36,15 +36,25 @@ def _parse_iso(value: str | None) -> Optional[dt.datetime]:
         return None
 
 
-def random_account_interval_seconds() -> int:
-    lo = min(DM_ACCOUNT_INTERVAL_MIN, DM_ACCOUNT_INTERVAL_MAX)
-    hi = max(DM_ACCOUNT_INTERVAL_MIN, DM_ACCOUNT_INTERVAL_MAX)
+def random_account_interval_seconds(acc: dict[str, Any] | None = None) -> int:
+    from services import runtime as runtime_svc
+
+    if acc is not None:
+        lo = acc.get("dm_interval_min_sec")
+        hi = acc.get("dm_interval_max_sec")
+        if lo is not None and hi is not None:
+            a, b = int(lo), int(hi)
+            if a > b:
+                a, b = b, a
+            return random.randint(max(30, a), max(30, b))
+    lo, hi = runtime_svc.get_account_interval_range()
     return random.randint(lo, hi)
 
 
 def random_global_spacing_seconds() -> int:
-    lo = min(DM_GLOBAL_SPACING_MIN, DM_GLOBAL_SPACING_MAX)
-    hi = max(DM_GLOBAL_SPACING_MIN, DM_GLOBAL_SPACING_MAX)
+    from services import runtime as runtime_svc
+
+    lo, hi = runtime_svc.get_global_spacing_range()
     return random.randint(lo, hi)
 
 
@@ -93,7 +103,11 @@ def account_is_send_ready(acc: dict[str, Any]) -> tuple[bool, str]:
     if last_send and not next_send:
         from services import runtime as runtime_svc
 
-        lo, _hi = runtime_svc.get_account_interval_range()
+        lo_own = acc.get("dm_interval_min_sec")
+        if lo_own is not None:
+            lo = int(lo_own)
+        else:
+            lo, _hi = runtime_svc.get_account_interval_range()
         elapsed = (_now() - last_send).total_seconds()
         if elapsed < lo:
             return False, "account_interval"
@@ -112,7 +126,10 @@ def account_is_send_ready(acc: dict[str, Any]) -> tuple[bool, str]:
 def record_successful_send(account_user_id: int) -> None:
     now = _now()
     today = now.date().isoformat()
-    interval = random_account_interval_seconds()
+    from services import accounts as accounts_svc
+
+    acc = accounts_svc.get_account(int(account_user_id))
+    interval = random_account_interval_seconds(acc)
     next_send = (now + dt.timedelta(seconds=interval)).isoformat()
     conn = get_connection()
     with db_lock(), conn:
