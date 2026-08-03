@@ -355,30 +355,31 @@ async def cb_bc_pacing(event: events.CallbackQuery.Event) -> None:
 def _peerflood_screen() -> str:
     from services import runtime as runtime_svc
 
-    pf = runtime_svc.format_peer_flood_pause()
+    pf = runtime_svc.format_peer_flood_range()
     return screen(
         "⚠️",
         "Пауза PeerFlood",
-        f"Сейчас: **{pf}**",
-        "После PeerFlood аккаунт ждёт минимум столько,",
+        f"Сейчас: **{pf}** (рандом при каждом PeerFlood)",
+        "После PeerFlood аккаунт ждёт случайное время из диапазона,",
         "даже если @SpamBot уже «зелёный».",
-        "Выбери пресет или свой вариант (в **секундах**):",
+        "Пресет или свой `min max` в **секундах**:",
     )
 
 
 def _peerflood_buttons():
     from services.ui import btn
 
+    # data: pf_rng_{lo}_{hi}
     return [
         [
-            btn("5 мин", b"pf_set_300"),
-            btn("15 мин", b"pf_set_900"),
+            btn("1–5 мин", b"pf_rng_60_300"),
+            btn("3–10 мин", b"pf_rng_180_600"),
         ],
         [
-            btn("30 мин", b"pf_set_1800"),
-            btn("60 мин", b"pf_set_3600"),
+            btn("5–15 мин", b"pf_rng_300_900"),
+            btn("10–30 мин", b"pf_rng_600_1800"),
         ],
-        [btn("✏️ Свой вариант (сек)", b"pf_custom")],
+        [btn("✏️ Свой min max (сек)", b"pf_custom")],
         back_row(b"bc_pacing"),
         back_home_row(),
     ]
@@ -393,6 +394,22 @@ async def cb_bc_peerflood(event: events.CallbackQuery.Event) -> None:
     await event.answer()
 
 
+@bot.on(events.CallbackQuery(pattern=rb"^pf_rng_(\d+)_(\d+)$"))
+async def cb_pf_rng(event: events.CallbackQuery.Event) -> None:
+    if not is_admin(event.sender_id):
+        await event.answer(DENIED, alert=True)
+        return
+    from services import runtime as runtime_svc
+
+    lo = int(event.pattern_match.group(1))
+    hi = int(event.pattern_match.group(2))
+    a, b = runtime_svc.set_peer_flood_range_seconds(lo, hi)
+    label = runtime_svc.format_peer_flood_range()
+    await render_menu(event, _peerflood_screen(), _peerflood_buttons())
+    await event.answer(f"Диапазон: {label}")
+
+
+# legacy fixed preset buttons still work → fixed range
 @bot.on(events.CallbackQuery(pattern=rb"^pf_set_(\d+)$"))
 async def cb_pf_set(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
@@ -401,8 +418,8 @@ async def cb_pf_set(event: events.CallbackQuery.Event) -> None:
     from services import runtime as runtime_svc
 
     seconds = int(event.pattern_match.group(1))
-    stored = runtime_svc.set_peer_flood_min_seconds(seconds)
-    label = runtime_svc.format_peer_flood_pause(stored)
+    runtime_svc.set_peer_flood_range_seconds(seconds, seconds)
+    label = runtime_svc.format_peer_flood_range()
     await render_menu(event, _peerflood_screen(), _peerflood_buttons())
     await event.answer(f"Пауза: {label}")
 
@@ -415,15 +432,16 @@ async def cb_pf_custom(event: events.CallbackQuery.Event) -> None:
     from services.admin_state import set_state
     from services import runtime as runtime_svc
 
-    set_state(event.sender_id, flow="peerflood", step="custom_seconds")
-    pf = runtime_svc.format_peer_flood_pause()
+    set_state(event.sender_id, flow="peerflood", step="custom_range")
+    pf = runtime_svc.format_peer_flood_range()
     text = screen(
         "✏️",
-        "Свой вариант",
+        "Свой диапазон",
         f"Сейчас: **{pf}**",
-        "Пришли число **секунд** одним сообщением.",
+        "Пришли **два числа** в секундах: `min max`",
         f"Допустимо: **{runtime_svc.PEER_FLOOD_MIN_ALLOWED_SEC}–{runtime_svc.PEER_FLOOD_MAX_ALLOWED_SEC}** сек.",
-        "Примеры: `300` (=5 мин), `900` (=15 мин)",
+        "Примеры: `180 600` (=3–10 мин), `60 300` (=1–5 мин)",
+        "Одно число = фиксированная пауза.",
         "Отмена: /cancel",
     )
     await render_menu(
@@ -451,19 +469,29 @@ async def on_peerflood_custom(event: events.NewMessage.Event) -> None:
     from services import runtime as runtime_svc
 
     st = get_state(event.sender_id) or {}
-    if st.get("step") != "custom_seconds":
+    if st.get("step") != "custom_range":
         return
     raw = (event.raw_text or "").strip()
     if raw.startswith("/"):
         return
-    if not raw.isdigit():
-        await event.respond("Нужно целое число **секунд**. Пример: `300`")
+    parts = raw.replace(",", " ").split()
+    if len(parts) == 1 and parts[0].isdigit():
+        n = int(parts[0])
+        a, b = runtime_svc.set_peer_flood_range_seconds(n, n)
+    elif len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+        a, b = runtime_svc.set_peer_flood_range_seconds(int(parts[0]), int(parts[1]))
+    else:
+        await event.respond("Формат: `180 600` (min max в секундах) или одно число.")
         return
-    stored = runtime_svc.set_peer_flood_min_seconds(int(raw))
-    label = runtime_svc.format_peer_flood_pause(stored)
+    label = runtime_svc.format_peer_flood_range()
     clear_state(event.sender_id)
     await event.respond(
-        screen("⚠️", "Пауза PeerFlood", f"Сохранено: **{label}** (`{stored}` сек)"),
+        screen(
+            "⚠️",
+            "Пауза PeerFlood",
+            f"Сохранено: **{label}**",
+            f"`{a}`–`{b}` сек · рандом при каждом PeerFlood",
+        ),
         buttons=[back_home_row()],
     )
 

@@ -39,11 +39,11 @@ def _account_label(account_user_id: int) -> str:
 
 def _notify_peerflood(label: str, seconds: int) -> str:
     from services import runtime as runtime_svc
-    pause = runtime_svc.format_peer_flood_pause(int(seconds))
+    pause = runtime_svc.format_duration(int(seconds))
+    rng = runtime_svc.format_peer_flood_range()
     line1 = f"⚠️ Аккаунт **{label}** словил PeerFlood."
-    line2 = f"Ставлю паузу на **{pause}** и спрашиваю @SpamBot."
+    line2 = f"Пауза **{pause}** (рандом {rng}). Спрашиваю @SpamBot."
     return line1 + "\n" + line2
-
 
 def _notify_free_manual(label: str) -> str:
     return (
@@ -159,7 +159,7 @@ async def on_peer_flood(account_user_id: int) -> None:
     """
     account_user_id = int(account_user_id)
     from services import runtime as runtime_svc
-    seconds = int(runtime_svc.get_peer_flood_min_seconds())
+    seconds = int(runtime_svc.pick_peer_flood_seconds())
     min_until = _now() + dt.timedelta(seconds=seconds)
     pacing.set_paused(account_user_id, "PeerFlood", paused=True)
     # Also set cooldown so resume cannot happen before min window.
