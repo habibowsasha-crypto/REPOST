@@ -185,13 +185,16 @@ async def on_peer_flood(account_user_id: int) -> None:
                 account_user_id,
             )
             return
-        if st_status in {STATUS_CHECKING, STATUS_FREE_PENDING, STATUS_LIMITED}:
+        # Cooldown already over: only debounce if SpamBot still mid-check/limited.
+        if st_status == STATUS_LIMITED:
             logger.info(
-                "PeerFlood debounced (spambot status={}) account={}",
-                st_status,
+                "PeerFlood debounced (still limited) account={}",
                 account_user_id,
             )
             return
+        if st_status == STATUS_CHECKING:
+            # Allow re-entry if check is older than 10 min (stuck)
+            pass
 
     info = accounts_svc.register_peerflood_hit(account_user_id)
     streak = int(info.get("streak") or 1)
@@ -482,22 +485,41 @@ async def _apply_parse(
 
 
 async def resume_account(account_user_id: int, *, source: str = "manual") -> None:
-    """Clear PeerFlood pause and mark SpamBot idle."""
+    """Clear PeerFlood pause and mark SpamBot idle.
+
+    Manual resume also clears next_send_at so admin override takes effect now.
+    Auto resume (spambot_*) keeps next_send_at to avoid sticky same-account loops.
+    """
     account_user_id = int(account_user_id)
     pacing.set_paused(account_user_id, "", paused=False)
+    clear_next = source == "manual"
     conn = get_connection()
     with db_lock(), conn:
-        conn.execute(
-            """
-            UPDATE accounts
-               SET is_paused=0,
-                   pause_reason=NULL,
-                   cooldown_until=NULL,
-                   updated_at=?
-             WHERE user_id=?
-            """,
-            (_now_iso(), account_user_id),
-        )
+        if clear_next:
+            conn.execute(
+                """
+                UPDATE accounts
+                   SET is_paused=0,
+                       pause_reason=NULL,
+                       cooldown_until=NULL,
+                       next_send_at=NULL,
+                       updated_at=?
+                 WHERE user_id=?
+                """,
+                (_now_iso(), account_user_id),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE accounts
+                   SET is_paused=0,
+                       pause_reason=NULL,
+                       cooldown_until=NULL,
+                       updated_at=?
+                 WHERE user_id=?
+                """,
+                (_now_iso(), account_user_id),
+            )
     _upsert_state(
         account_user_id,
         status=STATUS_IDLE,
