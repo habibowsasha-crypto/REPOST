@@ -157,9 +157,15 @@ async def _handle_incoming_private_body(
         reply = await ai_dialog.generate_contextual_reply(
             history, include_link=not link_already
         )
+        from config import CHANNEL_LINK
+
+        # Ensure link is in the text BEFORE send when we still need it.
+        if (not link_already) and CHANNEL_LINK and CHANNEL_LINK not in (reply or ""):
+            reply = f"{(reply or '').rstrip()}\n{CHANNEL_LINK}"
+
         ok = await _send_private(account_user_id, target_user_id, reply)
         if not ok:
-            # Keep stage explained; if auto_link was pending, push it a bit later.
+            # Keep stage explained; re-schedule auto-link.
             later = (_now() + dt.timedelta(seconds=_auto_link_delay())).isoformat()
             if not link_already:
                 store.set_stage(
@@ -168,19 +174,28 @@ async def _handle_incoming_private_body(
                     auto_link_at=later,
                 )
             return
-        store.append_history(target_user_id, "assistant", reply)
-        from config import CHANNEL_LINK
 
-        link_now = bool(CHANNEL_LINK and CHANNEL_LINK in reply)
-        store.set_stage(
-            target_user_id,
-            store.STAGE_LINK_SENT if link_now else store.STAGE_EXPLAINED,
-            bump_outgoing=True,
-            link_sent=True if link_now else None,
-            clear_auto_link=True,
-        )
+        link_now = bool(CHANNEL_LINK and CHANNEL_LINK in (reply or ""))
+        store.append_history(target_user_id, "assistant", reply)
+
         if link_now:
+            store.set_stage(
+                target_user_id,
+                store.STAGE_LINK_SENT,
+                bump_outgoing=True,
+                link_sent=True,
+                clear_auto_link=True,
+            )
             phrases_svc.remember(phrases_svc.KIND_LINK, reply)
+        else:
+            # No link in this turn — keep explained and RE-schedule auto-link.
+            later = (_now() + dt.timedelta(seconds=_auto_link_delay())).isoformat()
+            store.set_stage(
+                target_user_id,
+                store.STAGE_EXPLAINED,
+                bump_outgoing=True,
+                auto_link_at=later,
+            )
         d2 = store.get_dialog(target_user_id)
         if d2 and int(d2.get("outgoing_count") or 0) >= store.MAX_OUTGOING:
             store.set_stage(target_user_id, store.STAGE_CLOSED)

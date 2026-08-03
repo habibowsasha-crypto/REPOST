@@ -69,14 +69,9 @@ def _dashboard_text() -> str:
     from services import accounts as accounts_svc
     from services import dialog_store as dialog_store_svc
     from services import dispatcher as dispatcher_svc
-    from services import monitor as monitor_svc
     from services import opt_out as opt_out_svc
     from services import queue as queue_svc
     from services import runtime as runtime_svc
-
-    total_acc = accounts_svc.count_accounts()
-    mon = monitor_svc.monitor_status()
-    mon_n = int(mon.get("connected_count") or 0)
 
     wst = dispatcher_svc.worker_status()
     if wst.get("enabled") and wst.get("loop_running"):
@@ -105,6 +100,7 @@ def _dashboard_text() -> str:
     wait = float(wst.get("global_wait_sec") or 0)
     wait_txt = f"~{int(wait)}с" if wait else "сейчас"
     pf = runtime_svc.format_peer_flood_range()
+    acc_block = accounts_svc.dashboard_accounts_block(limit=8)
 
     return screen(
         "✨",
@@ -123,13 +119,13 @@ def _dashboard_text() -> str:
                 ]
             ),
         ),
+        section("👤 Аккаунты", acc_block),
         join(
             kv("Диалоги", str(dialogs), icon="💬"),
             kv("Opt-out", str(optouts), icon="🚫"),
-            kv("В сети", f"{mon_n} / {total_acc} акк.", icon="👤"),
         ),
         join(f"🔗 `{link_short}`", ai_line, f"⚠️ PeerFlood  {pf}"),
-        hint="👇 разделы ниже",
+        hint="Таймер паузы · 🔄 Обновить",
     )
 
 

@@ -186,3 +186,66 @@ def account_status_line(acc: dict[str, Any]) -> str:
         reason = (acc.get("pause_reason") or "пауза").strip()
         parts.append(f"пауза: {reason}")
     return " | ".join(parts)
+
+
+def format_cooldown_left(acc: dict[str, Any]) -> str | None:
+    """Human remaining pause from cooldown_until, or None if not applicable."""
+    raw = acc.get("cooldown_until")
+    if not raw:
+        return None
+    try:
+        s = str(raw).replace("Z", "+00:00")
+        until = dt.datetime.fromisoformat(s)
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=dt.timezone.utc)
+        now = dt.datetime.now(dt.timezone.utc)
+        sec = int((until - now).total_seconds())
+    except Exception:
+        return None
+    if sec <= 0:
+        return "скоро"
+    if sec < 60:
+        return f"~{sec}с"
+    if sec < 3600:
+        return f"~{sec // 60}м"
+    h, m = divmod(sec // 60, 60)
+    if m:
+        return f"~{h}ч {m}м"
+    return f"~{h}ч"
+
+
+def dashboard_account_line(acc: dict[str, Any]) -> str:
+    """One compact line for main menu: status + optional pause timer."""
+    label = format_account_label(acc, include_id=False)
+    if len(label) > 22:
+        label = label[:21] + "…"
+    participates = bool(acc.get("participates"))
+    paused = bool(acc.get("is_paused"))
+    if not participates:
+        return f"⚪ {label}  выкл"
+    if paused:
+        reason = (acc.get("pause_reason") or "пауза").strip()
+        # Short reason for dashboard
+        if "peerflood" in reason.lower() or reason.lower() == "peerflood":
+            reason_s = "PeerFlood"
+        elif "flood" in reason.lower():
+            reason_s = "FloodWait"
+        else:
+            reason_s = reason[:16]
+        left = format_cooldown_left(acc)
+        if left:
+            return f"🔴 {label}  {reason_s} · {left}"
+        return f"🔴 {label}  {reason_s}"
+    return f"🟢 {label}"
+
+
+def dashboard_accounts_block(*, limit: int = 8) -> str:
+    """Multi-line block for main menu."""
+    rows = list_accounts()
+    if not rows:
+        return "нет аккаунтов"
+    lines = [dashboard_account_line(a) for a in rows[:limit]]
+    extra = len(rows) - limit
+    if extra > 0:
+        lines.append(f"… ещё {extra} в 👤 Аккаунты")
+    return "\n".join(lines)
