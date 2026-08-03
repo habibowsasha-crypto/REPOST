@@ -295,9 +295,19 @@ def parse_spambot_reply(text: str) -> dict[str, Any]:
 
 
 def _extract_until(text: str) -> Optional[str]:
-    """Best-effort datetime extraction; falls back to +24h if limited but unparsed."""
-    # ISO-like
-    m = re.search(r"(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?)", text)
+    """Best-effort datetime extraction from @SpamBot limited messages.
+
+    Supports:
+      - 2026-08-03 23:42 / 2026-08-03T23:42:00
+      - 03.08.2026 23:42
+      - 3 Aug 2026, 23:42 UTC  (English months)
+      - 3 августа 2026, 23:42  (Russian months)
+    Fallback +24h only if nothing matched.
+    """
+    raw = text or ""
+
+    # ISO-like: 2026-08-03 23:42[:ss]
+    m = re.search(r"(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?)", raw)
     if m:
         try:
             parsed = dt.datetime.fromisoformat(m.group(1).replace(" ", "T"))
@@ -306,17 +316,84 @@ def _extract_until(text: str) -> Optional[str]:
             return parsed.isoformat()
         except Exception:
             pass
+
     # dd.mm.yyyy hh:mm
-    m = re.search(r"(\d{1,2})[./](\d{1,2})[./](\d{4})\s+(\d{1,2}):(\d{2})", text)
+    m = re.search(r"(\d{1,2})[./](\d{1,2})[./](\d{4})\s+(\d{1,2}):(\d{2})", raw)
     if m:
         d, mo, y, h, mi = map(int, m.groups())
         try:
-            parsed = dt.datetime(y, mo, d, h, mi, tzinfo=dt.timezone.utc)
-            return parsed.isoformat()
+            return dt.datetime(y, mo, d, h, mi, tzinfo=dt.timezone.utc).isoformat()
         except Exception:
             pass
-    return (_now() + dt.timedelta(hours=24)).isoformat()
 
+    months_en = {
+        "jan": 1, "january": 1,
+        "feb": 2, "february": 2,
+        "mar": 3, "march": 3,
+        "apr": 4, "april": 4,
+        "may": 5,
+        "jun": 6, "june": 6,
+        "jul": 7, "july": 7,
+        "aug": 8, "august": 8,
+        "sep": 9, "sept": 9, "september": 9,
+        "oct": 10, "october": 10,
+        "nov": 11, "november": 11,
+        "dec": 12, "december": 12,
+    }
+    months_ru = {
+        "январ": 1, "феврал": 2, "март": 3, "апрел": 4,
+        "ма": 5, "июн": 6, "июл": 7, "август": 8,
+        "сентябр": 9, "октябр": 10, "ноябр": 11, "декабр": 12,
+    }
+
+    # 3 Aug 2026, 23:42 UTC  |  3 August 2026 23:42
+    m = re.search(
+        r"(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})\s*,?\s*(\d{1,2}):(\d{2})",
+        raw,
+    )
+    if m:
+        d = int(m.group(1))
+        mon_s = m.group(2).lower()
+        y, h, mi = int(m.group(3)), int(m.group(4)), int(m.group(5))
+        mo = months_en.get(mon_s) or months_en.get(mon_s[:3])
+        if mo:
+            try:
+                return dt.datetime(y, mo, d, h, mi, tzinfo=dt.timezone.utc).isoformat()
+            except Exception:
+                pass
+
+    # 3 августа 2026, 23:42  (optional UTC/МСК words ignored)
+    m = re.search(
+        r"(\d{1,2})\s+([А-Яа-яЁё]+)\s+(\d{4})\s*,?\s*(\d{1,2}):(\d{2})",
+        raw,
+    )
+    if m:
+        d = int(m.group(1))
+        mon_s = m.group(2).lower()
+        y, h, mi = int(m.group(3)), int(m.group(4)), int(m.group(5))
+        mo = None
+        for stem, num in months_ru.items():
+            if mon_s.startswith(stem):
+                # avoid "ма" matching "март" wrongly — already ordered; "мая" starts with ма
+                if stem == "ма" and not mon_s.startswith("ма"):
+                    continue
+                if stem == "ма" and mon_s.startswith("март"):
+                    mo = 3
+                    break
+                if stem == "ма" and (mon_s.startswith("мая") or mon_s == "май"):
+                    mo = 5
+                    break
+                if stem != "ма":
+                    mo = num
+                    break
+        if mo:
+            try:
+                return dt.datetime(y, mo, d, h, mi, tzinfo=dt.timezone.utc).isoformat()
+            except Exception:
+                pass
+
+    logger.warning("SpamBot until date unparsed, fallback +24h. snippet={!r}", raw[:180])
+    return (_now() + dt.timedelta(hours=24)).isoformat()
 
 async def check_account(account_user_id: int, *, force: bool = False) -> dict[str, Any]:
     """
