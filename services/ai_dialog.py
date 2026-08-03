@@ -61,12 +61,99 @@ _CHANNEL_HINT_RE = re.compile(
     re.IGNORECASE,
 )
 
-_EXPLAIN_FALLBACKS = [
-    "Написал не просто так: есть бесплатный канал, туда выкладывают посты из закрытых VIP. Платить не нужно.",
-    "Суть такая: бесплатный канал со сливами из платных випок. Можно просто глянуть.",
-    "Хотел поделиться: есть канал без оплаты, контент из закрытых VIP-чатов.",
-    "По делу: веду на бесплатный канал, где посты из закрытых випок. Без подписок на платное.",
-]
+_EXPLAIN_BY_BRANCH: dict[str, list[str]] = {
+    "self": [
+        "Понял, сам в рынке. Написал потому что есть бесплатный канал - туда падают посты из закрытых VIP в одном месте, без покупки доступов.",
+        "Ок, если сам торгуешь: есть бесплатный канал со сливами из платных випок. Можно просто глянуть, без оплаты.",
+    ],
+    "signals": [
+        "Понял, по сигналам. Как раз многие так делают - есть бесплатный канал, где собраны посты из закрытых VIP, платить за каждый доступ не нужно.",
+        "Ясно. Если смотришь сигналы: есть бесплатный канал со сливами из платных випок в одном месте. Без подписки на платное.",
+    ],
+    "newbie": [
+        "Ок, если новичок - тем более можно просто посмотреть, как выглядит контент из закрытых VIP. Есть бесплатный канал, платить не нужно.",
+        "Понял. Для новичка без давления: бесплатный канал с постами из закрытых випок, можно просто глянуть.",
+    ],
+    "other": [
+        "Написал не просто так: есть бесплатный канал, туда выкладывают посты из закрытых VIP. Платить не нужно.",
+        "По делу: бесплатный канал со сливами из платных випок. Можно просто глянуть, без обязательств.",
+        "Хотел поделиться: канал без оплаты, контент из закрытых VIP-чатов в одном месте.",
+    ],
+}
+
+_EXPLAIN_FALLBACKS = [t for branch in _EXPLAIN_BY_BRANCH.values() for t in branch]
+
+_SELF_RE = re.compile(
+    r"(сам(а)?\s+торг|торгую\s+сам|сам(а)?\s+открыв|сво(я|и)\s+сделк|без\s+сигнал)",
+    re.IGNORECASE,
+)
+_SIGNALS_RE = re.compile(
+    r"(сигнал|по\s+сигнал|чужи(е|м)\s+сигнал|копирую|копитрейд|по\s+чужим)",
+    re.IGNORECASE,
+)
+_NEWBIE_RE = re.compile(
+    r"(нович|только\s+нач|не\s+разбира|учу(сь)?|обуча|не\s+умею|первый\s+раз)",
+    re.IGNORECASE,
+)
+
+
+def classify_user_reply(text: str) -> str:
+    """self | signals | newbie | other — for explain angle only."""
+    raw = (text or "").strip()
+    if not raw:
+        return "other"
+    if _SIGNALS_RE.search(raw):
+        return "signals"
+    if _NEWBIE_RE.search(raw):
+        return "newbie"
+    if _SELF_RE.search(raw):
+        return "self"
+    return "other"
+
+
+def _last_user_text(history: list[dict]) -> str:
+    for item in reversed(history or []):
+        if (item.get("role") or "") == "user":
+            return str(item.get("text") or "")
+    return ""
+
+
+def _branch_instruction(branch: str, pitch: str) -> str:
+    angles = {
+        "self": (
+            "Юзер торгует САМ. Угол: чтобы не искать по куче чатов - "
+            "посты из закрытых VIP в одном бесплатном канале."
+        ),
+        "signals": (
+            "Юзер по СИГНАЛАМ / чужим идеям. Угол: можно смотреть, "
+            "что кидают в платных VIP, без покупки каждого доступа."
+        ),
+        "newbie": (
+            "Юзер новичок / просит подсказать. Угол: без давления, "
+            "просто посмотреть, как выглядит контент из закрытых VIP."
+        ),
+        "other": (
+            "Ответ общий. Угол: зачем написал - бесплатный канал с постами "
+            "из закрытых VIP, платить не нужно, можно просто глянуть."
+        ),
+    }
+    angle = angles.get(branch, angles["other"])
+    return (
+        "Это НЕ светская беседа.\n"
+        "Задача: 1-2 предложениями объяснить ЗАЧЕМ ты написал, "
+        "с учётом ответа юзера.\n"
+        f"Ветка: {branch}. {angle}\n"
+        f"Суть оффера: {pitch}\n"
+        "Можно коротко отзеркалить ответ (сам / сигналы / новичок) и сразу мостик к каналу.\n"
+        "ЖЁСТКИЕ запреты:\n"
+        "- не здоровайся снова\n"
+        "- не спрашивай как дела / чем занимается\n"
+        "- не задавай новых вопросов\n"
+        "- без ссылок, без t.me, без http\n"
+        "- без давления и обещаний дохода\n"
+        "- только обычный дефис '-'\n"
+        "Только текст ответа, 1-2 предложения."
+    )
 
 _LINK_FALLBACKS = [
     "Извини что отвлёк. Можешь просто глянуть - подписываться не обязательно:\n{link}",
@@ -101,7 +188,21 @@ def apology_text() -> str:
     )
 
 
+def followup_silence_text() -> str:
+    """Soft pity follow-up after silence on first DM. No channel, no link."""
+    return random.choice(
+        [
+            "Видимо не вовремя написал, извини. Больше не потревожу.",
+            "Похоже зря отвлёк. Извини, не буду больше писать.",
+            "Не хотел мешать. Извини за беспокойство, больше не пишу.",
+            "Ок, по тишине понял. Извини что потревожил.",
+            "Видимо не до того. Извини, больше не потревожу.",
+        ]
+    )
+
+
 def soft_close_text() -> str:
+
     return random.choice(
         [
             "Ок, не навязываю. Удачного дня.",
@@ -129,28 +230,18 @@ def _explain_ok(text: str) -> bool:
 
 
 async def generate_explain(history: list[dict]) -> str:
-    """Explain WHY we wrote: free channel pitch. NO link. NO small talk."""
+    """Explain WHY we wrote: free channel pitch. NO link. Branch by user reply."""
     recent = phrases_svc.recent_texts(phrases_svc.KIND_EXPLAIN, limit=20)
     pitch = CHANNEL_PITCH or "бесплатный канал с постами из закрытых VIP"
+    user_text = _last_user_text(history)
+    branch = classify_user_reply(user_text)
+    logger.info("explain branch={} user={!r}", branch, user_text[:60])
 
     if AI_DM_ENABLED and OPENAI_API_KEY:
         try:
             text = await _openai_reply(
                 history,
-                instruction=(
-                    "Это НЕ светская беседа.\n"
-                    "Задача: одним-двумя предложениями объяснить, ЗАЧЕМ ты написал.\n"
-                    f"Суть оффера: {pitch}\n"
-                    "ЖЁСТКИЕ запреты:\n"
-                    "- не здоровайся снова (не пиши Привет/Здравствуй)\n"
-                    "- не спрашивай как дела / чем занимается / что нового\n"
-                    "- не задавай встречные вопросы ни о чём личном\n"
-                    "- без ссылок, без t.me, без http\n"
-                    "- без давления и обещаний дохода\n"
-                    "- только обычный дефис '-', без длинного тире\n"
-                    "Можно начать с 'По делу:' или сразу с сути.\n"
-                    "Только текст ответа, 1-2 предложения."
-                ),
+                instruction=_branch_instruction(branch, pitch),
             )
             if text:
                 text = _strip_em_dash(text)
@@ -158,11 +249,16 @@ async def generate_explain(history: list[dict]) -> str:
                     text = text.replace(CHANNEL_LINK, "").strip()
                 if _explain_ok(text) and text not in recent:
                     return text
-                logger.warning("explain rejected by validator: {!r}", (text or "")[:100])
+                logger.warning("explain rejected: {!r}", (text or "")[:80])
         except Exception as exc:
             logger.exception("generate_explain failed: {}", exc)
 
-    pool = [t for t in _EXPLAIN_FALLBACKS if t not in recent] or list(_EXPLAIN_FALLBACKS)
+    pool = list(_EXPLAIN_BY_BRANCH.get(branch) or _EXPLAIN_BY_BRANCH["other"])
+    pool = [x for x in pool if x not in recent] or pool
+    # also allow other-branch fallbacks if exhausted
+    if len(pool) <= 1:
+        extra = [x for x in _EXPLAIN_FALLBACKS if x not in recent and x not in pool]
+        pool = pool + extra
     return random.choice(pool)
 
 

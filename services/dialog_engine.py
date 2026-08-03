@@ -116,7 +116,9 @@ async def _handle_incoming_private_body(
     stage = dialog.get("stage")
     outgoing = int(dialog.get("outgoing_count") or 0)
 
-    if stage == store.STAGE_WAITING_REPLY:
+    if stage in (store.STAGE_WAITING_REPLY, store.STAGE_FOLLOWUP_SENT):
+        # Cancel silence follow-up immediately so it cannot race with explain.
+        store.set_stage(target_user_id, stage, clear_auto_link=True)
         if ai_dialog.is_soft_decline(text):
             await _send_and_close(
                 account_user_id,
@@ -269,6 +271,50 @@ async def process_due_auto_links() -> int:
             )
             n += 1
             logger.info("Auto-link sent target={} account={}", target, account)
+        finally:
+            _inflight.discard(key)
+    return n
+
+
+async def process_due_followups() -> int:
+    """After ~24h silence on first DM: one soft apology, no channel/link."""
+    from services import runtime as runtime_svc
+
+    if not runtime_svc.is_worker_enabled():
+        return 0
+    due = store.list_due_followups()
+    n = 0
+    for d in due:
+        target = int(d["target_user_id"])
+        account = int(d["account_user_id"])
+        outgoing = int(d.get("outgoing_count") or 0)
+        if outgoing >= store.MAX_OUTGOING:
+            store.set_stage(target, store.STAGE_CLOSED, clear_auto_link=True)
+            store.mark_contact_completed(target)
+            continue
+        key = (account, target)
+        if key in _inflight:
+            continue
+        _inflight.add(key)
+        try:
+            text = ai_dialog.followup_silence_text()
+            ok = await _send_private(account, target, text)
+            if not ok:
+                # retry later (+2h)
+                later = (_now() + dt.timedelta(hours=2)).isoformat()
+                store.set_stage(
+                    target, store.STAGE_WAITING_REPLY, auto_link_at=later
+                )
+                continue
+            store.append_history(target, "assistant", text)
+            store.set_stage(
+                target,
+                store.STAGE_FOLLOWUP_SENT,
+                bump_outgoing=True,
+                clear_auto_link=True,
+            )
+            n += 1
+            logger.info("Silence follow-up sent target={} account={}", target, account)
         finally:
             _inflight.discard(key)
     return n

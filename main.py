@@ -1,4 +1,4 @@
-"""Entry point: Channel DM Bot (v1.0.25)."""
+"""Entry point: Channel DM Bot (v1.0.28)."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ def configure_logging() -> None:
 
 def run() -> None:
     configure_logging()
-    logger.info("Channel DM Bot - v1.0.25 starting")
+    logger.info("Channel DM Bot - v1.0.28 starting")
     logger.info("DB_PATH={}", DB_PATH)
 
     if not ADMIN_ID_LIST:
@@ -68,6 +68,10 @@ def run() -> None:
                     await dialog_engine.process_due_auto_links()
                 except Exception as exc:
                     logger.exception("auto-link due loop: {}", exc)
+                try:
+                    await dialog_engine.process_due_followups()
+                except Exception as exc:
+                    logger.exception("follow-up due loop: {}", exc)
                 try:
                     from services import queue as queue_svc
                     n = queue_svc.release_stale_claims(older_than_seconds=900)
