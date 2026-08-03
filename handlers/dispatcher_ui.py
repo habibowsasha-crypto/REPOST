@@ -1,46 +1,41 @@
-"""Start/stop dispatcher worker from admin menu."""
+"""Start/stop dispatcher worker UI — unified style."""
 
 from __future__ import annotations
 
-from telethon import Button, events
+from telethon import events
 
 from config import bot, is_admin
 from services import dispatcher as dispatcher_svc
 from services import monitor as monitor_svc
 from services import queue as queue_svc
-from services.menu_ui import back_home_row, back_row, render_menu
-
-
-def _worker_screen() -> str:
-    st = dispatcher_svc.worker_status()
-    mon = monitor_svc.monitor_status()
-    pending = queue_svc.count_by_status(queue_svc.STATUS_PENDING)
-    enabled = "вкл" if st["enabled"] else "выкл"
-    loop = "работает" if st["loop_running"] else "остановлен"
-    return (
-        f"**🚀 Воркер first DM**\n\n"
-        f"Флаг: **{enabled}**\n"
-        f"Цикл: **{loop}**\n"
-        f"Глобальная пауза ещё: **{st['global_wait_sec']}** сек\n"
-        f"Мониторинг: {mon['connected_count']} акк.\n"
-        f"Pending лидов: **{pending}**\n\n"
-        "Random lead × random свободный аккаунт.\n"
-        "Текст first DM - из локального пула (AI - шаг 8)."
-    )
+from services.menu_ui import render_menu
+from services.ui import (
+    DENIED,
+    OFF,
+    ON,
+    WAIT,
+    back_home_row,
+    back_row,
+    btn,
+    join,
+    kv,
+    screen,
+)
 
 
 @bot.on(events.CallbackQuery(data=b"bc_start"))
 async def cb_bc_start(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
-        await event.answer("Нет доступа", alert=True)
+        await event.answer(DENIED, alert=True)
         return
     await dispatcher_svc.start_worker()
+    text = screen("▶️", "Старт", "Воркер включён.", _worker_body())
     await render_menu(
         event,
-        "**▶️ Старт**\n\nВоркер включён.\n\n" + _worker_screen(),
+        text,
         [
-            [Button.inline("⏹ Стоп", b"bc_stop")],
-            [Button.inline("🔄 Обновить", b"bc_worker_status")],
+            [btn("⏹ Стоп", b"bc_stop")],
+            [btn("🔄 Обновить", b"bc_worker_status")],
             back_row(b"menu_broadcast"),
             back_home_row(),
         ],
@@ -48,17 +43,46 @@ async def cb_bc_start(event: events.CallbackQuery.Event) -> None:
     await event.answer("Воркер запущен")
 
 
+
+def _worker_body() -> str:
+    st = dispatcher_svc.worker_status()
+    mon = monitor_svc.monitor_status()
+    pending = queue_svc.count_by_status(queue_svc.STATUS_PENDING)
+    if st["enabled"] and st["loop_running"]:
+        flag, loop = f"{ON} вкл", f"{ON} работает"
+    elif st["enabled"]:
+        flag, loop = f"{ON} вкл", f"{WAIT} остановлен"
+    else:
+        flag, loop = f"{OFF} выкл", f"{OFF} остановлен"
+    return join(
+        f"Флаг: **{flag}**",
+        f"Цикл: **{loop}**",
+        kv("Глобальная пауза", f"{st['global_wait_sec']} сек"),
+        kv("Мониторинг", f"{mon['connected_count']} акк."),
+        kv("Pending", str(pending), icon="⏳"),
+        "",
+        "Random lead × свободный аккаунт.",
+        "AI first DM + fallback пул.",
+    )
+
+
 @bot.on(events.CallbackQuery(data=b"bc_stop"))
 async def cb_bc_stop(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
-        await event.answer("Нет доступа", alert=True)
+        await event.answer(DENIED, alert=True)
         return
     await dispatcher_svc.stop_worker()
+    text = screen(
+        "⏹",
+        "Стоп",
+        "Новые first DM не отправляются.",
+        _worker_body(),
+    )
     await render_menu(
         event,
-        "**⏹ Стоп**\n\nНовые first DM не отправляются.\n\n" + _worker_screen(),
+        text,
         [
-            [Button.inline("▶️ Старт", b"bc_start")],
+            [btn("▶️ Старт", b"bc_start")],
             back_row(b"menu_broadcast"),
             back_home_row(),
         ],
@@ -69,13 +93,14 @@ async def cb_bc_stop(event: events.CallbackQuery.Event) -> None:
 @bot.on(events.CallbackQuery(data=b"bc_worker_status"))
 async def cb_bc_worker_status(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
-        await event.answer("Нет доступа", alert=True)
+        await event.answer(DENIED, alert=True)
         return
+    text = screen("🚀", "Воркер first DM", _worker_body())
     await render_menu(
         event,
-        _worker_screen(),
+        text,
         [
-            [Button.inline("▶️ Старт", b"bc_start"), Button.inline("⏹ Стоп", b"bc_stop")],
+            [btn("▶️ Старт", b"bc_start"), btn("⏹ Стоп", b"bc_stop")],
             back_row(b"menu_broadcast"),
             back_home_row(),
         ],

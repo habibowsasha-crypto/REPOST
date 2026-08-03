@@ -1,100 +1,95 @@
-"""Admin UI for the common lead queue."""
+"""Admin UI for the common lead queue — unified style."""
 
 from __future__ import annotations
 
-from telethon import Button, events
+from telethon import events
 
 from config import bot, is_admin
 from services import monitor as monitor_svc
 from services import queue as queue_svc
-from services.menu_ui import back_home_row, back_row, render_menu
+from services.menu_ui import render_menu
+from services.ui import (
+    DENIED,
+    DIV,
+    OFF,
+    ON,
+    UPDATED,
+    back_home_row,
+    back_row,
+    btn,
+    join,
+    kv,
+    screen,
+    section,
+    tree,
+)
 
 
 def queue_screen_text() -> str:
     pending = queue_svc.count_by_status(queue_svc.STATUS_PENDING)
     claimed = queue_svc.count_by_status(queue_svc.STATUS_CLAIMED)
     sent = queue_svc.count_by_status(queue_svc.STATUS_SENT)
+    cancelled = queue_svc.count_by_status(queue_svc.STATUS_CANCELLED)
     mon = monitor_svc.monitor_status()
-    mon_line = (
-        f"Мониторинг: **вкл** ({mon['connected_count']} акк.)"
-        if mon["running"]
-        else "Мониторинг: **выкл**"
-    )
-    lines = [
-        "**📥 Очередь**\n",
-        mon_line,
-        f"Pending: **{pending}** | Claimed: {claimed} | Sent: {sent}\n",
-    ]
+    if mon["running"]:
+        mon_line = kv("Мониторинг", f"{mon['connected_count']} акк. онлайн", icon=ON)
+    else:
+        mon_line = kv("Мониторинг", "выкл", icon=OFF)
+
     recent = queue_svc.list_recent(12, status=queue_svc.STATUS_PENDING)
     if not recent:
-        lines.append("Pending пуст. Нужны: аккаунт с участием + выбранные чаты + сообщения в группах.")
+        recent_block = (
+            "Pending пуст.\n"
+            "Нужны: участие + чаты в мониторинге + сообщения в группах."
+        )
     else:
-        lines.append("Последние pending:")
-        for lead in recent:
-            lines.append(queue_svc.format_lead_line(lead))
-    return "\n".join(lines)
+        recent_block = join(
+            "Последние pending:",
+            *[queue_svc.format_lead_line(lead) for lead in recent],
+        )
+
+    return screen(
+        "📥",
+        "Очередь",
+        mon_line,
+        section(
+            "Сводка",
+            tree(
+                [
+                    ("⏳", "ждут DM", pending),
+                    ("🔄", "в работе", claimed),
+                    ("✅", "написали", sent),
+                    ("🗑", "отменены", cancelled),
+                ]
+            ),
+        ),
+        recent_block,
+    )
+
+
+def _queue_buttons():
+    return [
+        [btn("🔄 Обновить", b"bc_queue")],
+        [btn("🧹 Очистить pending", b"bc_queue_clear")],
+        back_row(b"menu_broadcast"),
+        back_home_row(),
+    ]
 
 
 @bot.on(events.CallbackQuery(data=b"bc_queue"))
 async def cb_bc_queue(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
-        await event.answer("Нет доступа", alert=True)
+        await event.answer(DENIED, alert=True)
         return
-    await render_menu(
-        event,
-        queue_screen_text(),
-        [
-            [Button.inline("🔄 Обновить", b"bc_queue")],
-            [Button.inline("🧹 Очистить pending", b"bc_queue_clear")],
-            [Button.inline("📡 Перезапуск мониторинга", b"bc_monitor_refresh")],
-            back_row(b"menu_broadcast"),
-            back_home_row(),
-        ],
-    )
+    await render_menu(event, queue_screen_text(), _queue_buttons())
     await event.answer()
 
 
 @bot.on(events.CallbackQuery(data=b"bc_queue_clear"))
 async def cb_bc_queue_clear(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
-        await event.answer("Нет доступа", alert=True)
+        await event.answer(DENIED, alert=True)
         return
     n = queue_svc.clear_pending()
-    await render_menu(
-        event,
-        f"**🧹 Очистка**\n\nУдалено pending: **{n}**\n\n" + queue_screen_text(),
-        [
-            [Button.inline("🔄 Обновить", b"bc_queue")],
-            back_row(b"menu_broadcast"),
-            back_home_row(),
-        ],
-    )
-    await event.answer(f"Удалено: {n}")
-
-
-@bot.on(events.CallbackQuery(data=b"bc_monitor_refresh"))
-async def cb_bc_monitor_refresh(event: events.CallbackQuery.Event) -> None:
-    if not is_admin(event.sender_id):
-        await event.answer("Нет доступа", alert=True)
-        return
-    await event.answer("Перезапуск…")
-    try:
-        await monitor_svc.refresh_monitor()
-    except Exception as exc:
-        await render_menu(
-            event,
-            f"⚠ Ошибка мониторинга: `{type(exc).__name__}`",
-            [back_row(b"bc_queue"), back_home_row()],
-        )
-        return
-    await render_menu(
-        event,
-        queue_screen_text(),
-        [
-            [Button.inline("🔄 Обновить", b"bc_queue")],
-            [Button.inline("🧹 Очистить pending", b"bc_queue_clear")],
-            [Button.inline("📡 Перезапуск мониторинга", b"bc_monitor_refresh")],
-            back_row(b"menu_broadcast"),
-            back_home_row(),
-        ],
-    )
+    await render_menu(event, queue_screen_text(), _queue_buttons())
+    await event.answer(f"Очищено: {n}")

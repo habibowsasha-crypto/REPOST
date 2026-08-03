@@ -28,6 +28,58 @@ STATUS_ERROR = "error"
 
 _SPAMBOT = "SpamBot"
 
+def _account_label(account_user_id: int) -> str:
+    """Human label: @username or name · id."""
+    from services import accounts as accounts_svc
+
+    acc = accounts_svc.get_account(int(account_user_id))
+    if not acc:
+        return f"id `{account_user_id}`"
+    return accounts_svc.format_account_label(acc, include_id=True)
+
+
+def _notify_peerflood(label: str, minutes: int) -> str:
+    return (
+        f"⚠️ Аккаунт **{label}** словил PeerFlood.\n"
+        f"Ставлю паузу на **{minutes} мин** и спрашиваю @SpamBot."
+    )
+
+
+def _notify_free_auto(label: str) -> str:
+    return (
+        f"✅ @SpamBot: **{label}** свободен.\n"
+        f"Снимаю паузу (auto-resume)."
+    )
+
+
+def _notify_free_manual(label: str) -> str:
+    return (
+        f"✅ @SpamBot: **{label}** свободен.\n"
+        f"Auto-resume выкл — сними паузу вручную."
+    )
+
+
+def _notify_limited(label: str, until: str, next_check: str) -> str:
+    return (
+        f"⏳ @SpamBot пишет, что **{label}** ещё ограничен\n"
+        f"примерно до `{until}`.\n"
+        f"Проверю снова после `{next_check}`."
+    )
+
+
+def _notify_unknown(label: str, reply: str) -> str:
+    return (
+        f"❔ Неясный ответ @SpamBot по **{label}**.\n"
+        f"{reply}"
+    )
+
+
+def _notify_resumed(label: str, source: str) -> str:
+    src = {"manual": "вручную", "auto": "auto-resume", "spambot_free": "auto-resume"}.get(
+        source, source
+    )
+    return f"✅ **{label}** снова можно использовать в рассылке ({src})."
+
 
 def _now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
@@ -141,10 +193,9 @@ async def on_peer_flood(account_user_id: int) -> None:
         next_check_at=_now_iso(),  # check ASAP
         limited_until=None,
     )
+    label = _account_label(account_user_id)
     await notify_admins(
-        f"⚠ PeerFlood на аккаунте `{account_user_id}`.\n"
-        f"Мин. пауза {PEER_FLOOD_MIN_COOLDOWN_MINUTES} мин. "
-        f"Запускаю проверку @SpamBot."
+        _notify_peerflood(label, PEER_FLOOD_MIN_COOLDOWN_MINUTES)
     )
     # Immediate check attempt
     await check_account(account_user_id, force=True)
@@ -341,10 +392,8 @@ async def _apply_parse(
                 last_reply=reply_text[:500],
                 next_check_at=None,
             )
-            await notify_admins(
-                f"✅ @SpamBot: аккаунт `{account_user_id}` свободен.\n"
-                f"Auto-resume выключен - снимите паузу вручную."
-            )
+            label = _account_label(account_user_id)
+            await notify_admins(_notify_free_manual(label))
         return
 
     if result == "limited":
@@ -362,10 +411,11 @@ async def _apply_parse(
             next_check_at=next_check,
             limited_until=until,
         )
+        label = _account_label(account_user_id)
+        until_short = (until or "неизвестно")[:19]
+        next_short = (next_check or "")[:19]
         await notify_admins(
-            f"⏳ @SpamBot: аккаунт `{account_user_id}` ограничен.\n"
-            f"До: `{until or 'неизвестно'}`\n"
-            f"След. проверка: `{next_check}`"
+            _notify_limited(label, until_short, next_short)
         )
         return
 
@@ -376,9 +426,9 @@ async def _apply_parse(
         last_reply=reply_text[:500],
         next_check_at=(_now() + dt.timedelta(minutes=15)).isoformat(),
     )
+    label = _account_label(account_user_id)
     await notify_admins(
-        f"❔ @SpamBot: неясный ответ для `{account_user_id}`.\n"
-        f"{(reply_text or '')[:200]}"
+        _notify_unknown(label, (reply_text or "")[:200] or "(пусто)")
     )
 
 
@@ -407,7 +457,8 @@ async def resume_account(account_user_id: int, *, source: str = "manual") -> Non
         limited_until=None,
     )
     logger.info("Account {} resumed ({})", account_user_id, source)
-    await notify_admins(f"✅ Аккаунт `{account_user_id}` снова в пуле ({source}).")
+    label = _account_label(account_user_id)
+    await notify_admins(_notify_resumed(label, source))
     try:
         await monitor_svc.refresh_monitor()
     except Exception as exc:
@@ -449,7 +500,7 @@ async def notify_admins(text: str) -> None:
         return
     for admin_id in ADMIN_ID_LIST:
         try:
-            await bot.send_message(admin_id, text)
+            await bot.send_message(admin_id, text, link_preview=False)
         except Exception as exc:
             logger.debug("notify admin {} failed: {}", admin_id, exc)
 

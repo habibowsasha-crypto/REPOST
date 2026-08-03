@@ -1,4 +1,4 @@
-"""Shared helpers for admin inline menus."""
+"""Shared helpers for admin inline menus (render + nav)."""
 
 from __future__ import annotations
 
@@ -8,15 +8,9 @@ from telethon import Button
 from telethon.events.callbackquery import CallbackQuery
 from telethon.events.newmessage import NewMessage
 
+from services.ui import back_home_row, back_row, btn  # noqa: F401 — re-export
+
 EventLike = Union[NewMessage.Event, CallbackQuery.Event, Any]
-
-
-def back_home_row() -> list[Button]:
-    return [Button.inline("◀️ Главное меню", b"menu_home")]
-
-
-def back_row(data: bytes, label: str = "◀️ Назад") -> list[Button]:
-    return [Button.inline(label, data)]
 
 
 async def render_menu(
@@ -29,13 +23,10 @@ async def render_menu(
     """
     Show a menu screen.
 
-    - CallbackQuery + edit=True: always try to edit the same message.
-      If content is unchanged (Telegram "not modified") - stay on same message.
-      Never spawn a duplicate menu from a button press.
+    - CallbackQuery + edit=True: edit the same message (never spawn a duplicate).
     - NewMessage / edit=False: send a new message.
     """
     btn_list = [list(row) for row in buttons] if buttons else None
-
     is_callback = getattr(event, "query", None) is not None
 
     if edit and is_callback:
@@ -44,15 +35,13 @@ async def render_menu(
             return
         except Exception as exc:
             err = str(exc).lower()
-            # Same text/buttons - Telegram rejects edit. Keep current message.
             if (
                 "not modified" in err
                 or "message is not modified" in err
                 or "content of the message" in err
             ):
                 return
-            # Other edit failures: still do NOT open a second menu from a callback.
-            # Admin can re-send /menu if the message was deleted.
+            # Other edit failures: do not open a second menu from a callback.
             return
 
     respond = getattr(event, "respond", None)

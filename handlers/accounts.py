@@ -17,7 +17,22 @@ from telethon.sessions import StringSession
 from config import API_HASH, API_ID, bot, is_admin
 from services import accounts as accounts_svc
 from services.admin_state import clear_state, get_state, set_state
-from services.menu_ui import back_home_row, back_row, render_menu
+from services.menu_ui import render_menu
+from services.ui import (
+    DENIED,
+    DISABLED,
+    ENABLED,
+    OFF,
+    ON,
+    WARN,
+    back_home_row,
+    back_row,
+    btn,
+    join,
+    kv,
+    notice,
+    screen,
+)
 
 _PHONE_RE = re.compile(r"^\+?[0-9]{10,15}$")
 
@@ -46,14 +61,21 @@ async def _disconnect_client(client: TelegramClient | None) -> None:
 async def show_accounts_menu(event, *, edit: bool = True) -> None:
     total = accounts_svc.count_accounts()
     active = accounts_svc.count_participating()
+    text = screen(
+        "👤",
+        "Аккаунты",
+        join(
+            kv("Всего", str(total)),
+            kv("Участвуют", str(active), icon=ON),
+        ),
+        "Добавь user-аккаунт и включи участие.",
+    )
     await render_menu(
         event,
-        "**👤 Аккаунты**\n\n"
-        f"Всего: **{total}** | Участвуют в рассылке: **{active}**\n\n"
-        "Добавьте user-аккаунт Telegram и включите тумблер участия.",
+        text,
         [
-            [Button.inline("➕ Добавить аккаунт", b"acc_add")],
-            [Button.inline("📋 Список аккаунтов", b"acc_list")],
+            [btn("➕ Добавить аккаунт", b"acc_add")],
+            [btn("📋 Список аккаунтов", b"acc_list")],
             back_home_row(),
         ],
         edit=edit,
@@ -65,7 +87,7 @@ async def show_account_list(event, *, edit: bool = True) -> None:
     if not rows:
         await render_menu(
             event,
-            "**📋 Список аккаунтов**\n\nПока пусто. Нажмите «Добавить аккаунт».",
+            screen("📋", "Список аккаунтов", "Пока пусто. Нажми «Добавить аккаунт»."),
             [
                 [Button.inline("➕ Добавить аккаунт", b"acc_add")],
                 back_row(b"menu_accounts"),
@@ -75,23 +97,20 @@ async def show_account_list(event, *, edit: bool = True) -> None:
         )
         return
 
-    lines = ["**📋 Список аккаунтов**\n"]
+    lines = [screen("📋", "Список аккаунтов", "")]
     buttons: list[list[Button]] = []
     for acc in rows:
         label = accounts_svc.format_account_label(acc)
         status = accounts_svc.account_status_line(acc)
-        icon = "🟢" if acc.get("participates") and not acc.get("is_paused") else "🔴"
+        icon = ON if acc.get("participates") and not acc.get("is_paused") else OFF
         lines.append(f"{icon} `{acc['user_id']}` | {label}\n{status}")
         short = accounts_svc.format_account_label(acc, include_id=False)[:28]
         buttons.append(
             [
-                Button.inline(
-                    f"{icon} {short}",
-                    f"acc_card_{acc['user_id']}".encode(),
-                )
+                btn(f"{icon} {short}", f"acc_card_{acc['user_id']}")
             ]
         )
-    buttons.append([Button.inline("➕ Добавить", b"acc_add")])
+    buttons.append([btn("➕ Добавить", b"acc_add")])
     buttons.append(back_row(b"menu_accounts"))
     buttons.append(back_home_row())
     await render_menu(event, "\n\n".join(lines), buttons, edit=edit)
@@ -138,26 +157,30 @@ async def show_account_card(event, user_id: int, *, edit: bool = True) -> None:
         sb_reply = sb_reply[:120] + "…"
     sb_next = (sb.get("next_check_at") or "")[:19] or "-"
     cooldown = (acc.get("cooldown_until") or "")[:19] or "-"
-    text = (
-        f"**👤 Аккаунт**\n\n"
-        f"{label}\n"
-        f"ID: `{acc['user_id']}`\n"
-        f"Телефон: `{phone}`\n"
-        f"Статус: {status}\n"
-        f"Клиент монитора: **{mon_line}**\n"
-        f"Cooldownoldown: `{cooldown}`\n"
-        f"SpamBot: **{sb_status}** | next `{sb_next}`\n"
-        f"{('Ответ: ' + sb_reply + chr(10)) if sb_reply else ''}"
-        f"Чаты: режим **{mode_label}**, найдено {discovered_n}, "
-        f"мониторинг **{watchable}**\n"
-        f"Добавлен: {(acc.get('created_at') or '')[:19]}\n"
+    mon_icon = ON if connected else OFF
+    sb_block = f"Ответ: {sb_reply}" if sb_reply else ""
+    text = screen(
+        "👤",
+        "Аккаунт",
+        join(
+            f"**{label}**",
+            f"ID: `{acc['user_id']}`",
+            f"Телефон: `{phone}`",
+            f"Статус: {status}",
+            kv("Монитор", mon_line, icon=mon_icon),
+            f"Cooldownoldown: `{cooldown}`",
+            f"SpamBot: **{sb_status}** · next `{sb_next}`",
+            sb_block,
+            kv("Чаты", f"{mode_label} · найдено {discovered_n} · монитор {watchable}"),
+            f"Добавлен: {(acc.get('created_at') or '')[:19]}",
+        ),
     )
     buttons = [
-        [Button.inline(toggle_label, f"acc_toggle_{user_id}".encode())],
-        [Button.inline("💬 Чаты", f"acc_chats_{user_id}".encode())],
-        [Button.inline("🤖 Проверить @SpamBot", f"acc_spambot_{user_id}".encode())],
-        [Button.inline("▶️ Снять паузу", f"acc_unpause_{user_id}".encode())],
-        [Button.inline("🗑 Удалить", f"acc_del_ask_{user_id}".encode())],
+        [btn(toggle_label, f"acc_toggle_{user_id}")],
+        [btn("💬 Чаты", f"acc_chats_{user_id}")],
+        [btn("🤖 Проверить @SpamBot", f"acc_spambot_{user_id}")],
+        [btn("▶️ Снять паузу", f"acc_unpause_{user_id}")],
+        [btn("🗑 Удалить", f"acc_del_ask_{user_id}")],
         back_row(b"acc_list"),
         back_home_row(),
     ]
@@ -172,7 +195,7 @@ async def show_account_card(event, user_id: int, *, edit: bool = True) -> None:
 @bot.on(events.CallbackQuery(data=b"menu_accounts"))
 async def cb_menu_accounts(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
-        await event.answer("Нет доступа", alert=True)
+        await event.answer(DENIED, alert=True)
         return
     await show_accounts_menu(event)
     await event.answer()
@@ -181,7 +204,7 @@ async def cb_menu_accounts(event: events.CallbackQuery.Event) -> None:
 @bot.on(events.CallbackQuery(data=b"acc_list"))
 async def cb_acc_list(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
-        await event.answer("Нет доступа", alert=True)
+        await event.answer(DENIED, alert=True)
         return
     await show_account_list(event)
     await event.answer()
@@ -190,7 +213,7 @@ async def cb_acc_list(event: events.CallbackQuery.Event) -> None:
 @bot.on(events.CallbackQuery(pattern=rb"^acc_card_(\d+)$"))
 async def cb_acc_card(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
-        await event.answer("Нет доступа", alert=True)
+        await event.answer(DENIED, alert=True)
         return
     user_id = int(event.pattern_match.group(1))
     await show_account_card(event, user_id)
@@ -200,7 +223,7 @@ async def cb_acc_card(event: events.CallbackQuery.Event) -> None:
 @bot.on(events.CallbackQuery(pattern=rb"^acc_toggle_(\d+)$"))
 async def cb_acc_toggle(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
-        await event.answer("Нет доступа", alert=True)
+        await event.answer(DENIED, alert=True)
         return
     user_id = int(event.pattern_match.group(1))
     acc = accounts_svc.get_account(user_id)
@@ -215,7 +238,7 @@ async def cb_acc_toggle(event: events.CallbackQuery.Event) -> None:
     except Exception as exc:
         logger.warning("monitor refresh after toggle: {}", exc)
     await show_account_card(event, user_id)
-    await event.answer("Участвует" if new_value else "Выключен")
+    await event.answer(ENABLED if new_value else DISABLED)
 
 
 # acc_chats handler lives in handlers/chats.py (Step 4).
@@ -224,7 +247,7 @@ async def cb_acc_toggle(event: events.CallbackQuery.Event) -> None:
 @bot.on(events.CallbackQuery(pattern=rb"^acc_del_ask_(\d+)$"))
 async def cb_acc_del_ask(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
-        await event.answer("Нет доступа", alert=True)
+        await event.answer(DENIED, alert=True)
         return
     user_id = int(event.pattern_match.group(1))
     acc = accounts_svc.get_account(user_id)
@@ -247,7 +270,7 @@ async def cb_acc_del_ask(event: events.CallbackQuery.Event) -> None:
 @bot.on(events.CallbackQuery(pattern=rb"^acc_del_yes_(\d+)$"))
 async def cb_acc_del_yes(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
-        await event.answer("Нет доступа", alert=True)
+        await event.answer(DENIED, alert=True)
         return
     user_id = int(event.pattern_match.group(1))
     ok = accounts_svc.delete_account(user_id)
@@ -266,7 +289,7 @@ async def cb_acc_del_yes(event: events.CallbackQuery.Event) -> None:
 @bot.on(events.CallbackQuery(data=b"acc_add"))
 async def cb_acc_add(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
-        await event.answer("Нет доступа", alert=True)
+        await event.answer(DENIED, alert=True)
         return
     admin_id = int(event.sender_id)
     # Cancel any previous in-progress login client.
@@ -290,7 +313,7 @@ async def cb_acc_add(event: events.CallbackQuery.Event) -> None:
 @bot.on(events.CallbackQuery(data=b"acc_cancel"))
 async def cb_acc_cancel(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
-        await event.answer("Нет доступа", alert=True)
+        await event.answer(DENIED, alert=True)
         return
     admin_id = int(event.sender_id)
     state = get_state(admin_id)
@@ -312,9 +335,11 @@ async def cmd_cancel(event: events.NewMessage.Event) -> None:
         return
     if state.get("client"):
         await _disconnect_client(state.get("client"))
+    flow = state.get("flow")
     clear_state(admin_id)
     await event.respond("Ок, отменено.")
-    await show_accounts_menu(event, edit=False)
+    if flow == "login":
+        await show_accounts_menu(event, edit=False)
 
 
 @bot.on(
@@ -474,7 +499,7 @@ async def _finish_login(
 @bot.on(events.CallbackQuery(pattern=rb"^acc_spambot_(\d+)$"))
 async def cb_acc_spambot(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
-        await event.answer("Нет доступа", alert=True)
+        await event.answer(DENIED, alert=True)
         return
     user_id = int(event.pattern_match.group(1))
     await event.answer("Проверяю @SpamBot…")
@@ -495,7 +520,7 @@ async def cb_acc_spambot(event: events.CallbackQuery.Event) -> None:
 @bot.on(events.CallbackQuery(pattern=rb"^acc_unpause_(\d+)$"))
 async def cb_acc_unpause(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
-        await event.answer("Нет доступа", alert=True)
+        await event.answer(DENIED, alert=True)
         return
     user_id = int(event.pattern_match.group(1))
     from services import spambot as spambot_svc

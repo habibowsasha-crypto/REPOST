@@ -7,7 +7,8 @@ from telethon import Button, events
 from config import bot, is_admin
 from services import accounts as accounts_svc
 from services import chats as chats_svc
-from services.menu_ui import back_home_row, back_row, render_menu
+from services.menu_ui import render_menu
+from services.ui import DENIED, WARN, back_home_row, back_row, btn, join, kv, notice, screen
 
 
 def _mode_label(mode: str) -> str:
@@ -40,27 +41,21 @@ async def show_chats_menu(event, account_user_id: int, page: int = 0, *, edit: b
     chunk = discovered[start : start + chats_svc.PAGE_SIZE]
 
     label = accounts_svc.format_account_label(acc)
-    text = (
-        f"**💬 Чаты**\n\n"
-        f"Аккаунт: {label}\n"
-        f"Режим: **{_mode_label(mode)}**\n"
-        f"Найдено групп: **{total}**\n"
-        f"Будет мониториться: **{watchable}**\n"
+    body = join(
+        f"Аккаунт: {label}",
+        kv("Режим", _mode_label(mode)),
+        kv("Найдено групп", str(total)),
+        kv("Мониторится", str(watchable)),
     )
     if watchable == 0:
-        text += "⚠ **Ни один чат не мониторится — очередь будет пустой.**\n"
+        body = join(body, notice("warn", "Ни один чат не мониторится — очередь пустая."))
     if mode == chats_svc.CHAT_MODE_MANUAL:
-        text += f"Выбрано вручную: **{len(selected)}**\n"
-        text += "\nОтметьте чаты для мониторинга:"
+        body = join(body, kv("Выбрано вручную", str(len(selected))), "", "Отметь чаты для мониторинга:")
     else:
-        text += f"Исключено: **{len(excluded)}**\n"
-        text += "\nОтметьте чаты, которые **не** слушать:"
-
+        body = join(body, kv("Исключено", str(len(excluded))), "", "Отметь чаты, которые **не** слушать:")
     if not discovered:
-        text += (
-            "\n\nСписок пуст. Нажмите **Обновить группы** "
-            "(аккаунт должен состоять в группах)."
-        )
+        body = join(body, "", "Список пуст. Нажми **Обновить группы**", "(аккаунт должен быть в группах).")
+    text = screen("💬", "Чаты", body)
 
     buttons: list[list[Button]] = []
     other_mode = (
@@ -74,10 +69,10 @@ async def show_chats_menu(event, account_user_id: int, page: int = 0, *, edit: b
         else "🖐 Режим: вручную"
     )
     buttons.append(
-        [Button.inline(other_label, f"chat_mode_{account_user_id}_{other_mode}".encode())]
+        [btn(other_label, f"chat_mode_{account_user_id}_{other_mode}")]
     )
     buttons.append(
-        [Button.inline("🔄 Обновить группы", f"chat_refresh_{account_user_id}_{page}".encode())]
+        [btn("🔄 Обновить группы", f"chat_refresh_{account_user_id}_{page}")]
     )
 
     for row in chunk:
@@ -125,7 +120,7 @@ async def show_chats_menu(event, account_user_id: int, page: int = 0, *, edit: b
 @bot.on(events.CallbackQuery(pattern=rb"^acc_chats_(\d+)$"))
 async def cb_acc_chats(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
-        await event.answer("Нет доступа", alert=True)
+        await event.answer(DENIED, alert=True)
         return
     account_user_id = int(event.pattern_match.group(1))
     await show_chats_menu(event, account_user_id, 0)
@@ -135,7 +130,7 @@ async def cb_acc_chats(event: events.CallbackQuery.Event) -> None:
 @bot.on(events.CallbackQuery(pattern=rb"^chat_page_(\d+)_(\d+)$"))
 async def cb_chat_page(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
-        await event.answer("Нет доступа", alert=True)
+        await event.answer(DENIED, alert=True)
         return
     account_user_id = int(event.pattern_match.group(1))
     page = int(event.pattern_match.group(2))
@@ -146,7 +141,7 @@ async def cb_chat_page(event: events.CallbackQuery.Event) -> None:
 @bot.on(events.CallbackQuery(pattern=rb"^chat_mode_(\d+)_(manual|all_with_exclusions)$"))
 async def cb_chat_mode(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
-        await event.answer("Нет доступа", alert=True)
+        await event.answer(DENIED, alert=True)
         return
     account_user_id = int(event.pattern_match.group(1))
     mode = event.pattern_match.group(2).decode()
@@ -166,7 +161,7 @@ async def cb_chat_mode(event: events.CallbackQuery.Event) -> None:
 @bot.on(events.CallbackQuery(pattern=rb"^chat_refresh_(\d+)_(\d+)$"))
 async def cb_chat_refresh(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
-        await event.answer("Нет доступа", alert=True)
+        await event.answer(DENIED, alert=True)
         return
     account_user_id = int(event.pattern_match.group(1))
     page = int(event.pattern_match.group(2))
@@ -183,7 +178,7 @@ async def cb_chat_refresh(event: events.CallbackQuery.Event) -> None:
             msg = f"Ошибка: {reason}"
         await render_menu(
             event,
-            f"**⚠ Обновление групп**\n\n{msg}",
+            screen("⚠️", "Обновление групп", msg),
             [
                 back_row(f"acc_chats_{account_user_id}".encode()),
                 back_home_row(),
@@ -193,7 +188,7 @@ async def cb_chat_refresh(event: events.CallbackQuery.Event) -> None:
     except Exception as exc:
         await render_menu(
             event,
-            f"**⚠ Обновление групп**\n\nНе удалось: `{type(exc).__name__}`",
+            screen("⚠️", "Обновление групп", f"Не удалось: `{type(exc).__name__}`"),
             [
                 back_row(f"acc_chats_{account_user_id}".encode()),
                 back_home_row(),
@@ -217,7 +212,7 @@ async def cb_chat_refresh(event: events.CallbackQuery.Event) -> None:
 @bot.on(events.CallbackQuery(pattern=rb"^chat_sel_(\d+)_(-?\d+)_(\d+)$"))
 async def cb_chat_sel(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
-        await event.answer("Нет доступа", alert=True)
+        await event.answer(DENIED, alert=True)
         return
     account_user_id = int(event.pattern_match.group(1))
     chat_id = int(event.pattern_match.group(2))
@@ -235,7 +230,7 @@ async def cb_chat_sel(event: events.CallbackQuery.Event) -> None:
 @bot.on(events.CallbackQuery(pattern=rb"^chat_exc_(\d+)_(-?\d+)_(\d+)$"))
 async def cb_chat_exc(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
-        await event.answer("Нет доступа", alert=True)
+        await event.answer(DENIED, alert=True)
         return
     account_user_id = int(event.pattern_match.group(1))
     chat_id = int(event.pattern_match.group(2))

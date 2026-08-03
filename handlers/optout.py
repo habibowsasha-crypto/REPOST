@@ -1,194 +1,123 @@
-"""Admin Opt-out UI: list and remove bans."""
+"""Opt-out management UI — unified style."""
 
 from __future__ import annotations
 
-import re
-
-from telethon import Button, events
+from telethon import events
 
 from config import bot, is_admin
 from services import opt_out as opt_out_svc
 from services.admin_state import clear_state, get_state, set_state
-from services.menu_ui import back_home_row, back_row, render_menu
+from services.menu_ui import render_menu
+from services.ui import (
+    DENIED,
+    back_home_row,
+    back_row,
+    btn,
+    join,
+    kv,
+    notice,
+    screen,
+)
 
-_PAGE = 15
 
-
-def _optout_home_text() -> str:
+def _optout_text() -> str:
     total = opt_out_svc.count()
-    return (
-        "**🚫 Opt-out**\n\n"
-        f"В списке: **{total}**\n\n"
-        "Этим пользователям бот больше не пишет "
-        "(после «не пиши» / агрессии или вручную).\n\n"
-        "Можно снять запрет по кнопке в списке или вводом user id."
+    rows = opt_out_svc.list_all(limit=20)
+    if not rows:
+        body = "Список пуст — никто не в opt-out."
+    else:
+        lines = []
+        for r in rows:
+            tid = r.get("user_id")
+            reason = (r.get("reason") or "")[:40]
+            lines.append(f"• `{tid}`" + (f" — {reason}" if reason else ""))
+        body = join(f"Показано {len(rows)} из {total}:", *lines)
+    return screen(
+        "🚫",
+        "Opt-out",
+        kv("Всего", str(total)),
+        body,
+        "Этим людям бот больше не пишет.",
     )
 
 
-async def show_optout_menu(event, *, edit: bool = True) -> None:
-    await render_menu(
-        event,
-        _optout_home_text(),
-        [
-            [Button.inline("📋 Список", b"optout_list")],
-            [Button.inline("✅ Снять запрет (ввести id)", b"optout_remove")],
-            [Button.inline("➕ Добавить в opt-out", b"optout_add")],
-            back_home_row(),
-        ],
-        edit=edit,
-    )
-
-
-async def show_optout_list(event, page: int = 0, *, edit: bool = True) -> None:
-    rows = opt_out_svc.list_all(limit=200)
-    total = len(rows)
-    if total == 0:
-        await render_menu(
-            event,
-            "**📋 Opt-out список**\n\nПока пусто.",
-            [
-                [Button.inline("➕ Добавить", b"optout_add")],
-                back_row(b"menu_optout"),
-                back_home_row(),
-            ],
-            edit=edit,
-        )
-        return
-
-    pages = max(1, (total + _PAGE - 1) // _PAGE)
-    page = max(0, min(int(page), pages - 1))
-    chunk = rows[page * _PAGE : (page + 1) * _PAGE]
-
-    lines = [f"**📋 Opt-out** (стр. {page + 1}/{pages}, всего {total})\n"]
-    buttons: list[list[Button]] = []
-    for row in chunk:
-        uid = int(row["user_id"])
-        reason = (row.get("reason") or "-")[:40]
-        created = (row.get("created_at") or "")[:19]
-        lines.append(f"`{uid}` | {reason} | {created}")
-        buttons.append(
-            [Button.inline(f"✅ Снять {uid}", f"optout_del_{uid}".encode())]
-        )
-
-    nav: list[Button] = []
-    if page > 0:
-        nav.append(Button.inline("⬅️", f"optout_page_{page - 1}".encode()))
-    nav.append(Button.inline(f"{page + 1}/{pages}", f"optout_page_{page}".encode()))
-    if page + 1 < pages:
-        nav.append(Button.inline("➡️", f"optout_page_{page + 1}".encode()))
-    if nav:
-        buttons.append(nav)
-    buttons.append(back_row(b"menu_optout"))
-    buttons.append(back_home_row())
-    await render_menu(event, "\n".join(lines), buttons, edit=edit)
+def _optout_buttons():
+    return [
+        [btn("🔄 Обновить", b"menu_optout")],
+        [btn("➕ Добавить по ID", b"opt_add")],
+        [btn("➖ Снять по ID", b"opt_remove")],
+        back_home_row(),
+    ]
 
 
 @bot.on(events.CallbackQuery(data=b"menu_optout"))
 async def cb_menu_optout(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
-        await event.answer("Нет доступа", alert=True)
+        await event.answer(DENIED, alert=True)
         return
-    clear_state(int(event.sender_id))
-    await show_optout_menu(event)
+    await render_menu(event, _optout_text(), _optout_buttons())
     await event.answer()
 
 
-@bot.on(events.CallbackQuery(data=b"optout_list"))
-async def cb_optout_list(event: events.CallbackQuery.Event) -> None:
+@bot.on(events.CallbackQuery(data=b"opt_add"))
+async def cb_opt_add(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
-        await event.answer("Нет доступа", alert=True)
+        await event.answer(DENIED, alert=True)
         return
-    await show_optout_list(event, 0)
-    await event.answer()
-
-
-@bot.on(events.CallbackQuery(pattern=rb"^optout_page_(\d+)$"))
-async def cb_optout_page(event: events.CallbackQuery.Event) -> None:
-    if not is_admin(event.sender_id):
-        await event.answer("Нет доступа", alert=True)
-        return
-    page = int(event.pattern_match.group(1))
-    await show_optout_list(event, page)
-    await event.answer()
-
-
-@bot.on(events.CallbackQuery(pattern=rb"^optout_del_(\d+)$"))
-async def cb_optout_del(event: events.CallbackQuery.Event) -> None:
-    if not is_admin(event.sender_id):
-        await event.answer("Нет доступа", alert=True)
-        return
-    uid = int(event.pattern_match.group(1))
-    ok = opt_out_svc.remove(uid)
-    await show_optout_list(event, 0)
-    await event.answer("Снято" if ok else "Не найден")
-
-
-@bot.on(events.CallbackQuery(data=b"optout_remove"))
-async def cb_optout_remove(event: events.CallbackQuery.Event) -> None:
-    if not is_admin(event.sender_id):
-        await event.answer("Нет доступа", alert=True)
-        return
-    set_state(int(event.sender_id), flow="optout", step="remove")
-    await render_menu(
-        event,
-        "**✅ Снять запрет**\n\n"
-        "Отправьте **user id** числом (например `123456789`).\n"
+    set_state(event.sender_id, flow="optout", step="opt_add")
+    text = screen(
+        "➕",
+        "Добавить в opt-out",
+        "Пришли **числовой user id** одним сообщением.",
         "Отмена: /cancel",
-        [[Button.inline("❌ Отмена", b"menu_optout")]],
     )
+    await render_menu(event, text, [back_row(b"menu_optout"), back_home_row()])
     await event.answer()
 
 
-@bot.on(events.CallbackQuery(data=b"optout_add"))
-async def cb_optout_add(event: events.CallbackQuery.Event) -> None:
+@bot.on(events.CallbackQuery(data=b"opt_remove"))
+async def cb_opt_remove(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
-        await event.answer("Нет доступа", alert=True)
+        await event.answer(DENIED, alert=True)
         return
-    set_state(int(event.sender_id), flow="optout", step="add")
-    await render_menu(
-        event,
-        "**➕ Добавить в opt-out**\n\n"
-        "Отправьте **user id** числом.\n"
+    set_state(event.sender_id, flow="optout", step="opt_remove")
+    text = screen(
+        "➖",
+        "Снять opt-out",
+        "Пришли **числовой user id** одним сообщением.",
         "Отмена: /cancel",
-        [[Button.inline("❌ Отмена", b"menu_optout")]],
     )
+    await render_menu(event, text, [back_row(b"menu_optout"), back_home_row()])
     await event.answer()
 
 
 @bot.on(
     events.NewMessage(
-        func=lambda e: (
-            is_admin(e.sender_id)
-            and (get_state(int(e.sender_id)) or {}).get("flow") == "optout"
-            and not (e.raw_text or "").strip().startswith("/")
-        )
+        func=lambda e: e.is_private
+        and is_admin(e.sender_id)
+        and (get_state(int(e.sender_id)) or {}).get("flow") == "optout"
     )
 )
-async def optout_text_handler(event: events.NewMessage.Event) -> None:
-    admin_id = int(event.sender_id)
-    state = get_state(admin_id) or {}
-    step = state.get("step")
+async def on_optout_text(event: events.NewMessage.Event) -> None:
+    st = get_state(event.sender_id) or {}
+    step = st.get("step")
+    if step not in {"opt_add", "opt_remove"}:
+        return
     raw = (event.raw_text or "").strip()
-    if not re.fullmatch(r"\d{5,15}", raw):
-        await event.respond("⚠ Нужен числовой user id (5–15 цифр). Или /cancel")
+    if raw.startswith("/"):
         return
-    uid = int(raw)
-
-    if step == "remove":
-        ok = opt_out_svc.remove(uid)
-        clear_state(admin_id)
-        if ok:
-            await event.respond(f"✅ Запрет снят для `{uid}`.")
-        else:
-            await event.respond(f"В opt-out не было `{uid}`.")
-        await show_optout_menu(event, edit=False)
+    if not raw.lstrip("-").isdigit():
+        await event.respond(notice("warn", "Нужен числовой user id. /cancel — отмена."))
         return
-
-    if step == "add":
-        opt_out_svc.add(uid, reason="manual_admin")
-        clear_state(admin_id)
-        await event.respond(f"✅ `{uid}` добавлен в opt-out.")
-        await show_optout_menu(event, edit=False)
-        return
-
-    clear_state(admin_id)
+    target_id = int(raw)
+    clear_state(event.sender_id)
+    if step == "opt_add":
+        opt_out_svc.add(target_id, reason="manual_admin")
+        msg = notice("ok", f"`{target_id}` добавлен в opt-out.")
+    else:
+        opt_out_svc.remove(target_id)
+        msg = notice("ok", f"`{target_id}` снят с opt-out.")
+    await event.respond(
+        screen("🚫", "Opt-out", msg),
+        buttons=[back_home_row()],
+    )
