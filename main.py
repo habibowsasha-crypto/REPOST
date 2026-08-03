@@ -1,4 +1,4 @@
-"""Entry point: Channel DM Bot (v1.0.24)."""
+"""Entry point: Channel DM Bot (v1.0.25)."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ def configure_logging() -> None:
 
 def run() -> None:
     configure_logging()
-    logger.info("Channel DM Bot - v1.0.24 starting")
+    logger.info("Channel DM Bot - v1.0.25 starting")
     logger.info("DB_PATH={}", DB_PATH)
 
     if not ADMIN_ID_LIST:

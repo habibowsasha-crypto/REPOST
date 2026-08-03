@@ -3,29 +3,60 @@
 from __future__ import annotations
 
 import random
+import re
 
-# Short trading / soft hooks. No channel link, no hard pitch.
+# Mix: soft permission + light trading. No channel link, no hard pitch.
 FIRST_DM_TEMPLATES: list[str] = [
+    # soft / simple
+    "Можно спросить?",
+    "Привет, можно на секунду?",
+    "Есть минутка? Хотел спросить",
+    "Не отвлекаю? Можно вопрос",
+    "А можешь помочь новичку?",
+    "Есть вопрос про трейдинг, можно?",
+    "Можно коротко спросить?",
+    "Привет, не помешаю?",
+    "Салют, есть секунда?",
+    # trading light
     "Слушай, а ты щас торгуешь?",
     "А ты сам торгуешь или по сигналам?",
-    "А не подскажешь новичку?",
-    "По какой стратегии ты торгуешь?",
-    "Слушай, а ты много потерял в трейдинге? Можно спросить",
-    "Ты сейчас в рынке или на паузе?",
-    "Сам сделки открываешь или по сигналам идёшь?",
-    "Есть минута? Хотел спросить по трейду",
-    "Слушай, ты вообще в трейдинг ещё?",
-    "А ты по своей стратегии или чужие сигналы берёшь?",
     "Новичку не подскажешь по трейду?",
+    "По какой стратегии ты торгуешь?",
+    "Ты сейчас в рынке или на паузе?",
     "Щас торгуешь или уже отошёл?",
+    "Слушай, ты вообще в трейдинг ещё?",
+    "Есть минута? Хотел спросить по трейду",
 ]
+
+# Semantic buckets — avoid repeating same bucket in a row when possible
+_BUCKETS: dict[str, re.Pattern[str]] = {
+    "signals": re.compile(r"сигнал", re.I),
+    "losses": re.compile(r"убыт|потеря|слил|минус", re.I),
+    "strategy": re.compile(r"стратег", re.I),
+    "active": re.compile(r"торгу|рынк|паузе|отош", re.I),
+    "newbie": re.compile(r"новичк|помо", re.I),
+    "soft": re.compile(r"можно\s+спросить|есть\s+(секунд|минут)|не\s+отвлек|не\s+помеш", re.I),
+}
+
+
+def _bucket(text: str) -> str:
+    for name, rx in _BUCKETS.items():
+        if rx.search(text or ""):
+            return name
+    return "other"
 
 
 def pick_first_dm(*, recent: list[str] | None = None) -> str:
-    """Pick a random template, avoiding recent exact matches when possible."""
+    """Pick template avoiding recent exact text and recent semantic buckets."""
     recent = recent or []
     recent_set = set(recent)
+    recent_buckets = {_bucket(t) for t in recent[:8]}
+
     pool = [t for t in FIRST_DM_TEMPLATES if t not in recent_set]
     if not pool:
         pool = list(FIRST_DM_TEMPLATES)
+
+    diversified = [t for t in pool if _bucket(t) not in recent_buckets]
+    if diversified:
+        pool = diversified
     return random.choice(pool)

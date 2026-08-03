@@ -93,7 +93,28 @@ def validate_first_dm(text: str) -> tuple[bool, str]:
     return True, "ok"
 
 
+def _too_similar_recent(text: str, recent: list[str]) -> bool:
+    """True if text shares a heavy theme with many of the last few DMs."""
+    tl = (text or "").lower()
+    keys = []
+    if "сигнал" in tl:
+        keys.append("сигнал")
+    if any(x in tl for x in ("убыт", "потеря", "слил")):
+        keys.append("loss")
+    if not keys:
+        return False
+    hit = 0
+    for r in recent[:5]:
+        rl = (r or "").lower()
+        if "сигнал" in keys and "сигнал" in rl:
+            hit += 1
+        if "loss" in keys and any(x in rl for x in ("убыт", "потеря", "слил")):
+            hit += 1
+    return hit >= 2
+
+
 def sanitize_dashes(text: str) -> str:
+
     out = text
     for d in _BAD_DASHES:
         out = out.replace(d, "-")
@@ -113,8 +134,10 @@ async def generate_first_dm() -> str:
             if text:
                 text = sanitize_dashes(text)
                 ok, reason = validate_first_dm(text)
-                if ok and text not in recent:
+                if ok and text not in recent and not _too_similar_recent(text, recent):
                     return text
+                if ok and text not in recent and _too_similar_recent(text, recent):
+                    reason = "theme_repeat"
                 logger.warning(
                     "AI first DM rejected ({}): {!r}", reason, (text or "")[:80]
                 )
@@ -123,7 +146,11 @@ async def generate_first_dm() -> str:
                 if text2:
                     text2 = sanitize_dashes(text2)
                     ok2, reason2 = validate_first_dm(text2)
-                    if ok2 and text2 not in recent:
+                    if (
+                        ok2
+                        and text2 not in recent
+                        and not _too_similar_recent(text2, recent)
+                    ):
                         return text2
                     logger.warning(
                         "AI first DM retry rejected ({}): {!r}",
@@ -146,9 +173,21 @@ async def _openai_first_dm(recent: list[str]) -> Optional[str]:
         sample = "\n".join(f"- {t}" for t in recent[:15])
         avoid = f"\nНе повторяй эти недавние формулировки:\n{sample}\n"
 
+    # Nudge model away from repeating recent themes (signals / losses).
+    theme_hint = (
+        "Сейчас предпочти тип 1 или 2 (простой вопрос / помощь новичку), "
+        "не про сигналы и не про убытки."
+    )
+    recent_l = " ".join(recent[:6]).lower()
+    if "сигнал" not in recent_l and "убыт" not in recent_l and "потеря" not in recent_l:
+        theme_hint = (
+            "Выбери любой тип 1–3, но формулировка должна быть новой."
+        )
+
     user = (
         "Сгенерируй одно новое короткое первое сообщение для Telegram ЛС.\n"
-        "Только текст сообщения, без кавычек и без пояснений."
+        + theme_hint
+        + "\nТолько текст сообщения, без кавычек и без пояснений."
         + avoid
     )
 
