@@ -94,12 +94,6 @@ async def _worker_loop() -> None:
                     logger.warning("Released {} stale claimed leads", n)
             except Exception as sc_exc:
                 logger.exception("stale claims release: {}", sc_exc)
-            try:
-                from services import spambot as spambot_svc
-
-                await spambot_svc.process_due_checks()
-            except Exception as sp_exc:
-                logger.exception("SpamBot due checks error: {}", sp_exc)
         timeout = 2.0 if did else 5.0
         try:
             await asyncio.wait_for(_stop_event.wait(), timeout=timeout)
@@ -170,6 +164,9 @@ async def _tick() -> bool:
         queue_svc.release_claim(target_id, as_pending=True)
         return False
 
+    # One AI/local text per tick — reuse across account fallbacks.
+    text = await generate_first_dm()
+
     for acc in ordered:
         account_id = int(acc["user_id"])
         ok, _reason = pacing.account_is_send_ready(acc)
@@ -179,8 +176,10 @@ async def _tick() -> bool:
         if client is None:
             continue
 
-        queue_svc.reassign_claim(target_id, account_id)
-        text = await generate_first_dm()
+        # Previous attempt may have released the claim (PeerFlood/error).
+        if not queue_svc.ensure_claim(target_id, account_id):
+            return True  # lead already sent/cancelled
+
         result = await _send_first_dm(client, account_id, lead, text)
         if result == "sent":
             phrases_svc.remember(phrases_svc.KIND_FIRST_DM, text)
@@ -188,11 +187,19 @@ async def _tick() -> bool:
             pacing.mark_global_sent()
             return True
         if result == "flood":
-            pacing.mark_global_sent()
+            # Account-level cooldown only — do not stall global spacing for all.
             return True
-        if result in {"privacy", "invalid", "no_entity"}:
-            return True  # lead closed or will retry later
-        # try next preferred account
+        if result == "peerflood":
+            # Account paused; try next ready account for this lead.
+            continue
+        if result in {"privacy", "invalid"}:
+            return True  # lead closed
+        if result == "no_entity":
+            # Try next account that may resolve entity.
+            continue
+        if result == "error":
+            # Soft error: try next account via ensure_claim.
+            continue
     # Nobody could send — release if still claimed
     queue_svc.release_claim(target_id, as_pending=True)
     return False

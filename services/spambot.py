@@ -11,7 +11,6 @@ from telethon import TelegramClient
 
 from config import (
     ADMIN_ID_LIST,
-    PEER_FLOOD_MIN_COOLDOWN_MINUTES,
     SPAMBOT_AUTO_RESUME,
     bot,
 )
@@ -38,18 +37,12 @@ def _account_label(account_user_id: int) -> str:
     return accounts_svc.format_account_label(acc, include_id=True)
 
 
-def _notify_peerflood(label: str, minutes: int) -> str:
-    return (
-        f"⚠️ Аккаунт **{label}** словил PeerFlood.\n"
-        f"Ставлю паузу на **{minutes} мин** и спрашиваю @SpamBot."
-    )
-
-
-def _notify_free_auto(label: str) -> str:
-    return (
-        f"✅ @SpamBot: **{label}** свободен.\n"
-        f"Снимаю паузу (auto-resume)."
-    )
+def _notify_peerflood(label: str, seconds: int) -> str:
+    from services import runtime as runtime_svc
+    pause = runtime_svc.format_peer_flood_pause(int(seconds))
+    line1 = f"⚠️ Аккаунт **{label}** словил PeerFlood."
+    line2 = f"Ставлю паузу на **{pause}** и спрашиваю @SpamBot."
+    return line1 + "\n" + line2
 
 
 def _notify_free_manual(label: str) -> str:
@@ -165,7 +158,9 @@ async def on_peer_flood(account_user_id: int) -> None:
     Pauses account, sets min cooldown, schedules SpamBot check.
     """
     account_user_id = int(account_user_id)
-    min_until = _now() + dt.timedelta(minutes=int(PEER_FLOOD_MIN_COOLDOWN_MINUTES))
+    from services import runtime as runtime_svc
+    seconds = int(runtime_svc.get_peer_flood_min_seconds())
+    min_until = _now() + dt.timedelta(seconds=seconds)
     pacing.set_paused(account_user_id, "PeerFlood", paused=True)
     # Also set cooldown so resume cannot happen before min window.
     conn = get_connection()
@@ -195,7 +190,7 @@ async def on_peer_flood(account_user_id: int) -> None:
     )
     label = _account_label(account_user_id)
     await notify_admins(
-        _notify_peerflood(label, PEER_FLOOD_MIN_COOLDOWN_MINUTES)
+        _notify_peerflood(label, seconds)
     )
     # Immediate check attempt
     await check_account(account_user_id, force=True)

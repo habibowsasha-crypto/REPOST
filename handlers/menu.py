@@ -21,7 +21,6 @@ from config import (
     DM_GLOBAL_SPACING_MAX,
     DM_GLOBAL_SPACING_MIN,
     OPENAI_API_KEY,
-    PEER_FLOOD_MIN_COOLDOWN_MINUTES,
     SPAMBOT_AUTO_RESUME,
     bot,
     is_admin,
@@ -313,8 +312,11 @@ async def cb_bc_status(event: events.CallbackQuery.Event) -> None:
 
 
 def _pacing_text() -> str:
+    from services import runtime as runtime_svc
+
     acc_min_m = DM_ACCOUNT_INTERVAL_MIN // 60
     acc_max_m = DM_ACCOUNT_INTERVAL_MAX // 60
+    pf = runtime_svc.format_peer_flood_pause()
     return screen(
         "⚙️",
         "Темп",
@@ -324,11 +326,21 @@ def _pacing_text() -> str:
             kv("Лимит / сутки", str(DM_DAILY_LIMIT_PER_ACCOUNT)),
             kv("Ответ AI", f"{AI_REPLY_DELAY_MIN}–{AI_REPLY_DELAY_MAX} сек"),
             kv("Авто-ссылка", f"{AI_AUTO_LINK_DELAY_MIN}–{AI_AUTO_LINK_DELAY_MAX} сек"),
-            kv("PeerFlood cooldown", f"{PEER_FLOOD_MIN_COOLDOWN_MINUTES} мин"),
+            kv("PeerFlood пауза", pf, icon="⚠️"),
             kv("SpamBot auto-resume", "да" if SPAMBOT_AUTO_RESUME else "нет"),
         ),
-        "Меняется через Variables в Railway.",
+        "Интервалы DM — через Railway Variables.\nPeerFlood паузу можно менять кнопками ниже.",
     )
+
+
+def _pacing_buttons():
+    from services.ui import btn
+
+    return [
+        [btn("⚠️ Пауза PeerFlood", b"bc_peerflood")],
+        back_row(b"menu_broadcast"),
+        back_home_row(),
+    ]
 
 
 @bot.on(events.CallbackQuery(data=b"bc_pacing"))
@@ -336,12 +348,124 @@ async def cb_bc_pacing(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
         await event.answer(DENIED, alert=True)
         return
+    await render_menu(event, _pacing_text(), _pacing_buttons())
+    await event.answer()
+
+
+def _peerflood_screen() -> str:
+    from services import runtime as runtime_svc
+
+    pf = runtime_svc.format_peer_flood_pause()
+    return screen(
+        "⚠️",
+        "Пауза PeerFlood",
+        f"Сейчас: **{pf}**",
+        "После PeerFlood аккаунт ждёт минимум столько,",
+        "даже если @SpamBot уже «зелёный».",
+        "Выбери пресет или свой вариант (в **секундах**):",
+    )
+
+
+def _peerflood_buttons():
+    from services.ui import btn
+
+    return [
+        [
+            btn("5 мин", b"pf_set_300"),
+            btn("15 мин", b"pf_set_900"),
+        ],
+        [
+            btn("30 мин", b"pf_set_1800"),
+            btn("60 мин", b"pf_set_3600"),
+        ],
+        [btn("✏️ Свой вариант (сек)", b"pf_custom")],
+        back_row(b"bc_pacing"),
+        back_home_row(),
+    ]
+
+
+@bot.on(events.CallbackQuery(data=b"bc_peerflood"))
+async def cb_bc_peerflood(event: events.CallbackQuery.Event) -> None:
+    if not is_admin(event.sender_id):
+        await event.answer(DENIED, alert=True)
+        return
+    await render_menu(event, _peerflood_screen(), _peerflood_buttons())
+    await event.answer()
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^pf_set_(\d+)$"))
+async def cb_pf_set(event: events.CallbackQuery.Event) -> None:
+    if not is_admin(event.sender_id):
+        await event.answer(DENIED, alert=True)
+        return
+    from services import runtime as runtime_svc
+
+    seconds = int(event.pattern_match.group(1))
+    stored = runtime_svc.set_peer_flood_min_seconds(seconds)
+    label = runtime_svc.format_peer_flood_pause(stored)
+    await render_menu(event, _peerflood_screen(), _peerflood_buttons())
+    await event.answer(f"Пауза: {label}")
+
+
+@bot.on(events.CallbackQuery(data=b"pf_custom"))
+async def cb_pf_custom(event: events.CallbackQuery.Event) -> None:
+    if not is_admin(event.sender_id):
+        await event.answer(DENIED, alert=True)
+        return
+    from services.admin_state import set_state
+    from services import runtime as runtime_svc
+
+    set_state(event.sender_id, flow="peerflood", step="custom_seconds")
+    pf = runtime_svc.format_peer_flood_pause()
+    text = screen(
+        "✏️",
+        "Свой вариант",
+        f"Сейчас: **{pf}**",
+        "Пришли число **секунд** одним сообщением.",
+        f"Допустимо: **{runtime_svc.PEER_FLOOD_MIN_ALLOWED_SEC}–{runtime_svc.PEER_FLOOD_MAX_ALLOWED_SEC}** сек.",
+        "Примеры: `300` (=5 мин), `900` (=15 мин)",
+        "Отмена: /cancel",
+    )
     await render_menu(
         event,
-        _pacing_text(),
-        [back_row(b"menu_broadcast"), back_home_row()],
+        text,
+        [back_row(b"bc_peerflood"), back_home_row()],
     )
     await event.answer()
+
+
+def _is_peerflood_flow(event) -> bool:
+    if not event.is_private:
+        return False
+    if not is_admin(event.sender_id):
+        return False
+    from services.admin_state import get_state
+
+    st = get_state(int(event.sender_id)) or {}
+    return st.get("flow") == "peerflood"
+
+
+@bot.on(events.NewMessage(func=_is_peerflood_flow))
+async def on_peerflood_custom(event: events.NewMessage.Event) -> None:
+    from services.admin_state import clear_state, get_state
+    from services import runtime as runtime_svc
+
+    st = get_state(event.sender_id) or {}
+    if st.get("step") != "custom_seconds":
+        return
+    raw = (event.raw_text or "").strip()
+    if raw.startswith("/"):
+        return
+    if not raw.isdigit():
+        await event.respond("Нужно целое число **секунд**. Пример: `300`")
+        return
+    stored = runtime_svc.set_peer_flood_min_seconds(int(raw))
+    label = runtime_svc.format_peer_flood_pause(stored)
+    clear_state(event.sender_id)
+    await event.respond(
+        screen("⚠️", "Пауза PeerFlood", f"Сохранено: **{label}** (`{stored}` сек)"),
+        buttons=[back_home_row()],
+    )
 
 
 @bot.on(events.CallbackQuery(data=b"bc_link"))

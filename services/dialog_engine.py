@@ -130,11 +130,6 @@ async def _handle_incoming_private_body(
         return
 
     if stage == store.STAGE_EXPLAINED:
-        store.set_stage(
-            target_user_id,
-            store.STAGE_EXPLAINED,
-            clear_auto_link=True,
-        )
         if ai_dialog.is_soft_decline(text):
             await _send_and_close(
                 account_user_id,
@@ -152,6 +147,14 @@ async def _handle_incoming_private_body(
         )
         ok = await _send_private(account_user_id, target_user_id, reply)
         if not ok:
+            # Keep stage explained; if auto_link was pending, push it a bit later.
+            later = (_now() + dt.timedelta(seconds=_auto_link_delay())).isoformat()
+            if not link_already:
+                store.set_stage(
+                    target_user_id,
+                    store.STAGE_EXPLAINED,
+                    auto_link_at=later,
+                )
             return
         store.append_history(target_user_id, "assistant", reply)
         from config import CHANNEL_LINK
@@ -241,12 +244,21 @@ async def _send_and_close(
     reason: str,
 ) -> None:
     await asyncio.sleep(min(5.0, _delay_reply()))
-    await _send_private(account_user_id, target_user_id, text)
-    store.append_history(target_user_id, "assistant", text)
+    ok = await _send_private(account_user_id, target_user_id, text)
+    if ok:
+        store.append_history(target_user_id, "assistant", text)
+    else:
+        logger.warning(
+            "Close message failed target={} account={} reason={}",
+            target_user_id,
+            account_user_id,
+            reason,
+        )
+    # Always stop our side; hard-stop still opts out even if apology failed to send.
     store.set_stage(
         target_user_id,
         store.STAGE_CLOSED,
-        bump_outgoing=True,
+        bump_outgoing=bool(ok),
         clear_auto_link=True,
     )
     store.mark_contact_completed(target_user_id)

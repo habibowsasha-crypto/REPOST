@@ -46,7 +46,7 @@ def upsert_from_activity(
         return "skipped_opt_out"
 
     contact = _contact_status(target_user_id)
-    if contact in {"in_progress", "completed"}:
+    if contact in {"sending", "in_progress", "completed"}:
         return f"skipped_contact_{contact}"
 
     now = _now_iso()
@@ -206,18 +206,29 @@ def format_lead_line(lead: dict[str, Any]) -> str:
 
 
 def claim_random_pending(account_user_id: int) -> dict[str, Any] | None:
-    """Claim one random eligible pending lead for account. Returns lead dict or None."""
+    """Claim one random eligible pending lead for account. Returns lead dict or None.
+
+    Skips opt-out users and anyone with contact status sending/in_progress/completed.
+    """
     now = _now_iso()
     conn = get_connection()
     with db_lock(), conn:
         row = conn.execute(
             """
-            SELECT target_user_id, username, first_name, last_name,
-                   source_chat_id, source_account_user_id, status,
-                   eligible_at, last_seen_at, created_at
-              FROM leads
-             WHERE status=?
-               AND (eligible_at IS NULL OR eligible_at <= ?)
+            SELECT l.target_user_id, l.username, l.first_name, l.last_name,
+                   l.source_chat_id, l.source_account_user_id, l.status,
+                   l.eligible_at, l.last_seen_at, l.created_at
+              FROM leads l
+             WHERE l.status=?
+               AND (l.eligible_at IS NULL OR l.eligible_at <= ?)
+               AND NOT EXISTS (
+                     SELECT 1 FROM opt_out o WHERE o.user_id = l.target_user_id
+               )
+               AND NOT EXISTS (
+                     SELECT 1 FROM contacts c
+                      WHERE c.target_user_id = l.target_user_id
+                        AND c.status IN ('sending', 'in_progress', 'completed')
+               )
              ORDER BY RANDOM()
              LIMIT 1
             """,
@@ -329,7 +340,13 @@ def cancel_lead(target_user_id: int, reason: str | None = None) -> None:
 
 
 def release_stale_claims(*, older_than_seconds: int = 900) -> int:
-    """Recover stuck claims. If contact already in_progress → mark sent (anti-dupe)."""
+    """Recover stuck claims.
+
+    - contact status 'sending' (pre-send) → back to pending, drop contact
+      (send may never have happened — do NOT mark sent)
+    - contact in_progress/completed (post successful mark_sent) → mark lead sent
+    - no contact → back to pending
+    """
     import datetime as dt
 
     cutoff = (
@@ -356,6 +373,7 @@ def release_stale_claims(*, older_than_seconds: int = 900) -> int:
             ).fetchone()
             cstatus = str(contact["status"]) if contact else None
             if cstatus in {"in_progress", "completed"}:
+                # Message was acknowledged as sent at least once.
                 conn.execute(
                     """
                     UPDATE leads
@@ -366,6 +384,7 @@ def release_stale_claims(*, older_than_seconds: int = 900) -> int:
                     (STATUS_SENT, now, tid),
                 )
             else:
+                # 'sending' or no contact — safe to retry as pending.
                 conn.execute(
                     """
                     UPDATE leads
@@ -377,6 +396,11 @@ def release_stale_claims(*, older_than_seconds: int = 900) -> int:
                     """,
                     (STATUS_PENDING, now, tid),
                 )
+                if cstatus == "sending":
+                    conn.execute(
+                        "DELETE FROM contacts WHERE target_user_id=? AND status='sending'",
+                        (tid,),
+                    )
             released += 1
     return released
 
@@ -404,16 +428,20 @@ MAX_SEND_ATTEMPTS = 5
 
 
 def mark_sending(target_user_id: int, account_user_id: int) -> None:
-    """Create in_progress contact BEFORE send to prevent duplicate first DM on crash."""
+    """Mark contact as 'sending' BEFORE network send.
+
+    Only mark_sent upgrades to in_progress (real success).
+    Stale 'sending' is released back to pending — no false sent.
+    """
     now = _now_iso()
     conn = get_connection()
     with db_lock(), conn:
         conn.execute(
             """
             INSERT INTO contacts (target_user_id, status, sender_account_id, updated_at)
-            VALUES (?, 'in_progress', ?, ?)
+            VALUES (?, 'sending', ?, ?)
             ON CONFLICT(target_user_id) DO UPDATE SET
-                status='in_progress',
+                status='sending',
                 sender_account_id=excluded.sender_account_id,
                 updated_at=excluded.updated_at
             """,
@@ -428,6 +456,62 @@ def mark_sending(target_user_id: int, account_user_id: int) -> None:
             """,
             (int(account_user_id), now, int(target_user_id)),
         )
+
+
+def ensure_claim(target_user_id: int, account_user_id: int) -> bool:
+    """Make sure lead is claimed by account. Returns False if lead is not claimable."""
+    now = _now_iso()
+    conn = get_connection()
+    with db_lock(), conn:
+        row = conn.execute(
+            "SELECT status FROM leads WHERE target_user_id=?",
+            (int(target_user_id),),
+        ).fetchone()
+        if not row:
+            return False
+        status = str(row["status"])
+        if status in {STATUS_SENT, STATUS_CANCELLED}:
+            return False
+        if status == STATUS_PENDING:
+            cur = conn.execute(
+                """
+                UPDATE leads
+                   SET status=?,
+                       claimed_by_account=?,
+                       claimed_at=?,
+                       updated_at=?
+                 WHERE target_user_id=?
+                   AND status=?
+                """,
+                (
+                    STATUS_CLAIMED,
+                    int(account_user_id),
+                    now,
+                    now,
+                    int(target_user_id),
+                    STATUS_PENDING,
+                ),
+            )
+            return int(cur.rowcount or 0) == 1
+        # already claimed — reassign sender
+        conn.execute(
+            """
+            UPDATE leads
+               SET claimed_by_account=?,
+                   claimed_at=?,
+                   updated_at=?
+             WHERE target_user_id=?
+               AND status=?
+            """,
+            (
+                int(account_user_id),
+                now,
+                now,
+                int(target_user_id),
+                STATUS_CLAIMED,
+            ),
+        )
+        return True
 
 
 def reassign_claim(target_user_id: int, account_user_id: int) -> None:
@@ -484,14 +568,14 @@ def get_send_attempts(target_user_id: int) -> int:
 
 
 def clear_sending_contact(target_user_id: int) -> None:
-    """Remove in_progress contact if first DM did not actually complete."""
+    """Remove pre-send / in_progress contact if first DM did not complete."""
     conn = get_connection()
     with db_lock(), conn:
         conn.execute(
             """
             DELETE FROM contacts
              WHERE target_user_id=?
-               AND status='in_progress'
+               AND status IN ('sending', 'in_progress')
             """,
             (int(target_user_id),),
         )

@@ -1,4 +1,11 @@
-"""AI replies for post-first-DM funnel + stop detection."""
+"""AI replies for post-first-DM funnel + stop detection.
+
+Воронка (не small talk):
+1) First DM уже ушёл (короткий вопрос).
+2) Первый ответ юзера → generate_explain: ЗАЧЕМ написал (канал), БЕЗ ссылки.
+3) Тишина 60–120с → auto-link со ссылкой.
+4) Если юзер пишет дальше → кратко по делу + можно дать ссылку.
+"""
 
 from __future__ import annotations
 
@@ -33,10 +40,24 @@ _SOFT_NO_RE = re.compile(
 
 _BAD_DASHES = ("\u2014", "\u2013", "\u2212")
 
+# Small-talk that must NOT appear as "explain"
+_SMALLTALK_RE = re.compile(
+    r"(как\s+дела|что\s+делаешь|чем\s+занима|как\s+настроен|"
+    r"как\s+жизнь|что\s+нового|как\s+сам|как\s+ты\b|"
+    r"расскажи\s+о\s+себе|откуда\s+ты|сколько\s+лет)",
+    re.IGNORECASE,
+)
+
+_CHANNEL_HINT_RE = re.compile(
+    r"(канал|vip|вип|подписк|контент|пост|слив|бесплатн|закрыт)",
+    re.IGNORECASE,
+)
+
 _EXPLAIN_FALLBACKS = [
-    "По делу: есть бесплатный канал, туда падают посты из закрытых випок. Платить не нужно.",
-    "Коротко: бесплатный канал со сливами из платных VIP. Можно просто глянуть.",
-    "Суть такая - бесплатный канал, контент из закрытых випок без оплаты.",
+    "Написал не просто так: есть бесплатный канал, туда выкладывают посты из закрытых VIP. Платить не нужно.",
+    "Суть такая: бесплатный канал со сливами из платных випок. Можно просто глянуть.",
+    "Хотел поделиться: есть канал без оплаты, контент из закрытых VIP-чатов.",
+    "По делу: веду на бесплатный канал, где посты из закрытых випок. Без подписок на платное.",
 ]
 
 _LINK_FALLBACKS = [
@@ -81,27 +102,52 @@ def soft_close_text() -> str:
     )
 
 
+def _explain_ok(text: str) -> bool:
+    """Reject pure greetings / small talk as explain."""
+    t = (text or "").strip()
+    if not t or len(t) < 20:
+        return False
+    if _SMALLTALK_RE.search(t):
+        return False
+    # Must somehow point to channel idea
+    if not _CHANNEL_HINT_RE.search(t):
+        return False
+    if "http" in t.lower() or "t.me/" in t.lower():
+        return False
+    return True
+
+
 async def generate_explain(history: list[dict]) -> str:
-    """Explain channel WITHOUT link."""
+    """Explain WHY we wrote: free channel pitch. NO link. NO small talk."""
     recent = phrases_svc.recent_texts(phrases_svc.KIND_EXPLAIN, limit=20)
+    pitch = CHANNEL_PITCH or "бесплатный канал с постами из закрытых VIP"
+
     if AI_DM_ENABLED and OPENAI_API_KEY:
         try:
             text = await _openai_reply(
                 history,
                 instruction=(
-                    "Пользователь ответил на первое сообщение. "
-                    "Коротко (1-2 предложения) объясни, зачем написал: "
-                    f"{CHANNEL_PITCH}. "
-                    "Без ссылки, без давления, без длинного тире, только '-' если нужно. "
-                    "Не копируй шаблоны дословно."
+                    "Это НЕ светская беседа.\n"
+                    "Задача: одним-двумя предложениями объяснить, ЗАЧЕМ ты написал.\n"
+                    f"Суть оффера: {pitch}\n"
+                    "ЖЁСТКИЕ запреты:\n"
+                    "- не здоровайся снова (не пиши Привет/Здравствуй)\n"
+                    "- не спрашивай как дела / чем занимается / что нового\n"
+                    "- не задавай встречные вопросы ни о чём личном\n"
+                    "- без ссылок, без t.me, без http\n"
+                    "- без давления и обещаний дохода\n"
+                    "- только обычный дефис '-', без длинного тире\n"
+                    "Можно начать с 'По делу:' или сразу с сути.\n"
+                    "Только текст ответа, 1-2 предложения."
                 ),
             )
             if text:
                 text = _strip_em_dash(text)
                 if CHANNEL_LINK and CHANNEL_LINK in text:
                     text = text.replace(CHANNEL_LINK, "").strip()
-                if text and text not in recent and "http" not in text.lower():
+                if _explain_ok(text) and text not in recent:
                     return text
+                logger.warning("explain rejected by validator: {!r}", (text or "")[:100])
         except Exception as exc:
             logger.exception("generate_explain failed: {}", exc)
 
@@ -110,7 +156,7 @@ async def generate_explain(history: list[dict]) -> str:
 
 
 async def generate_link_wrap(history: list[dict]) -> str:
-    """Soft CTA + channel link."""
+    """Soft CTA + channel link (auto after silence or explicit)."""
     link = CHANNEL_LINK or "ссылка не задана (CHANNEL_LINK)"
     recent = phrases_svc.recent_texts(phrases_svc.KIND_LINK, limit=20)
     if AI_DM_ENABLED and OPENAI_API_KEY:
@@ -118,9 +164,10 @@ async def generate_link_wrap(history: list[dict]) -> str:
             text = await _openai_reply(
                 history,
                 instruction=(
-                    "Нужно мягко дать ссылку на бесплатный канал. "
-                    f"Ссылка обязательно одна и точная: {link} "
-                    "Текст 1-2 предложения: можно просто глянуть, подписываться не обязательно. "
+                    "Нужно мягко дать ссылку на канал.\n"
+                    f"Ссылка обязательно одна и точная: {link}\n"
+                    "1-2 предложения: можно просто глянуть, подписываться не обязательно.\n"
+                    "Не здоровайся, не спрашивай как дела.\n"
                     "Без давления, без длинного тире."
                 ),
             )
@@ -128,6 +175,9 @@ async def generate_link_wrap(history: list[dict]) -> str:
                 text = _strip_em_dash(text)
                 if link not in text and CHANNEL_LINK:
                     text = f"{text}\n{link}"
+                if text not in recent and "http" not in text.lower().replace(link.lower(), ""):
+                    # link itself may contain t.me - ok
+                    return text
                 if text not in recent:
                     return text
         except Exception as exp:
@@ -140,31 +190,51 @@ async def generate_link_wrap(history: list[dict]) -> str:
 
 
 async def generate_contextual_reply(history: list[dict], *, include_link: bool) -> str:
-    """Reply when user writes during/after explain."""
+    """
+    User wrote again after explain.
+    Not small talk: short answer + pitch, optionally with link.
+    """
     link = CHANNEL_LINK or ""
+    pitch = CHANNEL_PITCH or "бесплатный канал с постами из закрытых VIP"
+
     if AI_DM_ENABLED and OPENAI_API_KEY:
         try:
-            extra = (
-                f"Можно один раз дать ссылку: {link}"
-                if include_link and link
-                else "Ссылку не давай, если уже была или не просят."
-            )
+            if include_link and link:
+                extra = (
+                    f"Обязательно один раз вставь ссылку: {link}\n"
+                    "Скажи что можно просто глянуть, без обязательств."
+                )
+            else:
+                extra = (
+                    "Ссылку не давай. Коротко напомни суть канала без ссылки. "
+                    "Не спрашивай как дела / чем занимается."
+                )
             text = await _openai_reply(
                 history,
                 instruction=(
-                    "Ответь коротко по смыслу сообщения пользователя. "
-                    f"{CHANNEL_PITCH}. {extra} "
-                    "Без давления, без длинного тире, 1-3 предложения."
+                    "Это продолжение воронки в Telegram, не дружеский чат.\n"
+                    f"Оффер: {pitch}\n"
+                    f"{extra}\n"
+                    "Запрещено: повторный привет, 'как дела', 'чем занимаешься', "
+                    "личные вопросы, давление, длинное тире.\n"
+                    "1-3 коротких предложения по делу."
                 ),
             )
             if text:
-                return _strip_em_dash(text)
+                text = _strip_em_dash(text)
+                # Reject pure small talk
+                if _SMALLTALK_RE.search(text):
+                    logger.warning("contextual smalltalk rejected: {!r}", text[:80])
+                else:
+                    if include_link and link and link not in text:
+                        text = f"{text}\n{link}"
+                    return text
         except Exception as exc:
             logger.exception("contextual reply failed: {}", exc)
 
     if include_link and link:
-        return f"Можешь глянуть канал, без обязательств:\n{link}"
-    return "Ок, понял."
+        return random.choice(_LINK_FALLBACKS).format(link=link)
+    return random.choice(_EXPLAIN_FALLBACKS)
 
 
 async def _openai_reply(history: list[dict], *, instruction: str) -> Optional[str]:
@@ -175,22 +245,23 @@ async def _openai_reply(history: list[dict], *, instruction: str) -> Optional[st
         {
             "role": "system",
             "content": (
-                "Ты обычный человек в Telegram. Пиши коротко по-русски. "
-                "Только обычный дефис '-', без длинного тире. "
-                "Не обещай доход. Не спорь агрессивно."
+                "Ты пишешь от лица человека в Telegram, но цель - мягко "
+                "донести бесплатный канал (посты из закрытых VIP), не болтать.\n"
+                "Пиши коротко по-русски. Только дефис '-'. "
+                "Не обещай доход. Не спорь. Не устраивай small talk."
             ),
         },
         {"role": "system", "content": instruction},
     ]
-    for item in (history or [])[-8:]:
+    for item in (history or [])[-8]:
         role = "assistant" if item.get("role") == "assistant" else "user"
         messages.append({"role": role, "content": str(item.get("text") or "")[:500]})
 
     resp = await client.chat.completions.create(
         model=AI_MODEL,
         messages=messages,
-        temperature=0.85,
-        max_tokens=180,
+        temperature=0.7,
+        max_tokens=160,
     )
     content = (resp.choices[0].message.content or "").strip()
     if len(content) >= 2 and content[0] in "\"'«" and content[-1] in "\"'»":
