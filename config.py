@@ -47,7 +47,7 @@ os.makedirs(MEDIA_DIR, exist_ok=True)
 CHANNEL_LINK: str = config("CHANNEL_LINK", default="").strip()
 CHANNEL_PITCH: str = config(
     "CHANNEL_PITCH",
-    default="Бесплатный канал: посты из закрытых VIP, платить не нужно",
+    default="Бесплатный канал: посты из VIP-каналов копируются моментально, платить не нужно",
 ).strip()
 
 # ---------------------------------------------------------------------------

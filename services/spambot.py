@@ -37,6 +37,26 @@ def _account_label(account_user_id: int) -> str:
     return accounts_svc.format_account_label(acc, include_id=True)
 
 
+
+_MSK = dt.timezone(dt.timedelta(hours=3))
+
+
+def _format_admin_time(iso_or_dt) -> str:
+    """Show time in Moscow (UTC+3) for admin notifications."""
+    if iso_or_dt is None:
+        return "неизвестно"
+    if isinstance(iso_or_dt, dt.datetime):
+        d = iso_or_dt
+    else:
+        d = _parse_iso(str(iso_or_dt))
+        if not d:
+            return str(iso_or_dt)[:19]
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=dt.timezone.utc)
+    local = d.astimezone(_MSK)
+    return local.strftime("%d.%m.%Y %H:%M МСК")
+
+
 def _notify_peerflood(label: str, seconds: int, *, streak: int = 1, interval_bumped: bool = False) -> str:
     from services import runtime as runtime_svc
     pause = runtime_svc.format_duration(int(seconds))
@@ -63,10 +83,12 @@ def _notify_free_manual(label: str) -> str:
 
 
 def _notify_limited(label: str, until: str, next_check: str) -> str:
+    until_h = _format_admin_time(until)
+    next_h = _format_admin_time(next_check)
     return (
-        f"⏳ @SpamBot пишет, что **{label}** ещё ограничен\n"
-        f"примерно до `{until}`.\n"
-        f"Проверю снова после `{next_check}`."
+        f"⏳ @SpamBot: **{label}** ещё ограничен.\n"
+        f"Снятие примерно **{until_h}**.\n"
+        f"Проверю снова после **{next_h}**."
     )
 
 
@@ -541,10 +563,8 @@ async def _apply_parse(
             limited_until=until,
         )
         label = _account_label(account_user_id)
-        until_short = (until or "неизвестно")[:19]
-        next_short = (next_check or "")[:19]
         await notify_admins(
-            _notify_limited(label, until_short, next_short)
+            _notify_limited(label, until or "", next_check or "")
         )
         return
 
