@@ -77,6 +77,42 @@ def seconds_until_global_ready() -> float:
     return max(0.0, delta)
 
 
+def seconds_until_account_ready(acc: dict[str, Any]) -> float:
+    """Return the persisted account/cooldown wait without changing pacing.
+
+    The value mirrors account_is_send_ready() timing semantics and is used only
+    for an honest dashboard countdown. Daily limits and participation are
+    represented separately by account_is_send_ready().
+    """
+    if not acc:
+        return 0.0
+
+    now = _now()
+    waits: list[float] = []
+
+    cooldown = _parse_iso(acc.get("cooldown_until"))
+    if cooldown is not None:
+        waits.append((cooldown - now).total_seconds())
+
+    next_send = _parse_iso(acc.get("next_send_at"))
+    if next_send is not None:
+        waits.append((next_send - now).total_seconds())
+    else:
+        last_send = _parse_iso(acc.get("last_send_at"))
+        if last_send is not None:
+            from services import runtime as runtime_svc
+
+            own_min = acc.get("dm_interval_min_sec")
+            if own_min is not None:
+                minimum = int(own_min)
+            else:
+                minimum, _maximum = runtime_svc.get_account_interval_range()
+            elapsed = (now - last_send).total_seconds()
+            waits.append(float(minimum) - elapsed)
+
+    return max(0.0, max(waits, default=0.0))
+
+
 def _today_str() -> str:
     return _now().date().isoformat()
 

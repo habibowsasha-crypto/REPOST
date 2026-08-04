@@ -1,6 +1,18 @@
-# Channel DM Bot v1.0.59
+# Channel DM Bot v1.0.60
 
 Telegram user-account DM bot: monitors selected groups, builds one shared lead queue, sends First DM, continues active dialogs, handles refusals, sends only the administrator's exact channel link, and stores durable state in SQLite.
+
+
+## Changes in v1.0.60 - dashboard First DM countdowns
+
+- The main dashboard now shows the real persisted First DM wait under every participating account.
+- An account waiting for its own interval shows `Следующий First DM через 8м`.
+- An account ready by its own interval but blocked by global spacing shows `Готов · общая пауза ещё 40с`.
+- A fully available account shows `Готов к First DM`.
+- An account at its daily quota shows `Дневной лимит исчерпан`.
+- PeerFlood, FloodWait, reauthorization and disabled-account states keep priority over the normal countdown.
+- The countdown is display-only. No limit, interval, global spacing, pause, filter, quota or account-selection rule changed.
+- Added 6 dedicated v1.0.60 regression tests.
 
 
 ## Changes in v1.0.59 - username-first shared queue delivery
@@ -106,7 +118,7 @@ Telegram user-account DM bot: monitors selected groups, builds one shared lead q
 
 No First-DM limit, interval, pause, filter, quota or account-selection rule was changed in v1.0.55.
 
-## Changes in v1.0.53 — Step 5 of the audit repair plan
+## Changes in v1.0.53 - Step 5 of the audit repair plan
 
 ### Finite and diagnosable queue failures
 
@@ -139,7 +151,7 @@ No First-DM limit, interval, pause, filter, quota or account-selection rule was 
 
 
 
-## Changes in v1.0.52 — Step 4 of the audit repair plan
+## Changes in v1.0.52 - Step 4 of the audit repair plan
 
 ### Clear account lifecycle
 
@@ -171,7 +183,7 @@ No First-DM limit, interval, pause, filter, quota or account-selection rule was 
 - Queue/no-entity/performance work remains Step 5.
 
 
-## Changes in v1.0.51 — Step 3 of the audit repair plan
+## Changes in v1.0.51 - Step 3 of the audit repair plan
 
 ### Independent dialog attempts
 
@@ -202,7 +214,7 @@ No First-DM limit, interval, pause, filter, quota or account-selection rule was 
 - Account lifecycle and queue performance remain Step 4 and Step 5 work.
 
 
-## Changes in v1.0.50 — Step 2 of the audit repair plan
+## Changes in v1.0.50 - Step 2 of the audit repair plan
 
 ### Durable delivery for every dialog message
 
@@ -237,7 +249,7 @@ No First-DM limit, interval, pause, filter, quota or account-selection rule was 
 - Import behavior and 30/180-day retention policy remain unchanged for Step 3 and Step 4.
 
 
-## Changes in v1.0.49 — Step 1 of the audit repair plan
+## Changes in v1.0.49 - Step 1 of the audit repair plan
 
 ### Durable sequential incoming-message processing
 
@@ -358,7 +370,7 @@ The Telegram user-session must still exist when cleanup becomes due. The account
 
 ## Quick live test
 
-1. Deploy v1.0.56 over the existing volume/database.
+1. Deploy v1.0.60 over the existing volume/database.
 2. Confirm the new dashboard and all-time First-DM counter.
 3. Send a test First DM and confirm only one routine admin notification.
 4. Continue the dialog and confirm no reply/link/follow-up push notifications appear.

@@ -437,9 +437,26 @@ def format_cooldown_left(acc: dict[str, Any]) -> str | None:
     return f"~{h}ч"
 
 
+def _format_dashboard_wait(seconds: float) -> str:
+    """Compact countdown rounded up so the menu never promises too early."""
+    sec = max(0, int(float(seconds) + 0.999))
+    if sec <= 0:
+        return "0с"
+    if sec < 60:
+        return f"{sec}с"
+    minutes = (sec + 59) // 60
+    if minutes < 60:
+        return f"{minutes}м"
+    hours, rem_minutes = divmod(minutes, 60)
+    if rem_minutes:
+        return f"{hours}ч {rem_minutes}м"
+    return f"{hours}ч"
+
+
 def dashboard_account_line(acc: dict[str, Any]) -> str:
     """Compact two-line account status block for the main dashboard."""
     from services import dialog_store as dialog_store_svc
+    from services import pacing as pacing_svc
 
     label = format_account_label(acc, include_id=False)
     if len(label) > 24:
@@ -479,7 +496,27 @@ def dashboard_account_line(acc: dict[str, Any]) -> str:
             )
         return f"🟡 **{label}**\n└ First DM отключены · диалогов 0"
 
-    return f"🟢 **{label}**\n└ First DM включены · диалогов {dialogs}"
+    ready, reason = pacing_svc.account_is_send_ready(acc)
+    account_wait = pacing_svc.seconds_until_account_ready(acc)
+
+    if reason == "daily_limit":
+        detail = "Дневной лимит исчерпан"
+    elif account_wait > 0:
+        detail = f"Следующий First DM через {_format_dashboard_wait(account_wait)}"
+    else:
+        global_wait = pacing_svc.seconds_until_global_ready()
+        if global_wait > 0:
+            detail = f"Готов · общая пауза ещё {_format_dashboard_wait(global_wait)}"
+        elif ready:
+            detail = "Готов к First DM"
+        else:
+            detail = "Ожидает First DM"
+
+    return (
+        f"🟢 **{label}**\n"
+        f"├ First DM включены · диалогов {dialogs}\n"
+        f"└ {detail}"
+    )
 
 
 def dashboard_accounts_block(*, limit: int = 8) -> str:
