@@ -1,6 +1,19 @@
-# Channel DM Bot v1.0.57
+# Channel DM Bot v1.0.58
 
 Telegram user-account DM bot: monitors selected groups, builds one shared lead queue, sends First DM, continues active dialogs, handles refusals, sends only the administrator's exact channel link, and stores durable state in SQLite.
+
+
+## Changes in v1.0.58 - safe First DM delivery and exact apology timing
+
+- Production Loguru sinks disable backtrace and local-variable diagnostics, preventing Telegram session strings and account dictionaries from appearing in exception output.
+- Telegram `ALLOW_PAYMENT_REQUIRED` errors are terminal `paid_message_required` failures. Prepared state is rolled back, provisional contact/dialog state is removed, and no history recovery or account fallback is scheduled.
+- `PeerIdInvalidError` raised by the actual First DM send is treated as a definite failed send. Prepared state is rolled back and the same dispatch round continues through the next already eligible account.
+- Telegram entity resolution now happens before First DM AI generation. One generated text is reused across account fallbacks in the same lead round.
+- Legacy persisted apology ranges are migrated and clamped to 5-60 seconds. The admin editor rejects values outside this range.
+- A dedicated lightweight one-second scheduler processes due apologies separately from the historical 20-second recovery and retention loop. Existing dialogs continue while First DM is paused.
+- First DM style families and local fallbacks were expanded to reduce repeated openings without weakening validation or recent-similarity checks. AI attempts remain bounded at two before local fallback.
+- All 125 existing tests remain, with 16 new v1.0.58 regression tests.
+- No First DM limit, interval, global spacing, pause rule, source-account priority, account selection order, global opt-out rule, five-message limit, or last-30 promo uniqueness window was changed.
 
 
 ## Changes in v1.0.57 - account authorization recovery

@@ -188,6 +188,9 @@ KEY_PACE_AI_HI = "pace_ai_reply_hi_sec"
 KEY_PACE_LINK_LO = "pace_auto_link_lo_sec"
 KEY_PACE_LINK_HI = "pace_auto_link_hi_sec"
 
+APOLOGY_DELAY_MIN_ALLOWED_SEC = 5
+APOLOGY_DELAY_MAX_ALLOWED_SEC = 60
+
 
 def _int_or(default: int, raw: str | None, *, lo: int, hi: int) -> int:
     if raw is None or str(raw).strip() == "":
@@ -275,12 +278,40 @@ def set_ai_reply_delay_range(lo: int, hi: int) -> tuple[int, int]:
 
 
 def get_auto_link_delay_range() -> tuple[int, int]:
+    """Return the smoothing-apology range, migrating legacy values to 5-60."""
     from config import AI_APOLOGY_DELAY_MAX, AI_APOLOGY_DELAY_MIN
 
-    lo = _int_or(AI_APOLOGY_DELAY_MIN, _get(KEY_PACE_LINK_LO), lo=5, hi=1800)
-    hi = _int_or(AI_APOLOGY_DELAY_MAX, _get(KEY_PACE_LINK_HI), lo=5, hi=1800)
+    raw_lo = _get(KEY_PACE_LINK_LO)
+    raw_hi = _get(KEY_PACE_LINK_HI)
+    default_lo = max(
+        APOLOGY_DELAY_MIN_ALLOWED_SEC,
+        min(APOLOGY_DELAY_MAX_ALLOWED_SEC, int(AI_APOLOGY_DELAY_MIN)),
+    )
+    default_hi = max(
+        APOLOGY_DELAY_MIN_ALLOWED_SEC,
+        min(APOLOGY_DELAY_MAX_ALLOWED_SEC, int(AI_APOLOGY_DELAY_MAX)),
+    )
+    lo = _int_or(
+        default_lo,
+        raw_lo,
+        lo=APOLOGY_DELAY_MIN_ALLOWED_SEC,
+        hi=APOLOGY_DELAY_MAX_ALLOWED_SEC,
+    )
+    hi = _int_or(
+        default_hi,
+        raw_hi,
+        lo=APOLOGY_DELAY_MIN_ALLOWED_SEC,
+        hi=APOLOGY_DELAY_MAX_ALLOWED_SEC,
+    )
     if lo > hi:
         lo, hi = hi, lo
+
+    # Reading an old persisted range is also its migration. Rewrite only when
+    # absent, invalid, reversed or outside the approved 5-60 second boundary.
+    if raw_lo is not None or raw_hi is not None:
+        if str(raw_lo or "").strip() != str(lo) or str(raw_hi or "").strip() != str(hi):
+            _set(KEY_PACE_LINK_LO, str(lo))
+            _set(KEY_PACE_LINK_HI, str(hi))
     return lo, hi
 
 
@@ -288,8 +319,8 @@ def set_auto_link_delay_range(lo: int, hi: int) -> tuple[int, int]:
     lo, hi = int(lo), int(hi)
     if lo > hi:
         lo, hi = hi, lo
-    lo = max(5, min(1800, lo))
-    hi = max(5, min(1800, hi))
+    lo = max(APOLOGY_DELAY_MIN_ALLOWED_SEC, min(APOLOGY_DELAY_MAX_ALLOWED_SEC, lo))
+    hi = max(APOLOGY_DELAY_MIN_ALLOWED_SEC, min(APOLOGY_DELAY_MAX_ALLOWED_SEC, hi))
     _set(KEY_PACE_LINK_LO, str(lo))
     _set(KEY_PACE_LINK_HI, str(hi))
     return lo, hi

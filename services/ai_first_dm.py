@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import re
 from typing import Optional
 
@@ -10,7 +11,7 @@ from loguru import logger
 
 from config import AI_DM_ENABLED, AI_MODEL, AI_REQUEST_TIMEOUT_SECONDS, OPENAI_API_KEY
 from services import phrases as phrases_svc
-from texts.first_dm import pick_first_dm
+from texts.first_dm import FIRST_DM_TEMPLATES, pick_first_dm
 
 # Forbidden long dashes (user rule: only ASCII hyphen "-")
 _BAD_DASHES = ("\u2014", "\u2013", "\u2212")  # em, en, minus
@@ -87,6 +88,14 @@ def validate_first_dm(text: str) -> tuple[bool, str]:
             "потеря",
             "рынок",
             "сделк",
+            "график",
+            "иде",
+            "разбор",
+            "таймфрейм",
+            "биток",
+            "альт",
+            "крипт",
+            "золот",
         )
     )
     if not soft_ok:
@@ -135,21 +144,35 @@ def _opening_key(text: str) -> str:
 def _tokens(text: str) -> list[str]:
     return [w for w in re.findall(r"[а-яa-z0-9]+", (text or "").lower()) if len(w) > 2]
 
-# Styles optimized for reply rate + human feel. Forced rotation.
+# Style families are rotated by recent usage to reduce repeated openings and intent.
 _STYLES = (
-    "soft",      # можно спросить / не отвлеку — highest reply friction-low
-    "signals",   # сам или по сигналам
-    "active",    # щас торгуешь?
-    "newbie",    # подскажи новичку
+    "soft",
+    "signals",
+    "active",
+    "market_view",
+    "watchlist",
+    "analysis_source",
+    "format",
+    "timeframe",
 )
+
+MAX_AI_FIRST_DM_ATTEMPTS = 2
 
 
 def _detect_style(text: str) -> str:
     t = (text or "").lower()
-    if any(x in t for x in ("сигнал", "сам торг", "сам анализ", "сам смотр")):
+    if any(x in t for x in ("таймфрейм", "тф")):
+        return "timeframe"
+    if any(x in t for x in ("короткий разбор", "подроб", "формат")):
+        return "format"
+    if any(x in t for x in ("сам график", "идеи смот", "чужие идеи", "сам анализ")):
+        return "analysis_source"
+    if any(x in t for x in ("биток", "альт", "крипт", "золот", "что сейчас смот")):
+        return "watchlist"
+    if any(x in t for x in ("рынок вид", "как рынок", "по рынку дума")):
+        return "market_view"
+    if any(x in t for x in ("сигнал", "сам торг", "по сигнал")):
         return "signals"
-    if any(x in t for x in ("новичк", "подскаж", "помо")):
-        return "newbie"
     if any(
         x in t
         for x in (
@@ -162,62 +185,79 @@ def _detect_style(text: str) -> str:
         )
     ):
         return "soft"
-    if any(x in t for x in ("торгу", "рынк", "паузе", "щас")):
+    if any(x in t for x in ("торгу", "в рынке", "на паузе", "щас")):
         return "active"
     return "other"
 
 
 def _pick_style(recent: list[str]) -> str:
-    """Least-used style among last messages; soft gets a slight bias (reply rate)."""
-    counts = {s: 0 for s in _STYLES}
-    for r in recent[:10]:
-        st = _detect_style(r)
-        if st in counts:
-            counts[st] += 1
-    # soft may lag: prefer if missing in last 3
-    last3 = [_detect_style(r) for r in recent[:3]]
-    if "soft" not in last3 and counts["soft"] <= min(counts.values()) + 0:
-        return "soft"
-    # round-robin least used
-    return min(_STYLES, key=lambda s: (counts[s], _STYLES.index(s)))
+    """Pick the least-used intent family from recent First DMs."""
+    counts = {style: 0 for style in _STYLES}
+    for item in recent[:24]:
+        detected = _detect_style(item)
+        if detected in counts:
+            counts[detected] += 1
+    minimum = min(counts.values())
+    candidates = [style for style in _STYLES if counts[style] == minimum]
+    recent_styles = {_detect_style(item) for item in recent[:4]}
+    not_recent = [style for style in candidates if style not in recent_styles]
+    return random.choice(not_recent or candidates)
 
 
 def _style_instruction(style: str) -> str:
-    if style == "soft":
-        return (
-            "Стиль СЕЙЧАС: мягкий крючок без трейдинг-терминов. "
-            "Как человек, который стесняется писать первым. "
-            "Примеры смысла (не копируй): «можно спросить?», "
-            "«не отвлеку на секунду?», «есть минутка? хотел спросить». "
-            "Без слова сигнал, стратегия, убыток."
-        )
-    if style == "signals":
-        return (
-            "Стиль СЕЙЧАС: сам торгует или по сигналам. "
-            "Коротко и по-свойски, как в чате. "
-            "Примеры смысла: «ты сам торгуешь или по сигналам?», "
-            "«на сигналах сидишь или сам график смотришь?»."
-        )
-    if style == "active":
-        return (
-            "Стиль СЕЙЧАС: торгует ли сейчас. "
-            "Живой вопрос, не анкета. "
-            "Примеры смысла: «а ты щас торгуешь?», "
-            "«в рынке сейчас или на паузе?»."
-        )
-    # newbie
-    return (
-        "Стиль СЕЙЧАС: просьба к более опытному / новичку нужна подсказка. "
-        "Люди часто отвечают, когда их просят помочь. "
-        "Примеры смысла: «новичку не подскажешь по трейду?», "
-        "«можно глупый вопрос по рынку?»."
-    )
+    instructions = {
+        "soft": (
+            "Стиль СЕЙЧАС: мягкий короткий вход без трейдинг-терминов. "
+            "Не повторяй фразы «можно спросить», «есть секунда» и «есть минутка» "
+            "если они уже есть в недавних сообщениях."
+        ),
+        "signals": (
+            "Стиль СЕЙЧАС: коротко спроси, сам человек анализирует или смотрит сигналы. "
+            "Не делай это анкетой и не начинай со слова «Слушай»."
+        ),
+        "active": (
+            "Стиль СЕЙЧАС: одним живым вопросом уточни, торгует ли человек сейчас "
+            "или пока наблюдает рынок."
+        ),
+        "market_view": (
+            "Стиль СЕЙЧАС: спроси мнение о текущем рынке. Один конкретный вопрос, "
+            "без прогноза от себя и без выдуманной личной истории."
+        ),
+        "watchlist": (
+            "Стиль СЕЙЧАС: спроси, что человек сейчас больше наблюдает - биток, альты, "
+            "крипту или золото. Коротко, без списка из многих вопросов."
+        ),
+        "analysis_source": (
+            "Стиль СЕЙЧАС: спроси, сам человек разбирает график или смотрит чужие идеи. "
+            "Не упоминай канал, рекламу или собственный опыт."
+        ),
+        "format": (
+            "Стиль СЕЙЧАС: спроси, какой формат рыночного разбора удобнее - короткий "
+            "или подробный. Только один вопрос."
+        ),
+        "timeframe": (
+            "Стиль СЕЙЧАС: коротко спроси, какой таймфрейм человек чаще смотрит. "
+            "Без второго вопроса и без менеджерского тона."
+        ),
+    }
+    return instructions[style]
 
 
+def _local_first_dm(recent: list[str]) -> str:
+    """Pick a validator-safe local message that also respects recent similarity."""
+    candidates = list(FIRST_DM_TEMPLATES)
+    random.shuffle(candidates)
+    recent_styles = {_detect_style(item) for item in recent[:4]}
+    candidates.sort(key=lambda item: _detect_style(item) in recent_styles)
+    for candidate in candidates:
+        clean = sanitize_dashes(candidate)
+        ok, _reason = validate_first_dm(clean)
+        if ok and clean not in recent and not _too_similar_recent(clean, recent):
+            return clean
+    return sanitize_dashes(pick_first_dm(recent=recent))
 
 
 def sanitize_dashes(text: str) -> str:
-
     out = text
     for d in _BAD_DASHES:
         out = out.replace(d, "-")
@@ -235,7 +275,7 @@ async def generate_first_dm() -> str:
 
     if AI_DM_ENABLED and OPENAI_API_KEY:
         try:
-            for attempt in range(2):
+            for attempt in range(MAX_AI_FIRST_DM_ATTEMPTS):
                 text = await _openai_first_dm(recent, style=style)
                 if not text:
                     continue
@@ -255,8 +295,8 @@ async def generate_first_dm() -> str:
         except Exception as exc:
             logger.exception("AI first DM failed: {}", exc)
 
-    # Local fallback still respects style rotation via recent
-    return pick_first_dm(recent=recent)
+    # Local fallback scans all approved families and keeps the same similarity check.
+    return _local_first_dm(recent)
 
 
 async def _openai_first_dm(
@@ -264,7 +304,11 @@ async def _openai_first_dm(
 ) -> Optional[str]:
     from openai import AsyncOpenAI
 
-    client = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=AI_REQUEST_TIMEOUT_SECONDS, max_retries=1)
+    client = AsyncOpenAI(
+        api_key=OPENAI_API_KEY,
+        timeout=AI_REQUEST_TIMEOUT_SECONDS,
+        max_retries=1,
+    )
     avoid = ""
     if recent:
         sample = "\n".join(f"- {x}" for x in recent[:12])

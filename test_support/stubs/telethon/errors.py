@@ -11,3 +11,4 @@ class PhoneCodeExpiredError(RPCError): pass
 class PhoneCodeInvalidError(RPCError): pass
 class PhoneNumberInvalidError(RPCError): pass
 class SessionPasswordNeededError(RPCError): pass
+class PeerIdInvalidError(RPCError): pass

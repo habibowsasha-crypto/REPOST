@@ -483,6 +483,16 @@ async def cb_pace_edit(event: events.CallbackQuery.Event) -> None:
     await event.answer()
 
 
+def _validate_apology_range_input(lo: int, hi: int) -> tuple[int, int]:
+    """Reject admin values outside the approved 5-60 second interval."""
+    a, b = int(lo), int(hi)
+    if a > b:
+        a, b = b, a
+    if a < 5 or b > 60:
+        raise ValueError("apology delay must be within 5-60 seconds")
+    return a, b
+
+
 def _is_pacing_edit(event) -> bool:
     if not getattr(event, "is_private", False):
         return False
@@ -532,6 +542,7 @@ async def on_pacing_edit(event: events.NewMessage.Event) -> None:
                 lo, hi = runtime_svc.set_ai_reply_delay_range(a, b)
                 msg = f"AI: **{lo}–{hi} сек**"
             elif step == "link":
+                a, b = _validate_apology_range_input(a, b)
                 lo, hi = runtime_svc.set_auto_link_delay_range(a, b)
                 msg = f"Извинение: **{lo}-{hi} сек**"
             else:

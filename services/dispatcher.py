@@ -5,17 +5,19 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import random
+import re
 from typing import Any, Optional
 
 from loguru import logger
 from telethon.errors import (
-    FloodWaitError,
-    PeerFloodError,
-    UserPrivacyRestrictedError,
-    UserIsBlockedError,
-    InputUserDeactivatedError,
     ChatWriteForbiddenError,
+    FloodWaitError,
+    InputUserDeactivatedError,
+    PeerFloodError,
+    PeerIdInvalidError,
     UserBannedInChannelError,
+    UserIsBlockedError,
+    UserPrivacyRestrictedError,
 )
 from telethon.tl.types import InputPeerUser
 
@@ -35,6 +37,23 @@ from services.ai_first_dm import generate_first_dm
 _worker_task: Optional[asyncio.Task] = None
 _stop_event: Optional[asyncio.Event] = None
 _recent_texts: list[str] = []
+
+_PAID_MESSAGE_REQUIRED_RE = re.compile(r"ALLOW_PAYMENT_REQUIRED(?:_\d+)?", re.IGNORECASE)
+
+
+def _is_paid_message_required(exc: BaseException) -> bool:
+    """Recognize Telegram paid-message restriction without relying on one SDK class."""
+    values = [str(exc)]
+    for attr in ("message", "rpc_error_name", "error_message"):
+        value = getattr(exc, attr, None)
+        if value is not None:
+            values.append(str(value))
+    return any(_PAID_MESSAGE_REQUIRED_RE.search(value or "") for value in values)
+
+
+def _safe_error_name(exc: BaseException) -> str:
+    return type(exc).__name__
+
 
 
 def is_worker_running() -> bool:
@@ -91,7 +110,9 @@ async def _worker_loop() -> None:
         try:
             did = await _tick()
         except Exception as exc:
-            logger.exception("Dispatcher tick error: {}", exc)
+            logger.opt(exception=exc).error(
+                "Dispatcher tick failed error_type={}", _safe_error_name(exc)
+            )
             did = False
         ticks += 1
         if ticks % 3 == 0:
@@ -100,14 +121,20 @@ async def _worker_loop() -> None:
                 if recovered:
                     logger.warning("Reconciled {} ambiguous First-DM delivery(s)", recovered)
             except Exception as recovery_exc:
-                logger.exception("First-DM recovery loop failed: {}", recovery_exc)
+                logger.opt(exception=recovery_exc).error(
+                    "First-DM recovery loop failed error_type={}",
+                    _safe_error_name(recovery_exc),
+                )
         if ticks % 6 == 0:
             try:
                 n = queue_svc.release_stale_claims(older_than_seconds=900)
                 if n:
                     logger.warning("Released {} stale claimed leads", n)
             except Exception as sc_exc:
-                logger.exception("stale claims release: {}", sc_exc)
+                logger.opt(exception=sc_exc).error(
+                    "Stale claims release failed error_type={}",
+                    _safe_error_name(sc_exc),
+                )
         timeout = 2.0 if did else 5.0
         try:
             await asyncio.wait_for(_stop_event.wait(), timeout=timeout)
@@ -216,11 +243,22 @@ def _finish_or_defer_unresolvable(target_id: int, lead: dict[str, Any]) -> bool:
 
 
 async def _attempt_lead_across_accounts(
-    lead: dict[str, Any], accounts: list[dict[str, Any]], text: str
+    lead: dict[str, Any],
+    accounts: list[dict[str, Any]],
+    text: str | None = None,
 ) -> bool:
+    """Try ready accounts in the existing order.
+
+    Production dispatch passes ``text=None`` so Telegram entity resolution happens
+    before the first AI call. A provided text is retained as a compatibility path
+    for tests and recovery helpers that already own a generated First DM.
+    """
     target_id = int(lead["target_user_id"])
+    generated_text = text
+    lazy_generation = generated_text is None
     had_retryable_error = False
     had_account_cooldown = False
+
     for acc in accounts:
         account_id = int(acc["user_id"])
         fresh = accounts_svc.get_account(account_id) or acc
@@ -234,10 +272,120 @@ async def _attempt_lead_across_accounts(
         if not queue_svc.ensure_claim(target_id, account_id):
             return True
 
-        result = await _send_first_dm(client, account_id, lead, text)
+        entity = None
+        if lazy_generation:
+            try:
+                entity = await _resolve_target_entity(client, account_id, lead)
+            except FloodWaitError as exc:
+                seconds = int(getattr(exc, "seconds", 60) or 60)
+                queue_svc.release_claim(target_id, as_pending=True)
+                pacing.apply_floodwait(account_id, seconds)
+                had_account_cooldown = True
+                logger.warning(
+                    "Entity resolution FloodWait account={} target={} seconds={}",
+                    account_id,
+                    target_id,
+                    seconds,
+                )
+                continue
+            except PeerFloodError:
+                queue_svc.release_claim(target_id, as_pending=True)
+                try:
+                    from services import spambot as spambot_svc
+
+                    await spambot_svc.on_peer_flood(account_id)
+                except Exception as exc:
+                    logger.error(
+                        "SpamBot on_peer_flood failed account={} error_type={}",
+                        account_id,
+                        _safe_error_name(exc),
+                    )
+                    pacing.set_paused(account_id, "PeerFlood", paused=True)
+                had_account_cooldown = True
+                continue
+            except PeerIdInvalidError:
+                queue_svc.record_account_failure(
+                    target_id,
+                    account_id,
+                    "no_entity",
+                    "peer_id_invalid_during_entity_resolution",
+                )
+                queue_svc.release_claim(target_id, as_pending=True)
+                continue
+            except (UserPrivacyRestrictedError, UserIsBlockedError, ChatWriteForbiddenError):
+                queue_svc.cancel_lead(target_id, "privacy_or_blocked")
+                return True
+            except (InputUserDeactivatedError, UserBannedInChannelError, ValueError):
+                queue_svc.cancel_lead(target_id, "invalid_target")
+                return True
+            except Exception as exc:
+                if _is_paid_message_required(exc):
+                    queue_svc.mark_terminal_failure(
+                        target_id,
+                        "paid_message_required",
+                        "paid_message_required",
+                    )
+                    logger.info(
+                        "Paid message required target={} account={} phase=entity",
+                        target_id,
+                        account_id,
+                    )
+                    return True
+                if account_auth.is_auth_loss_error(exc):
+                    queue_svc.release_claim(target_id, as_pending=True)
+                    await account_auth.register_auth_loss(account_id, exc, notify=True)
+                    await monitor_svc.disconnect_account(account_id, cancel_tasks=True)
+                    had_account_cooldown = True
+                    continue
+                detail = f"{_safe_error_name(exc)} during entity resolution"
+                queue_svc.set_last_error(target_id, detail)
+                queue_svc.release_claim(target_id, as_pending=True)
+                logger.error(
+                    "Retryable entity resolution error target={} account={} error_type={}",
+                    target_id,
+                    account_id,
+                    _safe_error_name(exc),
+                )
+                had_retryable_error = True
+                continue
+
+            if entity is None:
+                queue_svc.record_account_failure(
+                    target_id,
+                    account_id,
+                    "no_entity",
+                    "Telegram entity unavailable",
+                )
+                queue_svc.release_claim(target_id, as_pending=True)
+                continue
+
+            if generated_text is None:
+                try:
+                    generated_text = await generate_first_dm()
+                except Exception as exc:
+                    detail = f"{_safe_error_name(exc)} during First DM generation"
+                    queue_svc.set_last_error(target_id, detail)
+                    queue_svc.release_claim(target_id, as_pending=True)
+                    logger.error(
+                        "First DM generation failed target={} error_type={}",
+                        target_id,
+                        _safe_error_name(exc),
+                    )
+                    had_retryable_error = True
+                    break
+
+        if generated_text is None:
+            continue
+        result = await _send_first_dm(
+            client,
+            account_id,
+            lead,
+            generated_text,
+            entity=entity,
+        )
         if result == "sent":
-            phrases_svc.remember(phrases_svc.KIND_FIRST_DM, text)
-            _remember_text(text)
+            phrases_svc.remember(phrases_svc.KIND_FIRST_DM, generated_text)
+            _remember_text(generated_text)
             pacing.mark_global_sent()
             return True
         if result in {"flood", "peerflood", "auth_lost"}:
@@ -246,11 +394,16 @@ async def _attempt_lead_across_accounts(
         if result == "error":
             had_retryable_error = True
             continue
-        if result in {"privacy", "invalid", "terminal"}:
+        if result in {"privacy", "invalid", "terminal", "paid_message_required"}:
             return True
-        if result == "no_entity":
+        if result in {"no_entity", "peer_invalid"}:
+            detail = (
+                "PeerIdInvalid during SendMessageRequest"
+                if result == "peer_invalid"
+                else "Telegram entity unavailable"
+            )
             queue_svc.record_account_failure(
-                target_id, account_id, "no_entity", "Telegram entity unavailable"
+                target_id, account_id, "no_entity", detail
             )
             continue
         if result == "ambiguous":
@@ -262,18 +415,21 @@ async def _attempt_lead_across_accounts(
         if attempts >= queue_svc.MAX_SEND_ATTEMPTS:
             detail = (
                 f"{last_error} | retryable rounds exhausted:{attempts}"
-                if last_error else f"retryable rounds exhausted:{attempts}"
+                if last_error
+                else f"retryable rounds exhausted:{attempts}"
             )
             queue_svc.mark_terminal_failure(
                 target_id, "max_transient_attempts", detail
             )
             logger.error(
                 "Lead terminal after retryable rounds target={} attempts={}",
-                target_id, attempts,
+                target_id,
+                attempts,
             )
             return True
         queue_svc.defer_claim(
-            target_id, seconds=60,
+            target_id,
+            seconds=60,
             reason=f"retryable_round:{attempts}/{queue_svc.MAX_SEND_ATTEMPTS}",
         )
         return False
@@ -306,10 +462,9 @@ async def _tick() -> bool:
     if not ordered:
         return _finish_or_defer_unresolvable(target_id, lead)
 
-    # Generate once and reuse for account fallbacks. No generation occurs while
-    # the lead merely waits for an unavailable, not-yet-tried account.
-    text = await generate_first_dm()
-    return await _attempt_lead_across_accounts(lead, ordered, text)
+    # Entity resolution is performed inside the account round. AI is called only
+    # after at least one ready account has a real Telegram entity.
+    return await _attempt_lead_across_accounts(lead, ordered)
 
 
 def _target_label(lead: dict[str, Any]) -> str:
@@ -495,11 +650,12 @@ async def recover_ambiguous_first_dms() -> int:
                 attempts,
                 retry_sec,
             )
-            logger.opt(exception=exc).debug(
-                "Prepared First DM recovery diagnostic account={} target={}",
-                account_id,
-                target_id,
-            )
+            if not peer_invalid:
+                logger.opt(exception=exc).debug(
+                    "Prepared First DM recovery diagnostic account={} target={}",
+                    account_id,
+                    target_id,
+                )
             continue
 
         if found is not None:
@@ -559,12 +715,15 @@ async def _send_first_dm(
     account_id: int,
     lead: dict[str, Any],
     text: str,
+    *,
+    entity=None,
 ) -> str:
     target_id = int(lead["target_user_id"])
     prepared = False
 
     try:
-        entity = await _resolve_target_entity(client, account_id, lead)
+        if entity is None:
+            entity = await _resolve_target_entity(client, account_id, lead)
         if entity is None:
             logger.warning(
                 "No entity for target={} account={} source_account={}",
@@ -626,6 +785,22 @@ async def _send_first_dm(
         await _notify_admins_first_dm(account_id, lead, text)
         return "sent"
 
+    except PeerIdInvalidError:
+        logger.info(
+            "PeerIdInvalid during First DM send account={} target={}",
+            account_id,
+            target_id,
+        )
+        if prepared:
+            first_dm_delivery.rollback(
+                target_id,
+                "peer_id_invalid_send",
+                as_pending=True,
+            )
+        else:
+            queue_svc.release_claim(target_id, as_pending=True)
+        return "peer_invalid"
+
     except FloodWaitError as exc:
         seconds = int(getattr(exc, "seconds", 60) or 60)
         logger.warning(
@@ -671,6 +846,26 @@ async def _send_first_dm(
         return "invalid"
 
     except Exception as exc:
+        if _is_paid_message_required(exc):
+            logger.info(
+                "Paid message required target={} account={} phase=send",
+                target_id,
+                account_id,
+            )
+            if prepared:
+                first_dm_delivery.rollback(
+                    target_id,
+                    "paid_message_required",
+                    as_pending=False,
+                )
+            else:
+                queue_svc.release_claim(target_id, as_pending=False)
+            queue_svc.mark_terminal_failure(
+                target_id,
+                "paid_message_required",
+                "paid_message_required",
+            )
+            return "paid_message_required"
         if account_auth.is_auth_loss_error(exc):
             logger.warning(
                 "First DM stopped because account authorization was lost "
@@ -688,16 +883,16 @@ async def _send_first_dm(
             await account_auth.register_auth_loss(account_id, exc, notify=True)
             await monitor_svc.disconnect_account(account_id, cancel_tasks=True)
             return "auth_lost"
-        logger.exception(
-            "First DM send became ambiguous account={} target={}: {}",
+        logger.opt(exception=exc).error(
+            "First DM send became ambiguous account={} target={} error_type={}",
             account_id,
             target_id,
-            exc,
+            _safe_error_name(exc),
         )
         if prepared:
             # Do not retry through another account: Telegram may have accepted it.
             return "ambiguous"
-        detail = f"{type(exc).__name__}: {exc}"
+        detail = f"{_safe_error_name(exc)}: pre-send failure"
         queue_svc.set_last_error(target_id, detail)
         queue_svc.release_claim(target_id, as_pending=True)
         logger.warning(
