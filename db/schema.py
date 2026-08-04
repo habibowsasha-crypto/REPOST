@@ -129,10 +129,23 @@ def init_db() -> None:
         _ensure_column(
             conn, "accounts", "interval_backoff_until", "interval_backoff_until TEXT"
         )
+        _ensure_column(
+            conn, "accounts", "auth_status",
+            "auth_status TEXT NOT NULL DEFAULT 'unknown'"
+        )
+        _ensure_column(conn, "accounts", "auth_error", "auth_error TEXT")
+        _ensure_column(conn, "accounts", "auth_lost_at", "auth_lost_at TEXT")
+        _ensure_column(conn, "accounts", "auth_notified_at", "auth_notified_at TEXT")
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_accounts_participates
             ON accounts(participates)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_accounts_auth_status
+            ON accounts(auth_status)
             """
         )
         conn.execute(

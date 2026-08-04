@@ -12,6 +12,7 @@ from telethon.tl.types import Channel, Chat
 
 from config import API_HASH, API_ID
 from db.schema import db_lock, get_connection
+from services import account_auth
 from services import accounts as accounts_svc
 
 CHAT_MODE_MANUAL = "manual"
@@ -194,6 +195,9 @@ async def refresh_discovered_chats(account_user_id: int) -> int:
     try:
         await client.connect()
         if not await client.is_user_authorized():
+            await account_auth.register_auth_loss(
+                account_user_id, "session_not_authorized", notify=True
+            )
             raise RuntimeError("session_not_authorized")
 
         async for dialog in client.iter_dialogs():
@@ -227,6 +231,12 @@ async def refresh_discovered_chats(account_user_id: int) -> int:
                     peer_type,
                 )
             )
+    except Exception as exc:
+        if account_auth.is_auth_loss_error(exc):
+            await account_auth.register_auth_loss(
+                account_user_id, exc, notify=True
+            )
+        raise
     finally:
         try:
             await client.disconnect()

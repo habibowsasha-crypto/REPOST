@@ -15,6 +15,7 @@ from config import (
     bot,
 )
 from db.schema import db_lock, get_connection
+from services import account_auth
 from services import accounts as accounts_svc
 from services import monitor as monitor_svc
 from services import pacing
@@ -498,9 +499,16 @@ async def check_account(account_user_id: int, *, force: bool = False) -> dict[st
         try:
             await client.connect()
             if not await client.is_user_authorized():
-                raise RuntimeError("not_authorized")
+                await account_auth.register_auth_loss(
+                    account_user_id, "session_not_authorized", notify=True
+                )
+                raise RuntimeError("session_not_authorized")
             return await _run_spambot_dialog(client, account_user_id)
         except Exception as exc:
+            if account_auth.is_auth_loss_error(exc):
+                await account_auth.register_auth_loss(
+                    account_user_id, exc, notify=True
+                )
             logger.exception("SpamBot temp client failed {}: {}", account_user_id, exc)
             _upsert_state(
                 account_user_id,
@@ -547,6 +555,13 @@ async def _run_spambot_dialog(
         await _apply_parse(account_user_id, parsed, reply_text)
         return {**parsed, "status": get_state(account_user_id).get("status")}
     except Exception as exc:
+        if account_auth.is_auth_loss_error(exc):
+            await account_auth.register_auth_loss(
+                account_user_id, exc, notify=True
+            )
+            await monitor_svc.disconnect_account(
+                account_user_id, cancel_tasks=True
+            )
         logger.exception("SpamBot dialog failed account={}: {}", account_user_id, exc)
         _upsert_state(
             account_user_id,

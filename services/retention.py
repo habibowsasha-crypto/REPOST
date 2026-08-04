@@ -13,6 +13,7 @@ from telethon.tl.types import InputPeerUser
 
 from config import API_HASH, API_ID, LOCAL_DIALOG_TEXT_RETENTION_DAYS
 from db.schema import db_lock, get_connection
+from services import account_auth
 from services import monitor as monitor_svc
 from services import telegram_history
 
@@ -382,6 +383,13 @@ async def process_due_telegram_deletions(limit: int = 10) -> int:
                 client = await _temporary_client(session)
                 temporary = True
             except Exception as exc:
+                if (
+                    account_auth.is_auth_loss_error(exc)
+                    or "not_authorized" in str(exc).lower()
+                ):
+                    await account_auth.register_auth_loss(
+                        account, exc, notify=True
+                    )
                 for row in account_rows:
                     _schedule_retry(row, f"{type(exc).__name__}: {exc}")
                 logger.exception(
@@ -408,6 +416,13 @@ async def process_due_telegram_deletions(limit: int = 10) -> int:
                         deleted,
                     )
                 except Exception as exc:
+                    if account_auth.is_auth_loss_error(exc):
+                        await account_auth.register_auth_loss(
+                            account, exc, notify=True
+                        )
+                        await monitor_svc.disconnect_account(
+                            account, cancel_tasks=True
+                        )
                     _schedule_retry(row, f"{type(exc).__name__}: {exc}")
                     logger.exception(
                         "Telegram retention failed account={} target={} source={}: {}",

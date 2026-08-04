@@ -1,6 +1,20 @@
-# Channel DM Bot v1.0.56
+# Channel DM Bot v1.0.57
 
 Telegram user-account DM bot: monitors selected groups, builds one shared lead queue, sends First DM, continues active dialogs, handles refusals, sends only the administrator's exact channel link, and stores durable state in SQLite.
+
+
+## Changes in v1.0.57 - account authorization recovery
+
+- Telegram session loss is now stored as a durable `reauth_required` account state.
+- The bot detects `session not authorized` and known authorization-loss errors during startup, periodic health checks, First DM and dialog sends.
+- A lost account is immediately removed from active monitoring and First DM account selection.
+- Existing dialogs remain assigned to the same account and wait for re-login. They are never transferred to another Telegram account.
+- The administrator receives one alert per authorization-loss incident with buttons: `ПЕРЕЗАЙТИ`, `УДАЛИТЬ АККАУНТ`, and `ОТКРЫТЬ АККАУНТ`.
+- Re-login uses the stored phone when available, requests Telegram code and 2FA, verifies the exact expected Telegram user ID, and preserves First DM settings, dialogs and statistics.
+- Account deletion still requires confirmation, closes only that account's active dialogs and preserves historical statistics.
+- Main menu, account list and account card show a red `Требуется повторный вход` state and a dedicated problem-account button.
+- `ПРОВЕРИТЬ СНОВА` performs a manual authorization check without treating temporary network errors as logout.
+- No First DM limit, interval, pause, quota, filter or account-selection priority was changed.
 
 
 ## Changes in v1.0.56 - production log stability hotfix

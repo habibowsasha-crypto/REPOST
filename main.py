@@ -106,6 +106,10 @@ def run() -> None:
                 except Exception as exc:
                     logger.exception("spambot due loop: {}", exc)
                 try:
+                    await monitor_svc.check_authorization_health()
+                except Exception as exc:
+                    logger.exception("account authorization health loop: {}", exc)
+                try:
                     await dialog_engine.recover_ambiguous_dialog_messages()
                 except Exception as exc:
                     logger.exception("dialog delivery recovery loop: {}", exc)

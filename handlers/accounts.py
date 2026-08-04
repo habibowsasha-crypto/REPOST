@@ -61,35 +61,44 @@ async def _disconnect_client(client: TelegramClient | None) -> None:
 async def show_accounts_menu(event, *, edit: bool = True) -> None:
     total = accounts_svc.count_accounts()
     active = accounts_svc.count_participating()
+    authorized = accounts_svc.count_authorized()
+    reauth = accounts_svc.count_reauth_required()
     rows = accounts_svc.list_accounts()
-    paused = sum(1 for row in rows if row.get("is_paused"))
+    paused = sum(
+        1
+        for row in rows
+        if row.get("is_paused") and not accounts_svc.is_reauth_required(row)
+    )
     finishing = sum(
         1
         for row in rows
         if not row.get("participates")
+        and not accounts_svc.is_reauth_required(row)
         and accounts_svc.dashboard_account_line(row).find("завершает") >= 0
     )
     text = screen(
         "👤",
         "Аккаунты",
         join(
-            f"├ Всего подключено: **{total}**",
+            f"├ Всего: **{total}**",
+            f"├ Авторизованы: **{authorized}**",
+            f"├ Требуют повторного входа: **{reauth}**",
             f"├ First DM включены: **{active}**",
             f"├ Ограничены Telegram: **{paused}**",
             f"└ Завершают диалоги: **{finishing}**",
         ),
-        "🟢 работает · 🟡 отключён от новых First DM · 🔴 ограничен Telegram",
+        "🟢 работает · 🟡 First DM отключены · 🔴 требуется вход",
     )
-    await render_menu(
-        event,
-        text,
-        [
-            [btn("➕ ДОБАВИТЬ АККАУНТ", b"acc_add")],
-            [btn("📋 ОТКРЫТЬ СПИСОК", b"acc_list")],
-            back_home_row(),
-        ],
-        edit=edit,
-    )
+    buttons = [
+        [btn("➕ ДОБАВИТЬ АККАУНТ", b"acc_add")],
+        [btn("📋 ОТКРЫТЬ СПИСОК", b"acc_list")],
+    ]
+    if reauth:
+        buttons.append(
+            [btn(f"🔴 НУЖЕН ВХОД · {reauth}", b"acc_problem_list")]
+        )
+    buttons.append(back_home_row())
+    await render_menu(event, text, buttons, edit=edit)
 
 
 async def show_account_list(event, *, edit: bool = True) -> None:
@@ -110,8 +119,10 @@ async def show_account_list(event, *, edit: bool = True) -> None:
     body = "\n\n".join(accounts_svc.dashboard_account_line(acc) for acc in rows)
     buttons: list[list[Button]] = []
     for acc in rows:
-        if acc.get("is_paused"):
+        if accounts_svc.is_reauth_required(acc):
             icon = "🔴"
+        elif acc.get("is_paused"):
+            icon = "🟠"
         elif acc.get("participates"):
             icon = "🟢"
         else:
@@ -129,6 +140,36 @@ async def show_account_list(event, *, edit: bool = True) -> None:
     )
 
 
+async def show_problem_accounts(event, *, edit: bool = True) -> None:
+    rows = accounts_svc.list_reauth_required()
+    if not rows:
+        await render_menu(
+            event,
+            screen("✅", "Проблемные аккаунты", "Все аккаунты авторизованы."),
+            [back_row(b"menu_accounts"), back_home_row()],
+            edit=edit,
+        )
+        return
+    body = "\n\n".join(accounts_svc.dashboard_account_line(acc) for acc in rows)
+    buttons = [
+        [
+            btn(
+                f"🔴 {accounts_svc.format_account_label(acc, include_id=False)[:28]}",
+                f"acc_card_{acc['user_id']}",
+            )
+        ]
+        for acc in rows
+    ]
+    buttons.append(back_row(b"menu_accounts"))
+    buttons.append(back_home_row())
+    await render_menu(
+        event,
+        screen("🔴", "Требуется повторный вход", body),
+        buttons,
+        edit=edit,
+    )
+
+
 async def show_account_card(event, user_id: int, *, edit: bool = True) -> None:
     acc = accounts_svc.get_account(user_id)
     if not acc:
@@ -141,42 +182,74 @@ async def show_account_card(event, user_id: int, *, edit: bool = True) -> None:
         return
 
     label = accounts_svc.format_account_label(acc)
-    status = accounts_svc.account_status_line(acc)
     phone = (acc.get("phone") or "").strip() or "не указан"
+    from services import chats as chats_svc
+    from services import dialog_store as dialog_store_svc
+    from services import monitor as monitor_svc
+    from services import spambot as spambot_svc
+
+    active_dialogs = dialog_store_svc.count_open_for_account(user_id)
+    retention_waiting = dialog_store_svc.count_retention_waiting_for_account(user_id)
+    connected = int(user_id) in set(monitor_svc.connected_account_ids())
+    auth_lost = accounts_svc.is_reauth_required(acc)
+
+    if auth_lost:
+        error = (acc.get("auth_error") or "session_not_authorized").strip()
+        if len(error) > 110:
+            error = error[:107] + "..."
+        text = screen(
+            "👤",
+            label,
+            join(
+                "🔴 Состояние: **требуется повторный вход**",
+                "📨 First DM: **остановлены**",
+                f"💬 Активных диалогов: **{active_dialogs}**",
+                f"🗑 Ожидают очистки: **{retention_waiting}**",
+                "📡 Мониторинг: **остановлен**",
+            ),
+            join(
+                "Telegram-сессия больше не действует.",
+                "Новые сообщения с аккаунта не отправляются.",
+                "Перезайдите в аккаунт или удалите его из бота.",
+            ),
+            join(
+                f"🆔 ID: `{acc['user_id']}`",
+                f"📱 Телефон: `{phone}`",
+                f"⚠ Причина: `{error}`",
+                f"🕒 Обнаружено: `{(acc.get('auth_lost_at') or '')[:19] or '-'}`",
+            ),
+        )
+        buttons = [
+            [btn("🔑 ПЕРЕЗАЙТИ", f"acc_relogin_{user_id}")],
+            [btn("🗑 УДАЛИТЬ АККАУНТ", f"acc_del_ask_{user_id}")],
+            [btn("🔄 ПРОВЕРИТЬ СНОВА", f"acc_auth_check_{user_id}")],
+            back_row(b"acc_list"),
+            back_home_row(),
+        ]
+        await render_menu(event, text, buttons, edit=edit)
+        return
+
     toggle_label = (
         "⏸ ОТКЛЮЧИТЬ FIRST DM"
         if acc.get("participates")
         else "▶️ ВКЛЮЧИТЬ FIRST DM"
     )
-    from services import chats as chats_svc
-
     mode = chats_svc.get_chat_mode(user_id)
     mode_label = (
-        "все + исключения"
-        if mode == chats_svc.CHAT_MODE_ALL
-        else "вручную"
+        "все + исключения" if mode == chats_svc.CHAT_MODE_ALL else "вручную"
     )
     watchable = chats_svc.count_watchable(user_id)
-    from services import monitor as monitor_svc
-    connected = int(user_id) in set(monitor_svc.connected_account_ids())
-    mon_line = "online" if connected else "offline"
-    discovered_n = len(chats_svc.list_discovered(user_id))
-    from services import spambot as spambot_svc
-
     sb = spambot_svc.get_state(user_id)
     sb_status = sb.get("status") or "idle"
     sb_reply = (sb.get("last_reply") or "").strip()
     if len(sb_reply) > 120:
-        sb_reply = sb_reply[:120] + "…"
+        sb_reply = sb_reply[:120] + "..."
     sb_next = (sb.get("next_check_at") or "")[:19] or "-"
     cooldown = (acc.get("cooldown_until") or "")[:19] or "-"
-    mon_icon = ON if connected else OFF
     sb_block = f"Ответ: {sb_reply}" if sb_reply else ""
-    from services import dialog_store as dialog_store_svc
-    active_dialogs = dialog_store_svc.count_open_for_account(user_id)
-    retention_waiting = dialog_store_svc.count_retention_waiting_for_account(user_id)
+
     if acc.get("is_paused"):
-        state_line = f"🔴 Ограничен: **{acc.get('pause_reason') or 'пауза'}**"
+        state_line = f"🟠 Ограничен: **{acc.get('pause_reason') or 'пауза'}**"
     elif acc.get("participates"):
         state_line = "🟢 Состояние: **работает**"
     elif active_dialogs:
@@ -192,15 +265,15 @@ async def show_account_card(event, user_id: int, *, edit: bool = True) -> None:
             f"📨 First DM: **{'включены' if acc.get('participates') else 'отключены'}**",
             f"💬 Активных диалогов: **{active_dialogs}**",
             f"🗑 Ожидают очистки: **{retention_waiting}**",
-            f"📡 Мониторинг: **{mon_line}**",
+            f"📡 Мониторинг: **{'online' if connected else 'offline'}**",
         ),
         join(
             f"⏱ Интервал First DM: **{accounts_svc.format_dm_interval(acc)}**",
             f"📍 Чаты: **{mode_label} · {watchable} в мониторинге**",
             f"🤖 SpamBot: **{sb_status}**",
-            *( [f"⏳ Ограничение до: `{cooldown}`"] if cooldown != "-" else [] ),
-            *( [f"🔄 Следующая проверка: `{sb_next}`"] if sb_next != "-" else [] ),
-            *( [sb_block] if sb_block else [] ),
+            *([f"⏳ Ограничение до: `{cooldown}`"] if cooldown != "-" else []),
+            *([f"🔄 Следующая проверка: `{sb_next}`"] if sb_next != "-" else []),
+            *([sb_block] if sb_block else []),
         ),
         join(
             f"🆔 ID: `{acc['user_id']}`",
@@ -244,6 +317,15 @@ async def cb_acc_list(event: events.CallbackQuery.Event) -> None:
     await event.answer()
 
 
+@bot.on(events.CallbackQuery(data=b"acc_problem_list"))
+async def cb_acc_problem_list(event: events.CallbackQuery.Event) -> None:
+    if not is_admin(event.sender_id):
+        await event.answer(DENIED, alert=True)
+        return
+    await show_problem_accounts(event)
+    await event.answer()
+
+
 @bot.on(events.CallbackQuery(pattern=rb"^acc_card_(\d+)$"))
 async def cb_acc_card(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
@@ -265,6 +347,10 @@ async def cb_acc_toggle(event: events.CallbackQuery.Event) -> None:
         await event.answer("Не найден", alert=True)
         return
     new_value = not bool(acc.get("participates"))
+    if new_value and accounts_svc.is_reauth_required(acc):
+        await event.answer("Сначала выполните повторный вход", alert=True)
+        await show_account_card(event, user_id)
+        return
     accounts_svc.set_participates(user_id, new_value)
     try:
         from services import monitor as monitor_svc
@@ -276,6 +362,134 @@ async def cb_acc_toggle(event: events.CallbackQuery.Event) -> None:
 
 
 # acc_chats handler lives in handlers/chats.py (Step 4).
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^acc_relogin_(\d+)$"))
+async def cb_acc_relogin(event: events.CallbackQuery.Event) -> None:
+    if not is_admin(event.sender_id):
+        await event.answer(DENIED, alert=True)
+        return
+    user_id = int(event.pattern_match.group(1))
+    acc = accounts_svc.get_account(user_id)
+    if not acc:
+        await event.answer("Не найден", alert=True)
+        return
+
+    admin_id = int(event.sender_id)
+    previous = get_state(admin_id)
+    if previous and previous.get("client"):
+        await _disconnect_client(previous.get("client"))
+    clear_state(admin_id)
+
+    phone = (acc.get("phone") or "").strip()
+    if not phone:
+        set_state(
+            admin_id,
+            flow="login",
+            login_mode="reauth",
+            target_user_id=user_id,
+            step="phone",
+        )
+        await render_menu(
+            event,
+            screen(
+                "🔑",
+                "Повторный вход",
+                f"Аккаунт: **{accounts_svc.format_account_label(acc, include_id=False)}**",
+                "Отправьте номер телефона в международном формате.",
+                "Пример: `+79001234567`",
+                "Отмена: /cancel",
+            ),
+            [[btn("❌ ОТМЕНА", b"acc_cancel")]],
+        )
+        await event.answer()
+        return
+
+    client = TelegramClient(StringSession(), API_ID, API_HASH)
+    try:
+        await client.connect()
+        await client.send_code_request(phone)
+    except Exception as exc:
+        await _disconnect_client(client)
+        logger.warning(
+            "Re-login code request failed account={} error={}",
+            user_id,
+            type(exc).__name__,
+        )
+        await event.answer("Не удалось отправить код", alert=True)
+        await show_account_card(event, user_id)
+        return
+
+    set_state(
+        admin_id,
+        flow="login",
+        login_mode="reauth",
+        target_user_id=user_id,
+        step="code",
+        phone=phone,
+        client=client,
+    )
+    await render_menu(
+        event,
+        screen(
+            "🔑",
+            "Повторный вход",
+            f"Аккаунт: **{accounts_svc.format_account_label(acc, include_id=False)}**",
+            f"Код отправлен на `{phone}`.",
+            "Пришлите код из Telegram только цифрами.",
+            "Если включена 2FA, бот затем запросит пароль.",
+            "Отмена: /cancel",
+        ),
+        [[btn("❌ ОТМЕНА", b"acc_cancel")]],
+    )
+    await event.answer("Код отправлен")
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^acc_auth_check_(\d+)$"))
+async def cb_acc_auth_check(event: events.CallbackQuery.Event) -> None:
+    if not is_admin(event.sender_id):
+        await event.answer(DENIED, alert=True)
+        return
+    user_id = int(event.pattern_match.group(1))
+    acc = accounts_svc.get_account(user_id)
+    if not acc:
+        await event.answer("Не найден", alert=True)
+        return
+    client = TelegramClient(StringSession(acc.get("session_string") or ""), API_ID, API_HASH)
+    try:
+        await client.connect()
+        authorized = bool(await client.is_user_authorized())
+    except Exception as exc:
+        from services import account_auth
+
+        if account_auth.is_auth_loss_error(exc):
+            authorized = False
+        else:
+            logger.warning(
+                "Manual auth check temporary failure account={} error={}",
+                user_id,
+                type(exc).__name__,
+            )
+            await event.answer("Временная ошибка проверки", alert=True)
+            await _disconnect_client(client)
+            return
+    finally:
+        await _disconnect_client(client)
+
+    from services import account_auth
+    from services import monitor as monitor_svc
+
+    if authorized:
+        account_auth.mark_authorized(user_id)
+        await monitor_svc.refresh_monitor()
+        await event.answer("Аккаунт авторизован")
+    else:
+        await account_auth.register_auth_loss(
+            user_id, "session_not_authorized", notify=True
+        )
+        await monitor_svc.disconnect_account(user_id, cancel_tasks=True)
+        await event.answer("Нужен повторный вход", alert=True)
+    await show_account_card(event, user_id)
 
 
 @bot.on(events.CallbackQuery(pattern=rb"^acc_del_ask_(\d+)$"))
@@ -373,10 +587,14 @@ async def cb_acc_cancel(event: events.CallbackQuery.Event) -> None:
         return
     admin_id = int(event.sender_id)
     state = get_state(admin_id)
+    target_user_id = int(state.get("target_user_id")) if state and state.get("target_user_id") else None
     if state and state.get("client"):
         await _disconnect_client(state.get("client"))
     clear_state(admin_id)
-    await show_accounts_menu(event)
+    if target_user_id is not None:
+        await show_account_card(event, target_user_id)
+    else:
+        await show_accounts_menu(event)
     await event.answer("Отменено")
 
 
@@ -392,9 +610,12 @@ async def cmd_cancel(event: events.NewMessage.Event) -> None:
     if state.get("client"):
         await _disconnect_client(state.get("client"))
     flow = state.get("flow")
+    target_user_id = int(state.get("target_user_id")) if state.get("target_user_id") else None
     clear_state(admin_id)
     await event.respond("Ок, отменено.")
-    if flow == "login":
+    if flow == "login" and target_user_id is not None:
+        await show_account_card(event, target_user_id, edit=False)
+    elif flow == "login":
         await show_accounts_menu(event, edit=False)
 
 
@@ -513,11 +734,43 @@ async def _finish_login(
     client: TelegramClient,
     phone: str,
 ) -> None:
+    state = get_state(admin_id) or {}
+    login_mode = str(state.get("login_mode") or "add")
+    target_user_id = (
+        int(state.get("target_user_id"))
+        if state.get("target_user_id") is not None
+        else None
+    )
     try:
         me = await client.get_me()
+        actual_user_id = int(me.id)
+        if login_mode == "reauth" and target_user_id is not None:
+            if actual_user_id != target_user_id:
+                await event.respond(
+                    "⚠ Вы вошли в другой Telegram-аккаунт.\n\n"
+                    f"Ожидался ID: `{target_user_id}`\n"
+                    f"Получен ID: `{actual_user_id}`\n\n"
+                    "Сессия не сохранена. Нажмите «Перезайти» и используйте нужный номер.",
+                    buttons=[
+                        [
+                            Button.inline(
+                                "🔑 ПЕРЕЗАЙТИ",
+                                f"acc_relogin_{target_user_id}".encode(),
+                            )
+                        ],
+                        [
+                            Button.inline(
+                                "👤 К АККАУНТУ",
+                                f"acc_card_{target_user_id}".encode(),
+                            )
+                        ],
+                    ],
+                )
+                return
+
         session_string = client.session.save()
         accounts_svc.upsert_account(
-            user_id=int(me.id),
+            user_id=actual_user_id,
             session_string=session_string,
             phone=phone or None,
             username=getattr(me, "username", None),
@@ -526,23 +779,66 @@ async def _finish_login(
         )
         label = accounts_svc.format_account_label(
             {
-                "user_id": int(me.id),
+                "user_id": actual_user_id,
                 "username": getattr(me, "username", None),
                 "first_name": getattr(me, "first_name", None),
                 "last_name": getattr(me, "last_name", None),
             }
         )
-        await event.respond(
-            f"✅ Аккаунт сохранён: **{label}**\n\n"
-            "По умолчанию **не участвует** в рассылке.\n"
-            "Откройте карточку и нажмите «Включить участие».",
-            buttons=[
-                [Button.inline("👤 Открыть карточку", f"acc_card_{me.id}".encode())],
-                [Button.inline("📋 К списку", b"acc_list")],
-                back_home_row(),
-            ],
-        )
-        logger.info("Account saved user_id={} by admin={}", me.id, admin_id)
+
+        from services import account_auth
+        from services import monitor as monitor_svc
+
+        account_auth.mark_authorized(actual_user_id)
+        await monitor_svc.refresh_monitor()
+
+        if login_mode == "reauth":
+            await event.respond(
+                "\n".join(
+                    [
+                        "✅ **АККАУНТ СНОВА ПОДКЛЮЧЁН**",
+                        "━━━━━━━━━━━━━━━━━━",
+                        "",
+                        f"Аккаунт: **{label}**",
+                        "",
+                        "Мониторинг восстановлен.",
+                        "Настройки First DM сохранены.",
+                        "Диалоги и статистика сохранены.",
+                    ]
+                ),
+                buttons=[
+                    [
+                        Button.inline(
+                            "👤 К АККАУНТУ",
+                            f"acc_card_{actual_user_id}".encode(),
+                        )
+                    ],
+                    [Button.inline("📋 К АККАУНТАМ", b"acc_list")],
+                    back_home_row(),
+                ],
+            )
+            logger.info(
+                "Account reauthorized user_id={} by admin={}",
+                actual_user_id,
+                admin_id,
+            )
+        else:
+            await event.respond(
+                f"✅ Аккаунт сохранён: **{label}**\n\n"
+                "По умолчанию **не участвует** в рассылке.\n"
+                "Откройте карточку и нажмите «Включить участие».",
+                buttons=[
+                    [
+                        Button.inline(
+                            "👤 Открыть карточку",
+                            f"acc_card_{actual_user_id}".encode(),
+                        )
+                    ],
+                    [Button.inline("📋 К списку", b"acc_list")],
+                    back_home_row(),
+                ],
+            )
+            logger.info("Account saved user_id={} by admin={}", actual_user_id, admin_id)
     except Exception as exc:
         logger.exception("finish_login failed: {}", exc)
         await event.respond(f"⚠ Не удалось сохранить аккаунт: `{type(exc).__name__}`")

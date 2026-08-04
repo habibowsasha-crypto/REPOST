@@ -54,9 +54,45 @@ def count_accounts() -> int:
 def count_participating() -> int:
     conn = get_connection()
     row = conn.execute(
-        "SELECT COUNT(*) AS c FROM accounts WHERE participates=1"
+        """
+        SELECT COUNT(*) AS c
+          FROM accounts
+         WHERE participates=1
+           AND COALESCE(auth_status, 'unknown') != 'reauth_required'
+        """
     ).fetchone()
     return int(row["c"] if row else 0)
+
+
+def count_authorized() -> int:
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM accounts WHERE auth_status='authorized'"
+    ).fetchone()
+    return int(row["c"] if row else 0)
+
+
+def count_reauth_required() -> int:
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM accounts WHERE auth_status='reauth_required'"
+    ).fetchone()
+    return int(row["c"] if row else 0)
+
+
+def list_reauth_required() -> list[dict[str, Any]]:
+    return [
+        row
+        for row in list_accounts()
+        if str(row.get("auth_status") or "unknown") == "reauth_required"
+    ]
+
+
+def is_reauth_required(acc: dict[str, Any] | None) -> bool:
+    return bool(
+        acc
+        and str(acc.get("auth_status") or "unknown") == "reauth_required"
+    )
 
 
 def list_accounts() -> list[dict[str, Any]]:
@@ -73,6 +109,8 @@ def list_accounts() -> list[dict[str, Any]]:
                COALESCE(peerflood_streak, 0) AS peerflood_streak,
                peerflood_last_at,
                interval_backup_min, interval_backup_max, interval_backoff_until,
+               COALESCE(auth_status, 'unknown') AS auth_status,
+               auth_error, auth_lost_at, auth_notified_at,
                created_at, updated_at
           FROM accounts
          ORDER BY created_at DESC
@@ -95,6 +133,8 @@ def get_account(user_id: int) -> Optional[dict[str, Any]]:
                COALESCE(peerflood_streak, 0) AS peerflood_streak,
                peerflood_last_at,
                interval_backup_min, interval_backup_max, interval_backoff_until,
+               COALESCE(auth_status, 'unknown') AS auth_status,
+               auth_error, auth_lost_at, auth_notified_at,
                created_at, updated_at
           FROM accounts
          WHERE user_id=?
@@ -130,6 +170,10 @@ def upsert_account(
                        username=?,
                        first_name=?,
                        last_name=?,
+                       auth_status='authorized',
+                       auth_error=NULL,
+                       auth_lost_at=NULL,
+                       auth_notified_at=NULL,
                        updated_at=?
                  WHERE user_id=?
                 """,
@@ -148,8 +192,9 @@ def upsert_account(
                 """
                 INSERT INTO accounts (
                     user_id, session_string, phone, username, first_name, last_name,
-                    participates, is_paused, chat_mode, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 'manual', ?, ?)
+                    participates, is_paused, chat_mode, auth_status,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 'manual', 'authorized', ?, ?)
                 """,
                 (
                     int(user_id),
@@ -353,6 +398,8 @@ def format_account_label(acc: dict[str, Any], *, include_id: bool = True) -> str
 
 
 def account_status_line(acc: dict[str, Any]) -> str:
+    if is_reauth_required(acc):
+        return "требуется повторный вход"
     parts = []
     if acc.get("participates"):
         parts.append("участвует")
@@ -403,6 +450,9 @@ def dashboard_account_line(acc: dict[str, Any]) -> str:
     )
     participates = bool(acc.get("participates"))
     paused = bool(acc.get("is_paused"))
+
+    if is_reauth_required(acc):
+        return f"🔴 **{label}**\n└ Требуется повторный вход · диалогов {dialogs}"
 
     if paused:
         reason = (acc.get("pause_reason") or "пауза").strip()

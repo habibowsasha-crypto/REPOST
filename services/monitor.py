@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any, Optional
 
 from loguru import logger
@@ -11,6 +12,7 @@ from telethon.sessions import StringSession
 from telethon.tl.types import User
 
 from config import API_HASH, API_ID
+from services import account_auth
 from services import accounts as accounts_svc
 from services import chats as chats_svc
 from services import queue as queue_svc
@@ -21,6 +23,8 @@ _started = False
 _lock = asyncio.Lock()
 _bg_tasks: set[asyncio.Task] = set()
 _bg_tasks_by_account: dict[int, set[asyncio.Task]] = {}
+_last_auth_health_check = 0.0
+_AUTH_HEALTH_INTERVAL_SECONDS = 60.0
 
 
 def _track_dialog_task(account_user_id: int, task: asyncio.Task) -> None:
@@ -89,6 +93,11 @@ async def start_monitor() -> None:
             len(_clients),
             list(_clients.keys()),
         )
+    pending_alerts = await account_auth.notify_pending_reauth_required()
+    if pending_alerts:
+        logger.warning(
+            "Delivered {} pending account authorization alert(s)", pending_alerts
+        )
 
 
 async def stop_monitor() -> None:
@@ -132,6 +141,8 @@ async def _sync_clients_unlocked() -> None:
     wanted: set[int] = set()
     for acc in accounts_svc.list_accounts():
         uid = int(acc["user_id"])
+        if accounts_svc.is_reauth_required(acc):
+            continue
         # Disabled accounts stay connected only while their own existing dialogs are open.
         needs_dialog_client = dialog_store_svc.has_open_for_account(uid)
         if not acc.get("participates") and not needs_dialog_client:
@@ -158,8 +169,12 @@ async def _sync_clients_unlocked() -> None:
             await client.connect()
             if not await client.is_user_authorized():
                 logger.warning("Monitor: account {} session not authorized", uid)
+                await account_auth.register_auth_loss(
+                    uid, "session_not_authorized", notify=True
+                )
                 await _safe_disconnect(client)
                 continue
+            account_auth.mark_authorized(uid)
             _register_handler(client, uid)
             _clients[uid] = client
             n_chats = len(chats_svc.list_watchable_ids(uid))
@@ -169,7 +184,15 @@ async def _sync_clients_unlocked() -> None:
                 n_chats,
             )
         except Exception as exc:
-            logger.exception("Monitor: failed to start account {}: {}", uid, exc)
+            if account_auth.is_auth_loss_error(exc):
+                logger.warning(
+                    "Monitor: account {} authorization lost during connect: {}",
+                    uid,
+                    type(exc).__name__,
+                )
+                await account_auth.register_auth_loss(uid, exc, notify=True)
+            else:
+                logger.exception("Monitor: failed to start account {}: {}", uid, exc)
             await _safe_disconnect(client)
 
 
@@ -189,6 +212,17 @@ def _register_handler(client: TelegramClient, account_user_id: int) -> None:
                 )
                 await _handle_group(account_user_id, event)
         except Exception as exc:
+            if account_auth.is_auth_loss_error(exc):
+                logger.warning(
+                    "Monitor handler detected authorization loss account={} error={}",
+                    account_user_id,
+                    type(exc).__name__,
+                )
+                await account_auth.register_auth_loss(
+                    account_user_id, exc, notify=True
+                )
+                await disconnect_account(account_user_id, cancel_tasks=True)
+                return
             logger.exception(
                 "Monitor handler error account={}: {}", account_user_id, exc
             )
@@ -348,6 +382,42 @@ async def disconnect_account(account_user_id: int, *, cancel_tasks: bool = True)
         client = _clients.pop(uid, None)
         await _safe_disconnect(client)
     logger.info("Monitor: account {} removed from active memory", uid)
+
+
+async def check_authorization_health(*, force: bool = False) -> int:
+    """Periodically verify connected sessions and quarantine revoked accounts."""
+    global _last_auth_health_check
+    now = time.monotonic()
+    if not force and now - _last_auth_health_check < _AUTH_HEALTH_INTERVAL_SECONDS:
+        return 0
+    _last_auth_health_check = now
+
+    lost = 0
+    for uid, client in list(_clients.items()):
+        try:
+            authorized = bool(await client.is_user_authorized())
+        except Exception as exc:
+            if not account_auth.is_auth_loss_error(exc):
+                logger.warning(
+                    "Authorization health check temporary failure account={} error={}",
+                    uid,
+                    type(exc).__name__,
+                )
+                continue
+            authorized = False
+            reason: str | BaseException = exc
+        else:
+            reason = "session_not_authorized"
+
+        if authorized:
+            account_auth.mark_authorized(uid)
+            continue
+
+        await account_auth.register_auth_loss(uid, reason, notify=True)
+        await disconnect_account(uid, cancel_tasks=True)
+        lost += 1
+        logger.warning("Authorization health check quarantined account={}", uid)
+    return lost
 
 
 async def maybe_disconnect_inactive_account(account_user_id: int) -> bool:

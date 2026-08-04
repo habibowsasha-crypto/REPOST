@@ -18,6 +18,7 @@ from telethon.errors import (
     ChatWriteForbiddenError,
 )
 
+from services import account_auth
 from services import ai_dialog
 from services import dialog_inbox
 from services import dialog_store as store
@@ -625,6 +626,24 @@ async def _send_prepared_action(
         await _cleanup_disabled_account(account_user_id)
         return "failed"
     except Exception as exc:
+        if account_auth.is_auth_loss_error(exc):
+            dialog_delivery.mark_failed(
+                target_user_id, action_kind, "authorization_lost"
+            )
+            await account_auth.register_auth_loss(
+                account_user_id, exc, notify=True
+            )
+            await monitor_svc.disconnect_account(
+                account_user_id, cancel_tasks=True
+            )
+            logger.warning(
+                "Dialog send stopped because authorization was lost "
+                "kind={} account={} target={}",
+                action_kind,
+                account_user_id,
+                target_user_id,
+            )
+            return "retry"
         # Telegram may have accepted the message even when the network response was
         # lost. Keep PREPARED and reconcile against real chat history before retry.
         logger.exception(
@@ -656,6 +675,17 @@ async def _reconcile_prepared_action(row: dict) -> bool:
             since=lower_bound,
         )
     except Exception as exc:
+        if account_auth.is_auth_loss_error(exc):
+            await account_auth.register_auth_loss(account, exc, notify=True)
+            await monitor_svc.disconnect_account(account, cancel_tasks=True)
+            logger.warning(
+                "Dialog recovery paused because authorization was lost "
+                "kind={} account={} target={}",
+                kind,
+                account,
+                target,
+            )
+            return False
         logger.exception(
             "Cannot inspect Telegram history kind={} account={} target={}: {}",
             kind,

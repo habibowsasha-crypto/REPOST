@@ -47,6 +47,7 @@ from services.ui import (
 
 
 def _main_menu_buttons():
+    from services import accounts as accounts_svc
     from services import dispatcher as dispatcher_svc
 
     running = bool(dispatcher_svc.worker_status().get("enabled"))
@@ -55,13 +56,23 @@ def _main_menu_buttons():
         if running
         else btn("▶️ ЗАПУСТИТЬ FIRST DM", b"bc_toggle")
     )
-    return [
+    rows = [
         [toggle, btn("🔄 ОБНОВИТЬ", b"menu_refresh")],
         [btn("👤 АККАУНТЫ", b"menu_accounts"), btn("💬 ДИАЛОГИ", b"menu_dialogs")],
-        [btn("📬 ОЧЕРЕДЬ", b"bc_queue"), btn("📁 БАЗА ЛЮДЕЙ", b"menu_audience")],
-        [btn("🚫 НЕ ПИСАТЬ", b"menu_optout"), btn("📊 СТАТИСТИКА", b"bc_status")],
-        [btn("⚙️ НАСТРОЙКИ", b"menu_settings"), btn("ℹ️ ПОМОЩЬ", b"menu_help")],
     ]
+    reauth = accounts_svc.count_reauth_required()
+    if reauth:
+        rows.append(
+            [btn(f"🔴 НУЖЕН ВХОД · {reauth}", b"acc_problem_list")]
+        )
+    rows.extend(
+        [
+            [btn("📬 ОЧЕРЕДЬ", b"bc_queue"), btn("📁 БАЗА ЛЮДЕЙ", b"menu_audience")],
+            [btn("🚫 НЕ ПИСАТЬ", b"menu_optout"), btn("📊 СТАТИСТИКА", b"bc_status")],
+            [btn("⚙️ НАСТРОЙКИ", b"menu_settings"), btn("ℹ️ ПОМОЩЬ", b"menu_help")],
+        ]
+    )
+    return rows
 
 
 def _dashboard_text() -> str:
@@ -91,6 +102,20 @@ def _dashboard_text() -> str:
     closed_today = dialog_store_svc.count_closed_today()
     account_count = accounts_svc.count_accounts()
     acc_block = accounts_svc.dashboard_accounts_block(limit=8)
+    reauth_count = accounts_svc.count_reauth_required()
+    auth_warning = (
+        f"⚠️ **{reauth_count} аккаунт требует повторного входа**"
+        if reauth_count == 1
+        else (
+            f"⚠️ **{reauth_count} аккаунта требуют повторного входа**"
+            if 1 < reauth_count < 5
+            else (
+                f"⚠️ **{reauth_count} аккаунтов требуют повторного входа**"
+                if reauth_count
+                else ""
+            )
+        )
+    )
 
     if CHANNEL_LINK:
         link_line = "🔗 Канал: ✅ настроен"
@@ -123,6 +148,7 @@ def _dashboard_text() -> str:
         DIV,
         f"👤 **АККАУНТЫ · {account_count}**",
         acc_block,
+        *([auth_warning] if auth_warning else []),
         DIV,
         "💬 **ДИАЛОГИ**",
         f"├ Активные: **{dialogs}**",

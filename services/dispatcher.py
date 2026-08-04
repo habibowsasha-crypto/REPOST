@@ -19,6 +19,7 @@ from telethon.errors import (
 )
 from telethon.tl.types import InputPeerUser
 
+from services import account_auth
 from services import accounts as accounts_svc
 from services import first_dm_delivery
 from services import chats as chats_svc
@@ -119,7 +120,7 @@ async def _worker_loop() -> None:
 def _list_ready_accounts() -> list[dict[str, Any]]:
     ready: list[dict[str, Any]] = []
     for acc in accounts_svc.list_accounts():
-        if not acc.get("participates"):
+        if not acc.get("participates") or accounts_svc.is_reauth_required(acc):
             continue
         ok, _reason = pacing.account_is_send_ready(acc)
         if not ok:
@@ -158,7 +159,11 @@ def _participating_sender_ids() -> set[int]:
     return {
         int(acc["user_id"])
         for acc in accounts_svc.list_accounts()
-        if acc.get("participates") and acc.get("session_string")
+        if (
+            acc.get("participates")
+            and acc.get("session_string")
+            and not accounts_svc.is_reauth_required(acc)
+        )
     }
 
 
@@ -235,7 +240,7 @@ async def _attempt_lead_across_accounts(
             _remember_text(text)
             pacing.mark_global_sent()
             return True
-        if result in {"flood", "peerflood"}:
+        if result in {"flood", "peerflood", "auth_lost"}:
             had_account_cooldown = True
             continue
         if result == "error":
@@ -457,6 +462,22 @@ async def recover_ambiguous_first_dms() -> int:
                 since=lower_bound,
             )
         except Exception as exc:
+            if account_auth.is_auth_loss_error(exc):
+                await account_auth.register_auth_loss(account_id, exc, notify=True)
+                await monitor_svc.disconnect_account(account_id, cancel_tasks=True)
+                attempts = first_dm_delivery.defer_recovery(
+                    target_id,
+                    f"authorization_lost: {exc}",
+                    delay_seconds=21600,
+                )
+                logger.warning(
+                    "Prepared First DM recovery paused for authorization account={} "
+                    "target={} attempt={} retry_sec=21600",
+                    account_id,
+                    target_id,
+                    attempts,
+                )
+                continue
             peer_invalid = type(exc).__name__ == "PeerIdInvalidError"
             retry_sec = 21600 if peer_invalid else 900
             reason = "peer_id_invalid" if peer_invalid else type(exc).__name__
@@ -650,6 +671,23 @@ async def _send_first_dm(
         return "invalid"
 
     except Exception as exc:
+        if account_auth.is_auth_loss_error(exc):
+            logger.warning(
+                "First DM stopped because account authorization was lost "
+                "account={} target={} error={}",
+                account_id,
+                target_id,
+                type(exc).__name__,
+            )
+            if prepared:
+                first_dm_delivery.rollback(
+                    target_id, "authorization_lost", as_pending=True
+                )
+            else:
+                queue_svc.release_claim(target_id, as_pending=True)
+            await account_auth.register_auth_loss(account_id, exc, notify=True)
+            await monitor_svc.disconnect_account(account_id, cancel_tasks=True)
+            return "auth_lost"
         logger.exception(
             "First DM send became ambiguous account={} target={}: {}",
             account_id,
