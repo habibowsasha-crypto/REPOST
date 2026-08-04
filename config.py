@@ -71,17 +71,17 @@ AI_DM_ENABLED: bool = config("AI_DM_ENABLED", default="true").lower() in {
 # ---------------------------------------------------------------------------
 # Pacing (seconds unless noted)
 # ---------------------------------------------------------------------------
-DM_ACCOUNT_INTERVAL_MIN: int = int(config("DM_ACCOUNT_INTERVAL_MIN", default="600"))
-DM_ACCOUNT_INTERVAL_MAX: int = int(config("DM_ACCOUNT_INTERVAL_MAX", default="900"))
+DM_ACCOUNT_INTERVAL_MIN: int = int(config("DM_ACCOUNT_INTERVAL_MIN", default="120"))
+DM_ACCOUNT_INTERVAL_MAX: int = int(config("DM_ACCOUNT_INTERVAL_MAX", default="420"))
 DM_GLOBAL_SPACING_MIN: int = int(config("DM_GLOBAL_SPACING_MIN", default="90"))
 DM_GLOBAL_SPACING_MAX: int = int(config("DM_GLOBAL_SPACING_MAX", default="180"))
-DM_DAILY_LIMIT_PER_ACCOUNT: int = int(config("DM_DAILY_LIMIT_PER_ACCOUNT", default="45"))
-AI_REPLY_DELAY_MIN: int = int(config("AI_REPLY_DELAY_MIN", default="30"))
-AI_REPLY_DELAY_MAX: int = int(config("AI_REPLY_DELAY_MAX", default="90"))
+DM_DAILY_LIMIT_PER_ACCOUNT: int = int(config("DM_DAILY_LIMIT_PER_ACCOUNT", default="125"))
+AI_REPLY_DELAY_MIN: int = int(config("AI_REPLY_DELAY_MIN", default="20"))
+AI_REPLY_DELAY_MAX: int = int(config("AI_REPLY_DELAY_MAX", default="60"))
 AI_APOLOGY_DELAY_MIN: int = int(
     config(
         "AI_APOLOGY_DELAY_MIN",
-        default=config("AI_AUTO_LINK_DELAY_MIN", default="5"),
+        default=config("AI_AUTO_LINK_DELAY_MIN", default="60"),
     )
 )
 AI_APOLOGY_DELAY_MAX: int = int(
@@ -93,8 +93,15 @@ AI_APOLOGY_DELAY_MAX: int = int(
 # Backward-compatible aliases for existing runtime code and old deployments.
 AI_AUTO_LINK_DELAY_MIN: int = AI_APOLOGY_DELAY_MIN
 AI_AUTO_LINK_DELAY_MAX: int = AI_APOLOGY_DELAY_MAX
+PEER_FLOOD_COOLDOWN_MIN_SECONDS: int = int(
+    config("PEER_FLOOD_COOLDOWN_MIN_SECONDS", default="60")
+)
+PEER_FLOOD_COOLDOWN_MAX_SECONDS: int = int(
+    config("PEER_FLOOD_COOLDOWN_MAX_SECONDS", default="90")
+)
+# Legacy compatibility for deployments that still define only the old minute key.
 PEER_FLOOD_MIN_COOLDOWN_MINUTES: int = int(
-    config("PEER_FLOOD_MIN_COOLDOWN_MINUTES", default="30")
+    config("PEER_FLOOD_MIN_COOLDOWN_MINUTES", default="1")
 )
 SPAMBOT_AUTO_RESUME: bool = config("SPAMBOT_AUTO_RESUME", default="true").lower() in {
     "1",

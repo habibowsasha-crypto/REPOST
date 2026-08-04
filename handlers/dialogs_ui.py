@@ -20,6 +20,9 @@ _STAGE_LABELS = {
     dialog_store_svc.STAGE_ENGAGED: "диалог начат",
     dialog_store_svc.STAGE_EXPLAINED: "ждёт ссылки",
     dialog_store_svc.STAGE_LINK_SENT: "ссылка отправлена",
+    dialog_store_svc.STAGE_PROMO_SENT: "реклама отправлена",
+    dialog_store_svc.STAGE_APOLOGY_SENT: "извинение отправлено",
+    dialog_store_svc.STAGE_LINK_HELP_SENT: "инструкция отправлена",
     dialog_store_svc.STAGE_CLOSED: "завершён",
 }
 
@@ -39,7 +42,7 @@ def _target_label(row: dict) -> str:
 
 def _date(value: str | None) -> str:
     if not value:
-        return "—"
+        return "-"
     try:
         parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         if parsed.tzinfo is None:

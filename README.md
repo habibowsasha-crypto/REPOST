@@ -1,6 +1,37 @@
-# Channel DM Bot v1.0.62
+# Channel DM Bot v1.0.64
 
 Telegram user-account DM bot: monitors selected groups, builds one shared lead queue, sends First DM, continues active dialogs, handles refusals, sends only the administrator's exact channel link, and stores durable state in SQLite.
+
+
+## Changes in v1.0.64 - simple First DM and varied four-step funnel
+
+- First DM is now only a simple everyday opener such as `Привет, можно один вопрос?`, `Привет, ты занят?` or `Не отвлеку?`.
+- First DM no longer asks about markets, positions, signals, formats, timeframes or trading.
+- After any allowed reply, the bot immediately sends the complete promo with the exact administrator `CHANNEL_LINK`. No extra market question is inserted.
+- After the promo, the bot sends a varied smoothing apology.
+- After the apology, the bot automatically sends a separate instruction explaining how to close the `Заблокировать / Добавить` panel, press the link again and copy it manually if Telegram still blocks the transition.
+- The standard path therefore uses four outgoing bot messages: First DM, promo, apology and link-opening instruction. The global maximum remains five outgoing messages, leaving one slot for a user-initiated follow-up when available.
+- First DM, promo, apology and link-opening instruction each have a separate global anti-repeat window of the last 20 sent texts across all accounts.
+- Exact or overly similar wording is rejected inside its own 20-message window. One initial AI generation and at most two repeat generations are allowed.
+- Local fallback pools contain more than 20 variants and still forbid exact repetition inside the active window.
+- A user reply between scheduled messages does not erase the remaining automatic sequence unless opt-out, a terminal refusal or the five-message maximum closes the dialog.
+- Crash-safe outbox delivery and Telegram-history reconciliation now include the new link-help message.
+- Existing v1.0.63 databases migrate without data loss. Historical phrase rows for all four new kinds are trimmed safely to 20. Existing completed or old apology rows are not retroactively messaged.
+- Account interval 2-7 minutes, global spacing 90-180 seconds, daily limit 125, AI reply delay 20-60 seconds, automatic-message delay 60-60 seconds, PeerFlood 60-90 seconds and the 5-in-10 extra cooldown rule are unchanged.
+
+This section supersedes older README statements about a promo-only 30-message uniqueness window and the older promo-to-apology-only automatic path.
+
+
+## Changes in v1.0.63 - deep audit fixes
+
+- Legacy prepared First DM recovery is finite. Entity-unavailable and PeerIdInvalid recovery is checked at most three times, then the prepared record is rolled back and the shared queue can try another available account.
+- The v1.0.61 compatibility migration preserves administrator-edited PeerFlood ranges and removes only untouched automatic 600-600 values. Stale cooldown and next-send artifacts from that rejected release are capped safely.
+- Ordinary PeerFlood pauses only the PeerFlood cooldown. It no longer creates a hidden extra 2-7 minute account interval. The fifth PeerFlood inside the rolling ten-minute window still adds the separately configurable extra cooldown.
+- Deleting an account also deletes its stored PeerFlood hit history, so a newly added session cannot inherit a previous account lifecycle.
+- The release gate reports unavailable ruff or mypy checks as SKIP, never PASS. Optional --require-dev-tools mode makes missing tools a release failure.
+- New-install defaults, .env.example, runtime fallback values and release documents now agree with the approved production settings: account 2-7 minutes, global 90-180 seconds, daily limit 125, AI reply 20-60 seconds, apology 60-60 seconds and ordinary PeerFlood 60-90 seconds.
+- Release text and source files use only the normal ASCII short hyphen.
+- No approved queue priority, source-account priority, global opt-out, five-message limit, dialog ownership, uniqueness window or First DM selection order was changed.
 
 
 ## Changes in v1.0.62 - exact PeerFlood 5-in-10 escalation
@@ -89,14 +120,14 @@ Telegram user-account DM bot: monitors selected groups, builds one shared lead q
 - Profit guarantees and claims about profitable signals are rejected by validation.
 - Every generated reply is normalized to the ordinary short hyphen `-`.
 
-### Completed 5-message funnel
+### Current five-message budget
 
-1. First DM remains controlled by the existing First DM module.
-2. Any user reaction starts one complete promo message with the exact `CHANNEL_LINK`.
-3. The promo explains that the channel is free and that software automatically copies new posts from closed VIP channels almost immediately.
-4. If the user stays silent, one short smoothing apology is sent after a random 5-60 second delay.
-5. Remaining slots answer user-initiated follow-up messages only.
-6. The absolute limit is five outgoing messages including First DM. No sixth response is possible.
+1. First DM is a simple everyday opener.
+2. Any allowed user reaction starts one complete promo message with the exact `CHANNEL_LINK`.
+3. The promo explains that the channel is free and that software quickly copies new posts from closed VIP channels.
+4. One smoothing apology follows after the configured 60-60 second delay.
+5. One separate link-opening instruction follows after the same configured delay.
+6. The standard path uses four outgoing messages. The absolute maximum remains five, so no sixth outgoing response is possible.
 
 ### Non-text reactions
 
@@ -114,18 +145,19 @@ Telegram user-account DM bot: monitors selected groups, builds one shared lead q
 
 ### Uniqueness and fallback
 
-- The bot stores exactly the last 30 promo messages across all accounts.
-- A new promo is compared only with those 30 messages.
-- If it is too similar, the AI can regenerate it at most two times.
-- If AI generation is unavailable or invalid, a safe local compositional fallback is used.
-- The exact link is appended by code, never trusted from model output.
+- First DM, promo, apology and link-help texts are stored separately.
+- Each type keeps exactly its last 20 sent texts across all accounts.
+- A new text is compared only with the last 20 texts of the same type.
+- One initial generation and at most two repeat generations are allowed.
+- If AI generation is unavailable or invalid, a varied local fallback is used without exact repetition inside the active window.
+- The exact channel link is appended by code, never trusted from model output.
 
 ### Reliability preserved
 
 - Every incoming reaction is written to the durable dialog inbox before AI processing.
 - Every outgoing promo, apology, Q&A answer and terminal reply uses the crash-safe outbox.
 - Ambiguous Telegram delivery is reconciled against real chat history before retry.
-- A pending user reply cancels the scheduled smoothing apology.
+- A pending user reply is processed first but does not erase the remaining scheduled apology or link-help step.
 - Existing v1.0.54 `explained` dialogs are recovered and completed by the new funnel.
 
 ### First DM scope preserved

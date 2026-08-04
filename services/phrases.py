@@ -1,4 +1,4 @@
-"""Persistent anti-repeat for outbound phrases (first DM, later dialog)."""
+"""Persistent anti-repeat windows for outbound funnel phrases."""
 
 from __future__ import annotations
 
@@ -11,13 +11,23 @@ KIND_FIRST_DM = "first_dm"
 KIND_EXPLAIN = "explain"
 KIND_LINK = "link_wrap"
 KIND_PROMO = "promo"
+KIND_APOLOGY = "apology"
+KIND_LINK_HELP = "link_help"
+
+ANTI_REPEAT_KINDS = {
+    KIND_FIRST_DM,
+    KIND_PROMO,
+    KIND_APOLOGY,
+    KIND_LINK_HELP,
+}
+ANTI_REPEAT_WINDOW = 20
 
 
 def _now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
-def recent_texts(kind: str, limit: int = 40) -> List[str]:
+def recent_texts(kind: str, limit: int = ANTI_REPEAT_WINDOW) -> List[str]:
     conn = get_connection()
     rows = conn.execute(
         """
@@ -28,12 +38,12 @@ def recent_texts(kind: str, limit: int = 40) -> List[str]:
         """,
         (kind, int(limit)),
     ).fetchall()
-    return [str(r["text"]) for r in rows]
+    return [str(row["text"]) for row in rows]
 
 
 def remember(kind: str, text: str) -> None:
-    text = (text or "").strip()
-    if not text:
+    value = (text or "").strip()
+    if not value:
         return
     conn = get_connection()
     with db_lock(), conn:
@@ -42,11 +52,9 @@ def remember(kind: str, text: str) -> None:
             INSERT INTO sent_phrases (kind, text, created_at)
             VALUES (?, ?, ?)
             """,
-            (kind, text, _now_iso()),
+            (kind, value, _now_iso()),
         )
-        # Keep exactly the approved anti-repeat window for promo text.
-        # Other phrase kinds retain the historical compact limit.
-        keep_limit = 30 if kind == KIND_PROMO else 200
+        keep_limit = ANTI_REPEAT_WINDOW if kind in ANTI_REPEAT_KINDS else 200
         conn.execute(
             """
             DELETE FROM sent_phrases

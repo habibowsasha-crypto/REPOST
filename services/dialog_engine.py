@@ -1,4 +1,4 @@
-"""Dialog funnel after First DM: promo, apology, Q&A and opt-out."""
+"""Dialog funnel after First DM: promo, apology, link help, Q&A and opt-out."""
 
 from __future__ import annotations
 
@@ -53,7 +53,7 @@ def _delay_reply() -> float:
 
 
 def _auto_link_delay() -> int:
-    """Legacy helper name: now returns the smoothing-apology delay."""
+    """Return the configured delay between automatic funnel messages."""
     from services import runtime as runtime_svc
 
     lo, hi = runtime_svc.get_auto_link_delay_range()
@@ -439,6 +439,7 @@ async def _handle_incoming_private_body(
     followup_stages = {
         store.STAGE_PROMO_SENT,
         store.STAGE_APOLOGY_SENT,
+        store.STAGE_LINK_HELP_SENT,
         store.STAGE_LINK_SENT,
     }
     if stage not in followup_stages:
@@ -481,6 +482,10 @@ async def _handle_incoming_private_body(
         content_kind=content_kind,
         include_link=include_link,
     )
+    keep_scheduled = stage in {
+        store.STAGE_PROMO_SENT,
+        store.STAGE_APOLOGY_SENT,
+    } and bool(dialog.get("auto_link_at"))
     result = await _deliver_inbox_message(
         account_user_id,
         target_user_id,
@@ -488,10 +493,10 @@ async def _handle_incoming_private_body(
         message_kind=dialog_delivery.KIND_QNA,
         source_inbox_id=source_inbox_id,
         transition={
-            "stage": store.STAGE_APOLOGY_SENT,
+            "stage": stage,
             "bump_outgoing": True,
             "link_sent": True,
-            "clear_auto_link": True,
+            "clear_auto_link": not keep_scheduled,
             "append_history": True,
         },
     )
@@ -704,12 +709,30 @@ async def _reconcile_prepared_action(row: dict) -> bool:
         )
         if not committed:
             return False
+        if kind == dialog_delivery.KIND_SMOOTH_APOLOGY:
+            repaired = store.get_dialog(target) or {}
+            if (
+                repaired.get("stage") == store.STAGE_APOLOGY_SENT
+                and not repaired.get("auto_link_at")
+                and int(repaired.get("outgoing_count") or 0) < store.MAX_OUTGOING
+            ):
+                store.set_stage(
+                    target,
+                    store.STAGE_APOLOGY_SENT,
+                    auto_link_at=(
+                        _now() + dt.timedelta(seconds=_auto_link_delay())
+                    ).isoformat(),
+                )
         if kind in {
             dialog_delivery.KIND_PROMO,
             dialog_delivery.KIND_AUTO_LINK,
             dialog_delivery.KIND_DIRECT_LINK,
         }:
             phrases_svc.remember(phrases_svc.KIND_PROMO, str(row.get("text") or ""))
+        elif kind == dialog_delivery.KIND_SMOOTH_APOLOGY:
+            phrases_svc.remember(phrases_svc.KIND_APOLOGY, str(row.get("text") or ""))
+        elif kind == dialog_delivery.KIND_LINK_HELP:
+            phrases_svc.remember(phrases_svc.KIND_LINK_HELP, str(row.get("text") or ""))
         await _cleanup_disabled_account(account)
         logger.warning(
             "Recovered dialog message from Telegram kind={} account={} target={} msg_id={}",
@@ -731,6 +754,12 @@ async def _reconcile_prepared_action(row: dict) -> bool:
         store.set_stage(
             target,
             store.STAGE_PROMO_SENT,
+            auto_link_at=(_now() + dt.timedelta(seconds=60)).isoformat(),
+        )
+    elif action_key == dialog_delivery.KIND_LINK_HELP:
+        store.set_stage(
+            target,
+            store.STAGE_APOLOGY_SENT,
             auto_link_at=(_now() + dt.timedelta(seconds=60)).isoformat(),
         )
     elif action_key == dialog_delivery.KIND_FOLLOWUP:
@@ -762,11 +791,11 @@ async def recover_ambiguous_scheduled_messages() -> int:
 
 
 async def process_due_auto_links() -> int:
-    """Send due smoothing apologies and recover legacy pre-v1.0.55 link steps.
+    """Send due promo compatibility steps, apologies and link-help instructions.
 
-    The historical function name is retained for the main loop. New dialogs already
-    received the link in message 2, so their due action is message 3: one short
-    apology after the approved 5-60 second delay.
+    The historical function name is retained for the main loop. The approved new
+    automatic path is promo -> apology -> link-opening instruction. Existing dialogs
+    continue even when new First DM sending is paused.
     """
     # Main-menu pause stops only new First DM. Existing dialogs continue.
     due = store.list_due_auto_links()
@@ -789,8 +818,6 @@ async def process_due_auto_links() -> int:
                 current = store.get_dialog(target)
                 if not current or current.get("stage") == store.STAGE_CLOSED:
                     continue
-                # A user reply that arrived before the deadline always wins over
-                # the automatic apology, even if its worker has not started yet.
                 if dialog_inbox.has_pending(account, target):
                     continue
                 outgoing = int(current.get("outgoing_count") or 0)
@@ -804,13 +831,13 @@ async def process_due_auto_links() -> int:
                 history = current.get("history") or []
                 if stage == store.STAGE_PROMO_SENT and int(current.get("link_sent") or 0):
                     action_kind = dialog_delivery.KIND_SMOOTH_APOLOGY
+                elif stage == store.STAGE_APOLOGY_SENT and int(current.get("link_sent") or 0):
+                    action_kind = dialog_delivery.KIND_LINK_HELP
                 elif stage == store.STAGE_EXPLAINED and not int(current.get("link_sent") or 0):
                     action_kind = dialog_delivery.KIND_AUTO_LINK
                 else:
                     continue
 
-                # Check the durable outbox before calling AI. A PREPARED action is owned
-                # by the reconciliation loop and must never trigger fresh generation.
                 existing = dialog_delivery.get(target, action_kind)
                 existing_status = str((existing or {}).get("status") or "")
                 if existing_status == dialog_delivery.STATUS_PREPARED:
@@ -828,6 +855,15 @@ async def process_due_auto_links() -> int:
                         store.set_stage(
                             target,
                             store.STAGE_APOLOGY_SENT,
+                            link_sent=True,
+                            auto_link_at=(
+                                _now() + dt.timedelta(seconds=_auto_link_delay())
+                            ).isoformat(),
+                        )
+                    elif action_kind == dialog_delivery.KIND_LINK_HELP:
+                        store.set_stage(
+                            target,
+                            store.STAGE_LINK_HELP_SENT,
                             link_sent=True,
                             clear_auto_link=True,
                         )
@@ -856,12 +892,27 @@ async def process_due_auto_links() -> int:
                         "stage": store.STAGE_APOLOGY_SENT,
                         "bump_outgoing": True,
                         "link_sent": True,
+                        "auto_link_at": (
+                            _now() + dt.timedelta(seconds=_auto_link_delay())
+                        ).isoformat(),
+                        "append_history": True,
+                    }
+                    message_kind = dialog_delivery.KIND_SMOOTH_APOLOGY
+                    retry_stage = store.STAGE_PROMO_SENT
+                    retry_delay = 60
+                elif action_kind == dialog_delivery.KIND_LINK_HELP:
+                    text = await ai_dialog.generate_link_open_help(history)
+                    transition = {
+                        "stage": store.STAGE_LINK_HELP_SENT,
+                        "bump_outgoing": True,
+                        "link_sent": True,
                         "clear_auto_link": True,
                         "append_history": True,
                     }
+                    message_kind = dialog_delivery.KIND_LINK_HELP
+                    retry_stage = store.STAGE_APOLOGY_SENT
+                    retry_delay = 60
                 else:
-                    # Upgrade compatibility: complete an old explain-only dialog by sending
-                    # the new full promo with the exact link, then schedule its apology.
                     text = await ai_dialog.generate_promo(
                         history,
                         category=ai_dialog.CATEGORY_NORMAL,
@@ -875,30 +926,24 @@ async def process_due_auto_links() -> int:
                         ).isoformat(),
                         "append_history": True,
                     }
+                    message_kind = dialog_delivery.KIND_PROMO
+                    retry_stage = store.STAGE_EXPLAINED
+                    retry_delay = 300
 
                 if not dialog_delivery.prepare(
                     target,
                     account,
                     action_kind,
                     text,
-                    message_kind=(
-                        dialog_delivery.KIND_SMOOTH_APOLOGY
-                        if action_kind == dialog_delivery.KIND_SMOOTH_APOLOGY
-                        else dialog_delivery.KIND_PROMO
-                    ),
+                    message_kind=message_kind,
                     transition=transition,
                 ):
                     latest_outbox = dialog_delivery.get(target, action_kind) or {}
-                    retry_sec = (
-                        60
-                        if action_kind == dialog_delivery.KIND_SMOOTH_APOLOGY
-                        else 300
-                    )
                     store.set_stage(
                         target,
                         stage,
                         auto_link_at=(
-                            _now() + dt.timedelta(seconds=retry_sec)
+                            _now() + dt.timedelta(seconds=retry_delay)
                         ).isoformat(),
                     )
                     logger.warning(
@@ -909,17 +954,22 @@ async def process_due_auto_links() -> int:
                         stage,
                         action_kind,
                         latest_outbox.get("status") or "missing",
-                        retry_sec,
+                        retry_delay,
                     )
                     continue
+
                 result = await _send_prepared_action(account, target, action_kind, text)
                 if result == "sent":
                     sent_count += 1
                     if action_kind == dialog_delivery.KIND_AUTO_LINK:
                         phrases_svc.remember(phrases_svc.KIND_PROMO, text)
                         logger.info("Legacy promo sent target={} account={}", target, account)
-                    else:
+                    elif action_kind == dialog_delivery.KIND_SMOOTH_APOLOGY:
+                        phrases_svc.remember(phrases_svc.KIND_APOLOGY, text)
                         logger.info("Smoothing apology sent target={} account={}", target, account)
+                    else:
+                        phrases_svc.remember(phrases_svc.KIND_LINK_HELP, text)
+                        logger.info("Link help sent target={} account={}", target, account)
                     latest = store.get_dialog(target) or {}
                     if int(latest.get("outgoing_count") or 0) >= store.MAX_OUTGOING:
                         store.set_stage(target, store.STAGE_CLOSED, clear_auto_link=True)
@@ -928,12 +978,6 @@ async def process_due_auto_links() -> int:
                 elif result == "failed":
                     latest = store.get_dialog(target)
                     if latest and latest.get("stage") != store.STAGE_CLOSED:
-                        retry_stage = (
-                            store.STAGE_PROMO_SENT
-                            if action_kind == dialog_delivery.KIND_SMOOTH_APOLOGY
-                            else store.STAGE_EXPLAINED
-                        )
-                        retry_delay = 60 if action_kind == dialog_delivery.KIND_SMOOTH_APOLOGY else 300
                         store.set_stage(
                             target,
                             retry_stage,
@@ -949,7 +993,6 @@ async def process_due_auto_links() -> int:
             finally:
                 _inflight.discard(key)
     return sent_count
-
 
 async def process_due_followups() -> int:
     """Send one crash-safe silence follow-up after the First DM."""

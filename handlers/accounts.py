@@ -899,20 +899,20 @@ async def cb_acc_delay(event: events.CallbackQuery.Event) -> None:
         f"Аккаунт: **{label}**",
         f"Сейчас: {cur}",
         "",
-        "По умолчанию — как в **Настройки → Темп**.",
+        "По умолчанию - как в **Настройки → Темп**.",
         "Свой интервал только для этого аккаунта (между first DM).",
     )
     buttons = [
         [btn("Как в настройках", f"acc_delayset_{user_id}_0_0")],
         [
-            btn("5–10 мин", f"acc_delayset_{user_id}_300_600"),
-            btn("10–15 мин", f"acc_delayset_{user_id}_600_900"),
+            btn("5-10 мин", f"acc_delayset_{user_id}_300_600"),
+            btn("10-15 мин", f"acc_delayset_{user_id}_600_900"),
         ],
         [
-            btn("15–25 мин", f"acc_delayset_{user_id}_900_1500"),
-            btn("20–40 мин", f"acc_delayset_{user_id}_1200_2400"),
+            btn("15-25 мин", f"acc_delayset_{user_id}_900_1500"),
+            btn("20-40 мин", f"acc_delayset_{user_id}_1200_2400"),
         ],
-        [btn("30–60 мин", f"acc_delayset_{user_id}_1800_3600")],
+        [btn("30-60 мин", f"acc_delayset_{user_id}_1800_3600")],
         back_row(f"acc_card_{user_id}"),
         back_home_row(),
     ]
@@ -933,6 +933,6 @@ async def cb_acc_delayset(event: events.CallbackQuery.Event) -> None:
         msg = "как в настройках"
     else:
         accounts_svc.set_dm_interval(user_id, lo, hi)
-        msg = f"{lo // 60}–{hi // 60} мин"
+        msg = f"{lo // 60}-{hi // 60} мин"
     await show_account_card(event, user_id)
     await event.answer(f"Задержка: {msg}")

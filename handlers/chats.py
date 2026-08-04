@@ -49,7 +49,7 @@ async def show_chats_menu(event, account_user_id: int, page: int = 0, *, edit: b
         kv("Мониторится", str(watchable)),
     )
     if watchable == 0:
-        body = join(body, notice("warn", "Ни один чат не мониторится — очередь пустая."))
+        body = join(body, notice("warn", "Ни один чат не мониторится - очередь пустая."))
     if mode == chats_svc.CHAT_MODE_MANUAL:
         body = join(body, kv("Выбрано вручную", str(len(selected))), "", "Отметь чаты для мониторинга:")
     else:

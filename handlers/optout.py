@@ -1,4 +1,4 @@
-"""Opt-out management UI — unified style."""
+"""Opt-out management UI - unified style."""
 
 from __future__ import annotations
 
@@ -25,13 +25,13 @@ def _optout_text() -> str:
     total = opt_out_svc.count()
     rows = opt_out_svc.list_all(limit=20)
     if not rows:
-        body = "Список пуст — запретов на отправку нет."
+        body = "Список пуст - запретов на отправку нет."
     else:
         lines = []
         for r in rows:
             tid = r.get("user_id")
             reason = (r.get("reason") or "")[:40]
-            lines.append(f"• `{tid}`" + (f" — {reason}" if reason else ""))
+            lines.append(f"• `{tid}`" + (f" - {reason}" if reason else ""))
         body = join(f"Показано {len(rows)} из {total}:", *lines)
     return screen(
         "🚫",
@@ -108,7 +108,7 @@ async def on_optout_text(event: events.NewMessage.Event) -> None:
     if raw.startswith("/"):
         return
     if not raw.lstrip("-").isdigit():
-        await event.respond(notice("warn", "Нужен числовой user id. /cancel — отмена."))
+        await event.respond(notice("warn", "Нужен числовой user id. /cancel - отмена."))
         return
     target_id = int(raw)
     clear_state(event.sender_id)

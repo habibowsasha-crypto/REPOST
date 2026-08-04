@@ -40,6 +40,12 @@ _recent_texts: list[str] = []
 
 _PAID_MESSAGE_REQUIRED_RE = re.compile(r"ALLOW_PAYMENT_REQUIRED(?:_\d+)?", re.IGNORECASE)
 
+# Legacy prepared rows must not stay in the dashboard forever. Three failed
+# resolution/history checks are enough before the exact account attempt is
+# rolled back and the shared queue may try another eligible account.
+_UNRESOLVABLE_RECOVERY_MAX_ATTEMPTS = 3
+_UNRESOLVABLE_RECOVERY_RETRY_SECONDS = 300
+
 
 def _is_paid_message_required(exc: BaseException) -> bool:
     """Recognize Telegram paid-message restriction without relying on one SDK class."""
@@ -603,6 +609,54 @@ def _normalize_message_text(value: str | None) -> str:
     return (value or "").replace("\r\n", "\n").strip()
 
 
+def _defer_or_release_unresolvable_recovery(
+    row: dict[str, Any],
+    *,
+    reason: str,
+) -> bool:
+    """Return True when a legacy prepared row was released from recovery."""
+    target_id = int(row["target_user_id"])
+    account_id = int(row["account_user_id"])
+    attempts = first_dm_delivery.defer_recovery(
+        target_id,
+        reason,
+        delay_seconds=_UNRESOLVABLE_RECOVERY_RETRY_SECONDS,
+    )
+    if attempts < _UNRESOLVABLE_RECOVERY_MAX_ATTEMPTS:
+        logger.warning(
+            "Prepared First DM recovery deferred account={} target={} reason={} "
+            "attempt={}/{} retry_sec={}",
+            account_id,
+            target_id,
+            reason,
+            attempts,
+            _UNRESOLVABLE_RECOVERY_MAX_ATTEMPTS,
+            _UNRESOLVABLE_RECOVERY_RETRY_SECONDS,
+        )
+        return False
+
+    queue_svc.record_account_failure(
+        target_id,
+        account_id,
+        "no_entity",
+        f"legacy_recovery_exhausted:{reason}",
+    )
+    first_dm_delivery.rollback(
+        target_id,
+        f"legacy_recovery_exhausted:{reason}",
+        as_pending=True,
+    )
+    logger.error(
+        "Prepared First DM recovery exhausted; returned to shared queue "
+        "account={} target={} reason={} attempts={}",
+        account_id,
+        target_id,
+        reason,
+        attempts,
+    )
+    return True
+
+
 async def recover_ambiguous_first_dms() -> int:
     """Reconcile prepared First DMs after a crash/network ambiguity.
 
@@ -632,20 +686,19 @@ async def recover_ambiguous_first_dms() -> int:
             )
             continue
 
-        entity = await _resolve_target_entity(client, account_id, row)
+        try:
+            entity = await _resolve_target_entity(client, account_id, row)
+        except PeerIdInvalidError:
+            if _defer_or_release_unresolvable_recovery(
+                row, reason="peer_id_invalid_entity_resolution"
+            ):
+                recovered += 1
+            continue
         if entity is None:
-            attempts = first_dm_delivery.defer_recovery(
-                target_id,
-                "entity_unavailable",
-                delay_seconds=1800,
-            )
-            logger.warning(
-                "Prepared First DM recovery deferred account={} target={} reason=no_entity "
-                "attempt={} retry_sec=1800",
-                account_id,
-                target_id,
-                attempts,
-            )
+            if _defer_or_release_unresolvable_recovery(
+                row, reason="entity_unavailable"
+            ):
+                recovered += 1
             continue
 
         prepared_at = pacing._parse_iso(row.get("prepared_at"))
@@ -678,29 +731,34 @@ async def recover_ambiguous_first_dms() -> int:
                     attempts,
                 )
                 continue
-            peer_invalid = type(exc).__name__ == "PeerIdInvalidError"
-            retry_sec = 21600 if peer_invalid else 900
-            reason = "peer_id_invalid" if peer_invalid else type(exc).__name__
+            peer_invalid = isinstance(exc, PeerIdInvalidError) or (
+                type(exc).__name__ == "PeerIdInvalidError"
+            )
+            if peer_invalid:
+                if _defer_or_release_unresolvable_recovery(
+                    row, reason="peer_id_invalid_history"
+                ):
+                    recovered += 1
+                continue
+            reason = type(exc).__name__
             attempts = first_dm_delivery.defer_recovery(
                 target_id,
-                f"{reason}: {exc}",
-                delay_seconds=retry_sec,
+                reason,
+                delay_seconds=900,
             )
             logger.warning(
                 "Prepared First DM recovery deferred account={} target={} reason={} "
-                "attempt={} retry_sec={}",
+                "attempt={} retry_sec=900",
                 account_id,
                 target_id,
                 reason,
                 attempts,
-                retry_sec,
             )
-            if not peer_invalid:
-                logger.opt(exception=exc).debug(
-                    "Prepared First DM recovery diagnostic account={} target={}",
-                    account_id,
-                    target_id,
-                )
+            logger.opt(exception=exc).debug(
+                "Prepared First DM recovery diagnostic account={} target={}",
+                account_id,
+                target_id,
+            )
             continue
 
         if found is not None:

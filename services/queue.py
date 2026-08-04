@@ -450,7 +450,7 @@ def release_stale_claims(*, older_than_seconds: int = 900) -> int:
     """Recover stuck claims.
 
     - contact status 'sending' (pre-send) → back to pending, drop contact
-      (send may never have happened — do NOT mark sent)
+      (send may never have happened - do NOT mark sent)
     - contact in_progress/completed (post successful mark_sent) → mark lead sent
     - no contact → back to pending
     """
@@ -500,7 +500,7 @@ def release_stale_claims(*, older_than_seconds: int = 900) -> int:
                     (STATUS_SENT, now, tid),
                 )
             else:
-                # 'sending' or no contact — safe to retry as pending.
+                # 'sending' or no contact - safe to retry as pending.
                 conn.execute(
                     """
                     UPDATE leads
@@ -583,7 +583,7 @@ def mark_sending(target_user_id: int, account_user_id: int) -> None:
     """Mark contact as 'sending' BEFORE network send.
 
     Only mark_sent upgrades to in_progress (real success).
-    Stale 'sending' is released back to pending — no false sent.
+    Stale 'sending' is released back to pending - no false sent.
     """
     now = _now_iso()
     conn = get_connection()
@@ -645,7 +645,7 @@ def ensure_claim(target_user_id: int, account_user_id: int) -> bool:
                 ),
             )
             return int(cur.rowcount or 0) == 1
-        # already claimed — reassign sender
+        # already claimed - reassign sender
         conn.execute(
             """
             UPDATE leads

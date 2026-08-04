@@ -1,4 +1,4 @@
-"""Admin main menu and sections — unified visual style."""
+"""Admin main menu and sections - unified visual style."""
 
 from __future__ import annotations
 
@@ -251,11 +251,11 @@ async def cb_settings(event: events.CallbackQuery.Event) -> None:
         "⚙️",
         "Настройки",
         join(
-            "• **Темп** — как часто писать (меняется в меню)",
-            "• **После PeerFlood** — пауза после ограничения",
+            "• **Темп** - как часто писать (меняется в меню)",
+            "• **После PeerFlood** - пауза после ограничения",
         ),
         join(
-            kv("Темп (акк.)", f"{a_lo // 60}–{a_hi // 60} мин", icon="⏱"),
+            kv("Темп (акк.)", f"{a_lo // 60}-{a_hi // 60} мин", icon="⏱"),
             kv("После PeerFlood", pf, icon="⚠️"),
             kv("AI", ai, icon="🤖"),
             f"🔗 `{link_short}`",
@@ -339,8 +339,8 @@ async def cb_bc_status(event: events.CallbackQuery.Event) -> None:
 
 def _fmt_min_range(lo: int, hi: int) -> str:
     if lo >= 60 and hi >= 60:
-        return f"{lo // 60}–{hi // 60} мин"
-    return f"{lo}–{hi} сек"
+        return f"{lo // 60}-{hi // 60} мин"
+    return f"{lo}-{hi} сек"
 
 
 def _pacing_text() -> str:
@@ -358,9 +358,9 @@ def _pacing_text() -> str:
         "Плановый ритм, пока нет PeerFlood.",
         "",
         f"👤 Аккаунт: **{_fmt_min_range(a_lo, a_hi)}**",
-        f"🌐 Global: **{g_lo}–{g_hi} сек**",
+        f"🌐 Global: **{g_lo}-{g_hi} сек**",
         f"📊 Лимит: **{daily}**/сутки",
-        f"🤖 AI-ответ: **{r_lo}–{r_hi} сек**",
+        f"🤖 AI-ответ: **{r_lo}-{r_hi} сек**",
         f"🙏 Извинение после рекламы: **{l_lo}-{l_hi} сек**",
         DIV,
         "Нажми параметр, чтобы изменить.",
@@ -377,9 +377,9 @@ def _pacing_buttons():
     l_lo, l_hi = runtime_svc.get_auto_link_delay_range()
     return [
         [btn(f"👤 Аккаунт · {_fmt_min_range(a_lo, a_hi)}", b"pace_edit_acc")],
-        [btn(f"🌐 Global · {g_lo}–{g_hi}с", b"pace_edit_glob")],
+        [btn(f"🌐 Global · {g_lo}-{g_hi}с", b"pace_edit_glob")],
         [btn(f"📊 Лимит · {daily}/сутки", b"pace_edit_daily")],
-        [btn(f"🤖 AI · {r_lo}–{r_hi}с", b"pace_edit_ai")],
+        [btn(f"🤖 AI · {r_lo}-{r_hi}с", b"pace_edit_ai")],
         [btn(f"🙏 Извинение · {l_lo}-{l_hi}с", b"pace_edit_link")],
         back_row(b"menu_settings"),
         back_home_row(),
@@ -442,15 +442,15 @@ def _pace_edit_screen(kind: str):
         cur = f"Сейчас: **{_fmt_min_range(lo, hi)}**"
     elif kind == "glob":
         lo, hi = runtime_svc.get_global_spacing_range()
-        cur = f"Сейчас: **{lo}–{hi} сек**"
+        cur = f"Сейчас: **{lo}-{hi} сек**"
     elif kind == "daily":
         cur = f"Сейчас: **{runtime_svc.get_daily_limit()}**/сутки"
     elif kind == "ai":
         lo, hi = runtime_svc.get_ai_reply_delay_range()
-        cur = f"Сейчас: **{lo}–{hi} сек**"
+        cur = f"Сейчас: **{lo}-{hi} сек**"
     else:
         lo, hi = runtime_svc.get_auto_link_delay_range()
-        cur = f"Сейчас: **{lo}–{hi} сек**"
+        cur = f"Сейчас: **{lo}-{hi} сек**"
 
     text = join(
         f"{emoji} **{title}**",
@@ -520,7 +520,7 @@ async def on_pacing_edit(event: events.NewMessage.Event) -> None:
     raw = (event.raw_text or "").strip()
     if raw.startswith("/"):
         return
-    parts = raw.replace(",", " ").replace("–", " ").replace("-", " ").split()
+    parts = raw.replace(",", " ").replace("-", " ").replace("-", " ").split()
     try:
         if step == "daily":
             if len(parts) != 1 or not parts[0].isdigit():
@@ -537,10 +537,10 @@ async def on_pacing_edit(event: events.NewMessage.Event) -> None:
                 msg = f"Аккаунт: **{_fmt_min_range(lo, hi)}**"
             elif step == "glob":
                 lo, hi = runtime_svc.set_global_spacing_range(a, b)
-                msg = f"Global: **{lo}–{hi} сек**"
+                msg = f"Global: **{lo}-{hi} сек**"
             elif step == "ai":
                 lo, hi = runtime_svc.set_ai_reply_delay_range(a, b)
-                msg = f"AI: **{lo}–{hi} сек**"
+                msg = f"AI: **{lo}-{hi} сек**"
             elif step == "link":
                 a, b = _validate_apology_range_input(a, b)
                 lo, hi = runtime_svc.set_auto_link_delay_range(a, b)
@@ -590,12 +590,12 @@ def _peerflood_buttons():
     # data: pf_rng_{lo}_{hi}
     return [
         [
-            btn("1–5 мин", b"pf_rng_60_300"),
-            btn("3–10 мин", b"pf_rng_180_600"),
+            btn("1-5 мин", b"pf_rng_60_300"),
+            btn("3-10 мин", b"pf_rng_180_600"),
         ],
         [
-            btn("5–15 мин", b"pf_rng_300_900"),
-            btn("10–30 мин", b"pf_rng_600_1800"),
+            btn("5-15 мин", b"pf_rng_300_900"),
+            btn("10-30 мин", b"pf_rng_600_1800"),
         ],
         [btn("✏️ Свой min max (сек)", b"pf_custom")],
         [btn("🔥 Доп. пауза после 5/10", b"pf_burst")],
@@ -658,8 +658,8 @@ async def cb_pf_custom(event: events.CallbackQuery.Event) -> None:
         "Свой диапазон",
         f"Сейчас: **{pf}**",
         "Пришли **два числа** в секундах: `min max`",
-        f"Допустимо: **{runtime_svc.PEER_FLOOD_MIN_ALLOWED_SEC}–{runtime_svc.PEER_FLOOD_MAX_ALLOWED_SEC}** сек.",
-        "Примеры: `180 600` (=3–10 мин), `60 300` (=1–5 мин)",
+        f"Допустимо: **{runtime_svc.PEER_FLOOD_MIN_ALLOWED_SEC}-{runtime_svc.PEER_FLOOD_MAX_ALLOWED_SEC}** сек.",
+        "Примеры: `180 600` (=3-10 мин), `60 300` (=1-5 мин)",
         "Одно число = фиксированная пауза.",
         "Отмена: /cancel",
     )
@@ -855,7 +855,7 @@ async def cb_bc_link(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
         await event.answer(DENIED, alert=True)
         return
-    link = CHANNEL_LINK or "(не задана — CHANNEL_LINK в Railway)"
+    link = CHANNEL_LINK or "(не задана - CHANNEL_LINK в Railway)"
     pitch = CHANNEL_PITCH or "(пусто)"
     text = screen(
         "🔗",
@@ -892,7 +892,7 @@ async def cb_ai(event: events.CallbackQuery.Event) -> None:
             bullets(
                 [
                     "короткий вопрос без ссылки",
-                    "без t.me / опросов / тире —",
+                    "без t.me / опросов / тире -",
                     "антиповтор + запасной пул",
                 ]
             ),
@@ -902,7 +902,7 @@ async def cb_ai(event: events.CallbackQuery.Event) -> None:
             bullets(
                 [
                     "ответ → объяснение канала",
-                    "тишина 60–120с → ссылка",
+                    "тишина 60-120с → ссылка",
                     "«не пиши» → opt-out",
                 ]
             ),
@@ -935,7 +935,7 @@ async def cb_help(event: events.CallbackQuery.Event) -> None:
             "Команды",
             join("`/start`  `/menu`  `меню`", "`/ping`  `/status`  `/cancel`"),
         ),
-        "На главном экране — живые цифры очереди.",
+        "На главном экране - живые цифры очереди.",
     )
     # fix numbered list properly
     text = screen(
@@ -951,7 +951,7 @@ async def cb_help(event: events.CallbackQuery.Event) -> None:
             join("`/start`  `/menu`  `меню`", "`/ping`  `/status`  `/cancel`"),
         ),
         join(
-            "На главном экране — живые цифры очереди.",
+            "На главном экране - живые цифры очереди.",
             "Пауза останавливает только новые First DM. Активные диалоги продолжаются.",
         ),
     )

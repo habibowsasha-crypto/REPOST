@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FORBIDDEN_PARTS = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "htmlcov"}
 FORBIDDEN_NAMES = {".coverage", "coverage.xml"}
 FORBIDDEN_SUFFIXES = {".pyc", ".pyo", ".db", ".sqlite", ".sqlite3", ".session"}
+FORBIDDEN_DASHES = {"\u2013", "\u2014", "\u2212"}
 SECRET_PATTERNS = (
     re.compile(r"(?i)(bot[_-]?token|api[_-]?hash|openai[_-]?api[_-]?key)\s*=\s*['\"]\S{12,}"),
     re.compile(r"\b\d{7,12}:[A-Za-z0-9_-]{20,}\b"),
@@ -113,6 +114,8 @@ def check_tree() -> list[str]:
                 text = path.read_text(encoding="utf-8")
             except (UnicodeError, OSError):
                 continue
+            if any(char in text for char in FORBIDDEN_DASHES):
+                errors.append(f"non-ASCII dash forbidden: {rel}")
             if path.name != ".env.example":
                 for pattern in SECRET_PATTERNS:
                     if pattern.search(text):
@@ -170,13 +173,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.zip:
         checks["zip"] = check_zip(args.zip.resolve())
 
-    command_results: list[tuple[str, bool, str]] = []
+    command_results: list[tuple[str, str, str]] = []
     ok, out = run_command([sys.executable, "scripts/import_check.py"])
-    command_results.append(("imports", ok, out))
+    command_results.append(("imports", "PASS" if ok else "FAIL", out))
 
     if not args.skip_tests:
         ok, out = run_command([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"])
-        command_results.append(("pytest", ok, out))
+        command_results.append(("pytest", "PASS" if ok else "FAIL", out))
 
     for tool, command in (
         ("ruff", ["ruff", "check", "."]),
@@ -184,11 +187,11 @@ def main(argv: list[str] | None = None) -> int:
     ):
         if shutil.which(tool):
             ok, out = run_command(command)
-            command_results.append((tool, ok, out))
+            command_results.append((tool, "PASS" if ok else "FAIL", out))
         elif args.require_dev_tools:
-            command_results.append((tool, False, f"{tool} is not installed"))
+            command_results.append((tool, "FAIL", f"{tool} is not installed"))
         else:
-            command_results.append((tool, True, f"{tool} not installed; config is present"))
+            command_results.append((tool, "SKIP", f"{tool} is not installed; check was not executed"))
 
     failed = False
     for name, errors in checks.items():
@@ -199,11 +202,11 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  - {error}")
         else:
             print(f"[PASS] {name}")
-    for name, ok, output in command_results:
-        print(f"[{'PASS' if ok else 'FAIL'}] {name}")
+    for name, status, output in command_results:
+        print(f"[{status}] {name}")
         if output:
             print(output)
-        failed = failed or not ok
+        failed = failed or status == "FAIL"
     return 1 if failed else 0
 
 

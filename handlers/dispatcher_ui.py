@@ -1,4 +1,4 @@
-"""Start / pause dispatcher worker UI — unified style.
+"""Start / pause dispatcher worker UI - unified style.
 
 Pause stops only new First DM from the queue.
 Active dialogs and group monitoring continue.

@@ -17,6 +17,7 @@ STAGE_EXPLAINED = "explained"  # legacy pre-v1.0.55 state
 STAGE_LINK_SENT = "link_sent"  # legacy pre-v1.0.55 terminal state
 STAGE_PROMO_SENT = "promo_sent"
 STAGE_APOLOGY_SENT = "apology_sent"
+STAGE_LINK_HELP_SENT = "link_help_sent"
 STAGE_CLOSED = "closed"
 
 ACTIVE_STAGES = (
@@ -26,6 +27,7 @@ ACTIVE_STAGES = (
     STAGE_EXPLAINED,
     STAGE_PROMO_SENT,
     STAGE_APOLOGY_SENT,
+    STAGE_LINK_HELP_SENT,
 )
 TERMINAL_STAGES = (STAGE_FOLLOWUP_SENT, STAGE_LINK_SENT, STAGE_CLOSED)
 
@@ -230,11 +232,11 @@ def set_stage(
         )
 
 def list_due_auto_links() -> list[dict[str, Any]]:
-    """Return due legacy links and v1.0.55 smoothing apologies.
+    """Return due legacy links, apologies and link-opening instructions.
 
-    The function name is retained because the main loop and older integrations call it.
-    New dialogs use STAGE_PROMO_SENT with link_sent=1, where auto_link_at is the
-    apology deadline. Legacy STAGE_EXPLAINED rows are still recoverable after upgrade.
+    The historical function name is retained for the main loop. New dialogs use
+    STAGE_PROMO_SENT for the apology deadline and STAGE_APOLOGY_SENT for the
+    following link-help deadline. Legacy STAGE_EXPLAINED rows remain recoverable.
     """
     now = _now_iso()
     conn = get_connection()
@@ -253,9 +255,11 @@ def list_due_auto_links() -> list[dict[str, Any]]:
                 (stage=? AND link_sent=0)
                 OR
                 (stage=? AND link_sent=1)
+                OR
+                (stage=? AND link_sent=1)
            )
         """,
-        (now, STAGE_EXPLAINED, STAGE_PROMO_SENT),
+        (now, STAGE_EXPLAINED, STAGE_PROMO_SENT, STAGE_APOLOGY_SENT),
     ).fetchall()
     result = []
     for r in rows:

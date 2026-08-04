@@ -93,7 +93,7 @@ def _notify_free_manual(label: str) -> str:
         "━━━━━━━━━━━━━━━━━━\n\n"
         f"👤 Аккаунт: **{label}**\n"
         "✅ Telegram не подтвердил ограничение.\n"
-        "⏸ Автовозобновление выключено — сними паузу вручную."
+        "⏸ Автовозобновление выключено - сними паузу вручную."
     )
 
 
@@ -266,16 +266,10 @@ async def on_peer_flood(account_user_id: int) -> None:
                         """
                         UPDATE accounts
                            SET cooldown_until=?,
-                               next_send_at=CASE
-                                   WHEN next_send_at IS NULL OR next_send_at<? THEN ?
-                                   ELSE next_send_at
-                               END,
                                updated_at=?
                          WHERE user_id=?
                         """,
                         (
-                            extended_until.isoformat(),
-                            extended_until.isoformat(),
                             extended_until.isoformat(),
                             _now_iso(),
                             account_user_id,
@@ -323,20 +317,8 @@ async def on_peer_flood(account_user_id: int) -> None:
         seconds = int(runtime_svc.pick_peer_flood_seconds())
     min_until = _now() + dt.timedelta(seconds=seconds)
     pacing.set_paused(account_user_id, "PeerFlood", paused=True)
-    # Preserve the existing v1.0.60 behavior: after an ordinary PeerFlood
-    # cooldown, the account also keeps its configured First DM interval.
-    acc_row = accounts_svc.get_account(account_user_id) or {}
-    lo = acc_row.get("dm_interval_min_sec")
-    hi = acc_row.get("dm_interval_max_sec")
-    if lo is not None and hi is not None:
-        import random as _rnd
-        a, b = int(lo), int(hi)
-        if a > b:
-            a, b = b, a
-        gap = _rnd.randint(max(60, a), max(60, b))
-    else:
-        gap = max(60, int(runtime_svc.get_account_interval_range()[0]))
-    next_send = min_until + dt.timedelta(seconds=int(gap))
+    # PeerFlood controls only cooldown_until. A pre-existing First DM interval
+    # remains independent, but no new 2-7 minute interval is added here.
     conn = get_connection()
     with db_lock(), conn:
         conn.execute(
@@ -345,14 +327,12 @@ async def on_peer_flood(account_user_id: int) -> None:
                SET cooldown_until=?,
                    pause_reason=?,
                    is_paused=1,
-                   next_send_at=?,
                    updated_at=?
              WHERE user_id=?
             """,
             (
                 min_until.isoformat(),
                 "PeerFlood",
-                next_send.isoformat(),
                 _now_iso(),
                 account_user_id,
             ),
@@ -500,7 +480,7 @@ def _extract_until(text: str) -> Optional[str]:
         mo = None
         for stem, num in months_ru.items():
             if mon_s.startswith(stem):
-                # avoid "ма" matching "март" wrongly — already ordered; "мая" starts with ма
+                # avoid "ма" matching "март" wrongly - already ordered; "мая" starts with ма
                 if stem == "ма" and not mon_s.startswith("ма"):
                     continue
                 if stem == "ма" and mon_s.startswith("март"):

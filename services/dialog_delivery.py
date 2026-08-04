@@ -19,6 +19,7 @@ KIND_CLOSE = "close"
 KIND_APOLOGY = "apology"
 KIND_PROMO = "promo"
 KIND_SMOOTH_APOLOGY = "smooth_apology"
+KIND_LINK_HELP = "link_help"
 KIND_QNA = "qna"
 KIND_STOP_CLOSE = "stop_close"
 
@@ -58,6 +59,13 @@ def _default_transition(message_kind: str) -> dict[str, Any]:
     if message_kind == KIND_SMOOTH_APOLOGY:
         return {
             "stage": "apology_sent",
+            "bump_outgoing": True,
+            "clear_auto_link": True,
+            "append_history": True,
+        }
+    if message_kind == KIND_LINK_HELP:
+        return {
+            "stage": "link_help_sent",
             "bump_outgoing": True,
             "clear_auto_link": True,
             "append_history": True,
@@ -110,6 +118,9 @@ def prepare(
                 return False
         elif action_key == KIND_SMOOTH_APOLOGY:
             if stage != "promo_sent" or not int(dialog["link_sent"] or 0):
+                return False
+        elif action_key == KIND_LINK_HELP:
+            if stage != "apology_sent" or not int(dialog["link_sent"] or 0):
                 return False
         elif action_key == KIND_FOLLOWUP and stage != "waiting_reply":
             return False

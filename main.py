@@ -36,7 +36,7 @@ APOLOGY_SCHEDULER_INTERVAL_SECONDS = 1.0
 
 
 async def _apology_due_loop() -> None:
-    """Lightweight scheduler for the approved 5-60 second apology deadline."""
+    """Lightweight scheduler for due apology and link-help deadlines."""
     from services import dialog_engine
 
     while True:

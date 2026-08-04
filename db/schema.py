@@ -152,31 +152,52 @@ def init_db() -> None:
         if not applied:
             rejected_v1061 = conn.execute(
                 """
-                SELECT 1 FROM schema_migrations
+                SELECT applied_at FROM schema_migrations
                  WHERE name='v1_0_61_peerflood_four_in_ten_base_10m'
                 """
             ).fetchone()
             if rejected_v1061:
-                # The rejected v1.0.61 migration forcibly overwrote the
-                # administrator's ordinary PeerFlood range with 600-600.
-                # Restore the approved 60-90 second range only when that exact
-                # migration marker proves the overwrite occurred.
-                now_sql = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
-                for key, value in (
-                    ("peer_flood_cooldown_lo_seconds", "60"),
-                    ("peer_flood_cooldown_hi_seconds", "90"),
-                    ("peer_flood_min_cooldown_seconds", "75"),
-                ):
-                    conn.execute(
-                        f"""
-                        INSERT INTO runtime_meta(key, value, updated_at)
-                        VALUES (?, ?, {now_sql})
-                        ON CONFLICT(key) DO UPDATE SET
-                            value=excluded.value,
-                            updated_at=excluded.updated_at
-                        """,
-                        (key, value),
-                    )
+                # v1.0.61 wrote 600-600 automatically. Restore 60-90 only when
+                # those exact values have not been edited after that migration.
+                rows = conn.execute(
+                    """
+                    SELECT key, value, updated_at FROM runtime_meta
+                     WHERE key IN (
+                         'peer_flood_cooldown_lo_seconds',
+                         'peer_flood_cooldown_hi_seconds',
+                         'peer_flood_min_cooldown_seconds'
+                     )
+                    """
+                ).fetchall()
+                values = {str(row['key']): row for row in rows}
+                lo_row = values.get('peer_flood_cooldown_lo_seconds')
+                hi_row = values.get('peer_flood_cooldown_hi_seconds')
+                migration_at = str(rejected_v1061['applied_at'] or '')
+                untouched_automatic_values = bool(
+                    lo_row
+                    and hi_row
+                    and str(lo_row['value']) == '600'
+                    and str(hi_row['value']) == '600'
+                    and str(lo_row['updated_at'] or '') <= migration_at
+                    and str(hi_row['updated_at'] or '') <= migration_at
+                )
+                if untouched_automatic_values:
+                    now_sql = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+                    for key, value in (
+                        ('peer_flood_cooldown_lo_seconds', '60'),
+                        ('peer_flood_cooldown_hi_seconds', '90'),
+                        ('peer_flood_min_cooldown_seconds', '75'),
+                    ):
+                        conn.execute(
+                            f"""
+                            INSERT INTO runtime_meta(key, value, updated_at)
+                            VALUES (?, ?, {now_sql})
+                            ON CONFLICT(key) DO UPDATE SET
+                                value=excluded.value,
+                                updated_at=excluded.updated_at
+                            """,
+                            (key, value),
+                        )
 
             conn.execute(
                 """
@@ -378,19 +399,22 @@ def init_db() -> None:
             """
         )
 
-        # v1.0.55 stores only the approved last 30 promo texts.
-        conn.execute(
-            """
-            DELETE FROM sent_phrases
-             WHERE kind='promo'
-               AND id NOT IN (
-                   SELECT id FROM sent_phrases
-                    WHERE kind='promo'
-                    ORDER BY id DESC
-                    LIMIT 30
-               )
-            """
-        )
+        # v1.0.64 keeps separate global anti-repeat windows for every
+        # approved funnel message type. Older rows are safely trimmed on startup.
+        for phrase_kind in ("first_dm", "promo", "apology", "link_help"):
+            conn.execute(
+                """
+                DELETE FROM sent_phrases
+                 WHERE kind=?
+                   AND id NOT IN (
+                       SELECT id FROM sent_phrases
+                        WHERE kind=?
+                        ORDER BY id DESC
+                        LIMIT 20
+                   )
+                """,
+                (phrase_kind, phrase_kind),
+            )
 
         conn.execute(
             """
@@ -695,6 +719,86 @@ def init_db() -> None:
             ON first_dm_outbox(status, recovery_next_at, prepared_at)
             """
         )
+
+        # v1.0.63 bounds legacy First DM recovery and removes only stale
+        # cooldown artifacts created before the accepted v1.0.62 migration.
+        migration_name = "v1_0_63_recovery_and_peerflood_cleanup"
+        applied = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE name=?",
+            (migration_name,),
+        ).fetchone()
+        if not applied:
+            conn.execute(
+                """
+                UPDATE first_dm_outbox
+                   SET recovery_next_at=NULL
+                 WHERE status='prepared'
+                   AND (
+                       recovery_last_error LIKE 'peer_id_invalid%'
+                       OR recovery_last_error='entity_unavailable'
+                   )
+                """
+            )
+
+            rejected_v1061 = conn.execute(
+                """
+                SELECT applied_at FROM schema_migrations
+                 WHERE name='v1_0_61_peerflood_four_in_ten_base_10m'
+                """
+            ).fetchone()
+            accepted_v1062 = conn.execute(
+                """
+                SELECT applied_at FROM schema_migrations
+                 WHERE name='v1_0_62_peerflood_five_in_ten'
+                """
+            ).fetchone()
+            if rejected_v1061 and accepted_v1062:
+                hi_row = conn.execute(
+                    """
+                    SELECT value FROM runtime_meta
+                     WHERE key='peer_flood_cooldown_hi_seconds'
+                    """
+                ).fetchone()
+                try:
+                    ordinary_hi = max(60, min(86400, int(hi_row['value'])))
+                except (TypeError, ValueError, KeyError):
+                    ordinary_hi = 90
+                cutoff = str(accepted_v1062['applied_at'] or '')
+                conn.execute(
+                    """
+                    UPDATE accounts
+                       SET cooldown_until=strftime(
+                               '%Y-%m-%dT%H:%M:%fZ',
+                               'now',
+                               '+' || ? || ' seconds'
+                           ),
+                           next_send_at=CASE
+                               WHEN next_send_at IS NOT NULL
+                                AND julianday(next_send_at) > julianday(
+                                    'now', '+' || ? || ' seconds'
+                                )
+                               THEN NULL
+                               ELSE next_send_at
+                           END,
+                           updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     WHERE is_paused=1
+                       AND pause_reason='PeerFlood'
+                       AND peerflood_last_at IS NOT NULL
+                       AND peerflood_last_at <= ?
+                       AND julianday(cooldown_until) > julianday(
+                           'now', '+' || ? || ' seconds'
+                       )
+                    """,
+                    (ordinary_hi, ordinary_hi, cutoff, ordinary_hi),
+                )
+
+            conn.execute(
+                """
+                INSERT INTO schema_migrations(name, applied_at)
+                VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                """,
+                (migration_name,),
+            )
 
         conn.execute(
             """

@@ -1,4 +1,4 @@
-"""Queue admin UI — unified style."""
+"""Queue admin UI - unified style."""
 
 from __future__ import annotations
 

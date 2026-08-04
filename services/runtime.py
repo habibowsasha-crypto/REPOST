@@ -68,7 +68,11 @@ def _clamp_sec(n: int) -> int:
 
 def get_peer_flood_range_seconds() -> tuple[int, int]:
     """Return (lo, hi) inclusive seconds for PeerFlood min pause."""
-    from config import PEER_FLOOD_MIN_COOLDOWN_MINUTES
+    from config import (
+        PEER_FLOOD_COOLDOWN_MAX_SECONDS,
+        PEER_FLOOD_COOLDOWN_MIN_SECONDS,
+        PEER_FLOOD_MIN_COOLDOWN_MINUTES,
+    )
 
     raw_lo = _get(KEY_PEER_FLOOD_LO)
     raw_hi = _get(KEY_PEER_FLOOD_HI)
@@ -99,10 +103,17 @@ def get_peer_flood_range_seconds() -> tuple[int, int]:
         except ValueError:
             pass
 
-    # Default: honor the configured environment value exactly. The previous
-    # implicit 3–10 minute rewrite contradicted PEER_FLOOD_MIN_COOLDOWN_MINUTES.
-    base = _clamp_sec(int(PEER_FLOOD_MIN_COOLDOWN_MINUTES) * 60)
-    return base, base
+    # New installations use the approved ordinary range. The legacy minute
+    # key remains a compatibility fallback only when the explicit range is invalid.
+    try:
+        lo = _clamp_sec(int(PEER_FLOOD_COOLDOWN_MIN_SECONDS))
+        hi = _clamp_sec(int(PEER_FLOOD_COOLDOWN_MAX_SECONDS))
+        if lo > hi:
+            lo, hi = hi, lo
+        return lo, hi
+    except (TypeError, ValueError):
+        base = _clamp_sec(int(PEER_FLOOD_MIN_COOLDOWN_MINUTES) * 60)
+        return base, base
 
 
 def set_peer_flood_range_seconds(lo: int, hi: int) -> tuple[int, int]:
@@ -175,7 +186,7 @@ def format_peer_flood_range() -> str:
     lo, hi = get_peer_flood_range_seconds()
     if lo == hi:
         return format_duration(lo)
-    return f"{format_duration(lo)} – {format_duration(hi)}"
+    return f"{format_duration(lo)} - {format_duration(hi)}"
 
 
 # --- Back-compat aliases ---
@@ -363,5 +374,5 @@ def format_sec_range(lo: int, hi: int) -> str:
         return format_duration(lo)
     # prefer minutes when both >= 60
     if lo >= 60 and hi >= 60:
-        return f"{lo // 60}–{hi // 60} мин"
-    return f"{lo}–{hi} сек"
+        return f"{lo // 60}-{hi // 60} мин"
+    return f"{lo}-{hi} сек"

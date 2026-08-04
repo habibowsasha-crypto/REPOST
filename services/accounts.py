@@ -377,6 +377,9 @@ def delete_account(user_id: int) -> bool:
             "DELETE FROM spambot_state WHERE account_user_id=?", (uid,)
         )
         conn.execute(
+            "DELETE FROM peerflood_hits WHERE account_user_id=?", (uid,)
+        )
+        conn.execute(
             "DELETE FROM dialog_outbox WHERE account_user_id=? AND status='prepared'",
             (uid,),
         )
@@ -570,11 +573,11 @@ def format_dm_interval(acc: dict) -> str:
     if lo is None or hi is None:
         from services import runtime as runtime_svc
         glo, ghi = runtime_svc.get_account_interval_range()
-        return f"как в настройках ({glo // 60}–{ghi // 60} мин)"
+        return f"как в настройках ({glo // 60}-{ghi // 60} мин)"
     lo, hi = int(lo), int(hi)
     if lo >= 60 and hi >= 60:
-        return f"свой: {lo // 60}–{hi // 60} мин"
-    return f"свой: {lo}–{hi} сек"
+        return f"свой: {lo // 60}-{hi // 60} мин"
+    return f"свой: {lo}-{hi} сек"
 
 
 

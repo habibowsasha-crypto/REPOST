@@ -9,7 +9,7 @@ from telethon import Button
 from telethon.events.callbackquery import CallbackQuery
 from telethon.events.newmessage import NewMessage
 
-from services.ui import back_home_row, back_row, btn  # noqa: F401 — re-export
+from services.ui import back_home_row, back_row, btn  # noqa: F401 - re-export
 
 EventLike = Union[NewMessage.Event, CallbackQuery.Event, Any]
 

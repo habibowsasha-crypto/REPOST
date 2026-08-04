@@ -2,10 +2,11 @@
 
 Approved funnel:
 1. First DM is already sent by the existing First DM module.
-2. Any user reaction starts one short, contextual promo with the exact CHANNEL_LINK.
-3. If the user stays silent, one short smoothing apology is sent after 5-60 seconds.
-4. Remaining outgoing slots are used only to answer the user's own follow-up messages.
-5. The absolute budget is five outgoing messages including First DM.
+2. Any allowed user reaction starts one varied promo with the exact CHANNEL_LINK.
+3. One varied smoothing apology is sent after the configured delay.
+4. One varied link-opening instruction is sent after the next configured delay.
+5. One remaining outgoing slot may answer the user's own follow-up message.
+6. The absolute budget is five outgoing messages including First DM.
 
 Voice notes, stickers, GIFs, photos, videos and emoji-only messages are always treated
 as neutral or positive reactions. They are not transcribed or semantically inspected.
@@ -84,11 +85,11 @@ _LINK_REQUEST_RE = re.compile(
 )
 
 _REQUIRED_SOFTWARE_RE = re.compile(r"(софт|программ)", re.IGNORECASE)
-_REQUIRED_COPY_RE = re.compile(r"(копир|перенос|дублир|подхватыва)", re.IGNORECASE)
+_REQUIRED_COPY_RE = re.compile(r"(копир|перенос|дублир|подхватыва|собира|попада)", re.IGNORECASE)
 _REQUIRED_VIP_RE = re.compile(r"(vip|вип|закрыт)", re.IGNORECASE)
 _REQUIRED_FREE_RE = re.compile(r"(бесплат|без\s+оплат|платить\s+не\s+надо)", re.IGNORECASE)
 _REQUIRED_SPEED_RE = re.compile(
-    r"(почти\s+сразу|почти\s+моменталь|сразу\s+после|минимальн.{0,8}задерж)",
+    r"(почти\s+сразу|почти\s+моменталь|сразу\s+после|минимальн.{0,8}задерж|быстро|оперативн)",
     re.IGNORECASE,
 )
 _REQUIRED_BENEFIT_RE = re.compile(
@@ -104,60 +105,114 @@ _FORBIDDEN_CLAIMS_RE = re.compile(
 
 _PROMO_REACTIONS = {
     CATEGORY_NORMAL: [
-        "понял тебя",
-        "ага, понял",
-        "ясно",
         "ок, понял",
-        "понял)",
+        "ага, понял тебя",
+        "ясно, тогда коротко",
+        "понял, хорошо",
+        "окей, тогда по делу",
+        "ага, спасибо что ответил",
     ],
     CATEGORY_UNCLEAR: [
-        "не совсем понял тебя 😅",
-        "не до конца понял, что ты имел в виду",
-        "чуть не понял реакцию)",
+        "не совсем понял реакцию, но коротко объясню",
+        "чуть не понял тебя, поэтому просто скажу",
+        "не до конца уловил, тогда коротко",
     ],
     CATEGORY_LINK_REQUEST: [
-        "да, держи 👍",
-        "ага, вот",
-        "конечно, держи",
+        "да, держи",
+        "ага, вот ссылка",
+        "конечно, скидываю",
     ],
     CATEGORY_SOFT_REFUSAL: [
-        "понял тебя",
-        "ок, без проблем",
-        "ясно, не буду уговаривать",
+        "понял тебя, просто оставлю на всякий случай",
+        "ок, без уговоров, только скину",
+        "ясно, тогда просто оставлю ссылку",
     ],
 }
 _PROMO_TRANSITIONS = [
-    "я просто хотел скинуть бесплатный канал",
-    "я вообще хотел поделиться бесплатным каналом",
-    "написал по делу, есть бесплатный канал",
     "просто хотел оставить бесплатный канал",
+    "на самом деле хотел поделиться бесплатным каналом",
+    "я только хотел скинуть один бесплатный канал",
+    "просто решил показать бесплатный канал",
+    "хотел оставить тебе ссылку на бесплатный канал",
+    "написал только ради одного бесплатного канала",
 ]
 _PROMO_MECHANICS = [
     "там софт почти сразу копирует новые посты из закрытых випок",
-    "там программа автоматически переносит новые посты из закрытых випок почти сразу после выхода",
-    "там софт почти моментально подхватывает публикации из закрытых VIP-каналов",
-    "там программа сама копирует новые посты из закрытых випок с минимальной задержкой",
+    "туда программа почти моментально переносит публикации из закрытых VIP-каналов",
+    "там софт быстро подхватывает материалы из закрытых торговых випок",
+    "программа автоматически и с минимальной задержкой переносит туда посты из закрытых VIP-каналов",
+    "программа собирает там свежие публикации из закрытых випок почти сразу после выхода",
+    "софт оперативно переносит туда новые материалы из закрытых VIP-каналов",
 ]
 _PROMO_ACCESS = [
     "отдельные доступы покупать не надо",
     "платить за каждую випку отдельно не нужно",
-    "без покупки отдельных VIP-доступов",
-    "и за отдельные випки платить не надо",
+    "можно обойтись без покупки отдельных VIP-доступов",
+    "за несколько закрытых подписок отдельно платить не придётся",
+    "не нужно оплачивать доступ к каждой випке по отдельности",
+    "всё можно смотреть без отдельных платных подписок",
 ]
 _PROMO_BENEFITS = [
     "глянь, вдруг найдёшь что-то полезное для своих сделок",
     "может попадётся полезная идея для торговли",
-    "вдруг что-то пригодится для твоего анализа",
+    "вдруг что-нибудь пригодится для твоего анализа",
     "может найдёшь интересный сетап или разбор",
-    "можешь сравнить с тем, что сам сейчас смотришь",
+    "посмотри, возможно там будет что-то полезное для твоих сделок",
+    "можешь глянуть, вдруг найдётся подходящая торговая идея",
 ]
 
 _SMOOTHING_FALLBACKS = [
-    "сорян что отвлёк, просто подумал вдруг тебе будет полезно",
-    "извини что так в личку написал, просто решил поделиться",
-    "не хотел навязываться, вдруг реально что-то пригодится",
-    "сорян за внезапное сообщение, просто оставил на всякий случай",
-    "извини если не вовремя, больше отвлекать не буду",
+    "Сорян, не хотел навязываться. Просто делюсь, вдруг пригодится тебе.",
+    "Извини за внезапное сообщение. Просто решил поделиться, вдруг будет полезно.",
+    "Не хотел напрягать, просто оставил на всякий случай. Может пригодится.",
+    "Сорян, если отвлёк. Я только хотел поделиться полезной находкой.",
+    "Извини, что написал без предупреждения. Просто подумал, что тебе может пригодиться.",
+    "Не хотел быть навязчивым. Просто скинул, а смотреть или нет - уже тебе решать.",
+    "Сорян за такой заход. Просто решил оставить, вдруг окажется полезным.",
+    "Извини, если сообщение не к месту. Я лишь хотел поделиться.",
+    "Не хотел мешать. Просто оставил информацию на случай, если пригодится.",
+    "Сорян за внезапную личку. Просто делюсь без всяких уговоров.",
+    "Извини, если не вовремя. Решил скинуть, вдруг найдёшь что-то полезное.",
+    "Не хотел навязывать. Просто показал вариант, который может пригодиться.",
+    "Сорян, что отвлёк. Просто подумал, что информация может быть полезной.",
+    "Извини за неожиданное сообщение. Ничего не навязываю, просто поделился.",
+    "Не хотел грузить. Просто оставил на всякий случай.",
+    "Сорян, если помешал. Решил поделиться и больше не отвлекаю.",
+    "Извини за сообщение в личку. Просто хотел оставить полезный вариант.",
+    "Не хотел напрягать тебя. Просто скинул, вдруг когда-нибудь пригодится.",
+    "Сорян за беспокойство. Просто решил поделиться без лишних уговоров.",
+    "Извини, если отвлёк от дел. Просто оставил информацию на всякий случай.",
+    "Не хотел показаться навязчивым. Просто делюсь тем, что может быть полезно.",
+    "Сорян за неожиданность. Просто хотел, чтобы эта информация была у тебя.",
+    "Извини, что в личку. Просто решил поделиться, вдруг зайдёт.",
+    "Не хотел отвлекать надолго. Просто оставил и всё.",
+]
+
+_LINK_HELP_FALLBACKS = [
+    "На всякий случай закрой крестиком панель «Заблокировать / Добавить» над чатом. Потом нажми ссылку ещё раз. Если Telegram всё равно не пускает - скопируй её вручную.",
+    "Если ссылка не открывается, нажми крестик на панели «Заблокировать / Добавить» сверху чата и попробуй перейти повторно. Не поможет - скопируй ссылку вручную.",
+    "Чтобы Telegram пропустил по ссылке, сначала закрой крестиком блок «Заблокировать / Добавить» над перепиской. Затем нажми ссылку снова, а если не сработает - скопируй её вручную.",
+    "На случай проблемы со ссылкой: убери крестиком панель «Заблокировать / Добавить» над сообщениями и нажми ещё раз. Если переход не заработает - скопируй ссылку вручную.",
+    "Если Telegram не даёт перейти, закрой крестиком окно «Заблокировать / Добавить» над чатом. После этого повторно нажми ссылку. В крайнем случае скопируй её вручную.",
+    "Если ссылка сразу не нажимается, убери крестиком панель «Заблокировать / Добавить» сверху переписки и попробуй снова. Если всё равно не пускает - скопируй ссылку вручную.",
+    "Небольшая подсказка: закрой крестиком панель «Заблокировать / Добавить» над диалогом, затем ещё раз нажми ссылку. Если Telegram не откроет - скопируй её вручную.",
+    "Если с переходом проблема, сначала нажми крестик у панели «Заблокировать / Добавить» над чатом. Потом повтори нажатие на ссылку, а если не выйдет - скопируй её вручную.",
+    "Telegram иногда мешает открыть ссылку. Закрой крестиком панель «Заблокировать / Добавить» над перепиской и нажми ссылку заново. Не сработает - скопируй вручную.",
+    "Если канал не открывается, убери крестиком блок «Заблокировать / Добавить» сверху чата и снова нажми на ссылку. Если без результата - скопируй ссылку вручную.",
+    "Для перехода закрой крестиком панель «Заблокировать / Добавить», которая находится над чатом, и нажми ссылку ещё раз. Если Telegram откажет - скопируй её вручную.",
+    "Если Telegram тормозит переход, нажми крестик на панели «Заблокировать / Добавить» над сообщениями, затем попробуй ссылку повторно. Не получится - скопируй её вручную.",
+    "Если по ссылке не пускает, сначала закрой крестиком верхнюю панель «Заблокировать / Добавить». Потом нажми ссылку снова. Если ничего не изменится - скопируй вручную.",
+    "На всякий случай: убери крестиком предложение «Заблокировать / Добавить» над перепиской и повтори переход по ссылке. Если не откроется - скопируй её вручную.",
+    "Когда ссылка не работает, закрой крестиком панель «Заблокировать / Добавить» вверху чата и попробуй ещё раз. Если Telegram снова не пустит - скопируй ссылку вручную.",
+    "Если не получается зайти, нажми крестик возле панели «Заблокировать / Добавить» над чатом, после чего повторно открой ссылку. Не поможет - скопируй её вручную.",
+    "Если Telegram блокирует нажатие, закрой крестиком панель «Заблокировать / Добавить» над диалогом и снова нажми ссылку. В крайнем случае скопируй её вручную.",
+    "Если ссылка не срабатывает, убери крестиком верхний блок «Заблокировать / Добавить» и попробуй открыть её ещё раз. Если не выйдет - скопируй вручную.",
+    "Telegram может не пускать из-за панели над чатом. Закрой крестиком «Заблокировать / Добавить», снова нажми ссылку, а если не откроется - скопируй её вручную.",
+    "Если переход не открывается, сначала убери крестиком панель «Заблокировать / Добавить» над перепиской. Затем повтори нажатие, а при неудаче скопируй ссылку вручную.",
+    "Для надёжности закрой крестиком блок «Заблокировать / Добавить» над сообщениями и нажми ссылку повторно. Если Telegram всё равно не откроет - скопируй её вручную.",
+    "Если Telegram не реагирует на ссылку, нажми крестик у панели «Заблокировать / Добавить» сверху чата и повтори попытку. Не поможет - скопируй вручную.",
+    "Если не пускает в канал, убери крестиком панель «Заблокировать / Добавить» над диалогом и ещё раз нажми ссылку. Если не получится - скопируй её вручную.",
+    "Если ссылка остаётся недоступной, закрой крестиком «Заблокировать / Добавить» над чатом и попробуй снова. Последний вариант - скопировать ссылку вручную.",
 ]
 
 _FIRST_DM_SILENCE_FALLBACKS = [
@@ -191,7 +246,6 @@ _QNA_FALLBACKS = [
     "можешь просто открыть и посмотреть, отдельные доступы покупать не надо",
     "ссылка выше, там всё можно спокойно посмотреть без покупки випок",
 ]
-
 
 class ChannelLinkNotConfiguredError(RuntimeError):
     """Raised when a link step is reached without a valid admin CHANNEL_LINK."""
@@ -350,31 +404,63 @@ def is_too_similar(text: str, recent: list[str], *, threshold: float = 0.80) -> 
     return False
 
 
-def _promo_opening_instruction(
-    category: str,
+MAX_GENERATION_ATTEMPTS = 3
+ANTI_REPEAT_WINDOW = 20
+
+
+def _recent_block(recent: list[str]) -> str:
+    if not recent:
+        return ""
+    return "\nПоследние формулировки этого типа, которые нельзя повторять или близко копировать:\n" + "\n".join(
+        f"- {item}" for item in recent[:ANTI_REPEAT_WINDOW]
+    )
+
+
+def _pick_unique_fallback(
+    candidates: list[str],
+    recent: list[str],
     *,
-    retry: int,
-    pitch: str = "",
+    threshold: float,
 ) -> str:
-    category_guidance = {
-        CATEGORY_NORMAL: "Коротко и естественно отреагируй на ответ пользователя.",
-        CATEGORY_UNCLEAR: "Скажи, что не совсем понял реакцию, без выдумок.",
-        CATEGORY_LINK_REQUEST: "Пользователь просит ссылку. Начни прямо и дружелюбно.",
-        CATEGORY_SOFT_REFUSAL: "Пользователь спокойно отказался. Ответь без давления.",
-    }.get(category, "Коротко отреагируй на сообщение пользователя.")
-    retry_note = (
-        "Сформулируй совсем иначе, чем в прошлой попытке. " if retry else ""
+    pool = list(candidates)
+    random.shuffle(pool)
+    for candidate in pool:
+        clean = _strip_bad_dashes(candidate)
+        if not is_too_similar(clean, recent, threshold=threshold):
+            return clean
+    recent_normalized = {_normalize_similarity(item) for item in recent[:ANTI_REPEAT_WINDOW]}
+    exact_new = [item for item in pool if _normalize_similarity(item) not in recent_normalized]
+    if exact_new:
+        def max_score(item: str) -> float:
+            return max((similarity_score(item, old) for old in recent[:ANTI_REPEAT_WINDOW]), default=0.0)
+        return _strip_bad_dashes(min(exact_new, key=max_score))
+    return _strip_bad_dashes(random.choice(pool))
+
+
+def _build_local_promo_candidates(category: str, count: int = 100) -> list[str]:
+    reactions = _PROMO_REACTIONS.get(category) or _PROMO_REACTIONS[CATEGORY_NORMAL]
+    candidates: list[str] = []
+    shapes = (
+        "{reaction}. {transition} - {mechanics}. {benefit}, {access}",
+        "{reaction}, {transition}. {mechanics}. {access}, {benefit}",
+        "{reaction}. {transition}: {mechanics}. {access}. {benefit}",
+        "{reaction}. {transition}, {mechanics}. {benefit}. {access}",
+        "{reaction}, тогда коротко: {transition}. {mechanics}, поэтому {access}. {benefit}",
+        "{reaction}. {transition}. {mechanics}, а {access}. {benefit}",
     )
-    return (
-        "Напиши только короткое начало сообщения для обычного Telegram-диалога. "
-        "Длина 2-10 слов, без вопроса, ссылки и рекламного описания. "
-        "Обращайся на 'ты', пиши просто и по-человечески. "
-        f"{category_guidance} {retry_note}"
-        f"Контекст предложения: {(pitch or 'бесплатный крипто-канал')[:240]}. "
-        "Не пересказывай контекст, он нужен только для понимания ситуации. "
-        "Примеры формата: 'понял тебя', 'ага, ясно', 'да, держи', "
-        "'не совсем понял реакцию'. Верни только начало."
-    )
+    for _ in range(max(24, count)):
+        candidates.append(
+            _strip_bad_dashes(
+                random.choice(shapes).format(
+                    reaction=random.choice(reactions),
+                    transition=random.choice(_PROMO_TRANSITIONS),
+                    mechanics=random.choice(_PROMO_MECHANICS),
+                    access=random.choice(_PROMO_ACCESS),
+                    benefit=random.choice(_PROMO_BENEFITS),
+                )
+            )
+        )
+    return candidates
 
 
 def _promo_opening_ok(text: str) -> bool:
@@ -391,27 +477,32 @@ def _promo_opening_ok(text: str) -> bool:
 
 
 def _build_promo_with_opening(opening: str, category: str) -> str:
-    safe_opening = _strip_bad_dashes(opening).strip(" .,!?:;-")
-    if not safe_opening:
-        reactions = _PROMO_REACTIONS.get(category) or _PROMO_REACTIONS[CATEGORY_NORMAL]
-        safe_opening = random.choice(reactions)
-    transition = random.choice(_PROMO_TRANSITIONS)
-    mechanics = random.choice(_PROMO_MECHANICS)
-    access = random.choice(_PROMO_ACCESS)
-    benefit = random.choice(_PROMO_BENEFITS)
-    shapes = [
-        f"{safe_opening}. {transition}, {mechanics}. {access}, {benefit}",
-        f"{safe_opening}. {transition} - {mechanics}. {benefit}, {access}",
-        f"{safe_opening}, {transition}. {mechanics}, {access}. {benefit}",
-        f"{safe_opening}. {transition}: {mechanics}. {access}, {benefit}",
-    ]
-    return _strip_bad_dashes(random.choice(shapes))
+    reaction = _strip_bad_dashes(opening).strip(" .,!?:;-")
+    if not reaction:
+        reaction = random.choice(
+            _PROMO_REACTIONS.get(category) or _PROMO_REACTIONS[CATEGORY_NORMAL]
+        )
+    shapes = (
+        "{reaction}. {transition} - {mechanics}. {benefit}, {access}",
+        "{reaction}, {transition}. {mechanics}. {access}, {benefit}",
+        "{reaction}. {transition}: {mechanics}. {access}. {benefit}",
+        "{reaction}. {transition}, {mechanics}. {benefit}. {access}",
+    )
+    return _strip_bad_dashes(
+        random.choice(shapes).format(
+            reaction=reaction,
+            transition=random.choice(_PROMO_TRANSITIONS),
+            mechanics=random.choice(_PROMO_MECHANICS),
+            access=random.choice(_PROMO_ACCESS),
+            benefit=random.choice(_PROMO_BENEFITS),
+        )
+    )
 
 
 def _promo_validation_errors(text: str) -> list[str]:
     value = _strip_bad_dashes(text)
     errors: list[str] = []
-    if not 45 <= len(value) <= 420:
+    if not 70 <= len(value) <= 520:
         errors.append("length")
     if _URL_RE.search(value) or _TELEGRAM_HANDLE_RE.search(value):
         errors.append("foreign_link")
@@ -433,18 +524,13 @@ def _promo_ok(text: str) -> bool:
     return not _promo_validation_errors(text)
 
 
-def _build_local_promo(category: str) -> str:
-    reactions = _PROMO_REACTIONS.get(category) or _PROMO_REACTIONS[CATEGORY_NORMAL]
-    return _build_promo_with_opening(random.choice(reactions), category)
-
-
 async def generate_promo(
     history: list[dict],
     *,
     category: str = CATEGORY_NORMAL,
     content_kind: str = "text",
 ) -> str:
-    """Generate unique promo and append only the exact configured channel link."""
+    """Generate one varied promo with the exact configured channel link."""
     if is_non_text_reaction(_last_user_text(history), content_kind):
         category = CATEGORY_NORMAL
     if category not in {
@@ -455,81 +541,165 @@ async def generate_promo(
     }:
         category = CATEGORY_NORMAL
 
-    recent = phrases_svc.recent_texts(phrases_svc.KIND_PROMO, limit=30)
+    recent = phrases_svc.recent_texts(
+        phrases_svc.KIND_PROMO,
+        limit=ANTI_REPEAT_WINDOW,
+    )
+    instruction = (
+        "Напиши одно живое рекламное сообщение для Telegram после короткого ответа пользователя.\n"
+        "Смысл нужно передать каждый раз другими словами:\n"
+        "- просто хотел оставить бесплатный канал\n"
+        "- софт или программа почти сразу переносит публикации из закрытых VIP-каналов\n"
+        "- не нужно платить за каждую випку отдельно\n"
+        "- человеку может пригодиться идея, разбор или материал для его сделок\n"
+        "Пиши разговорно, без давления, одним сообщением до 420 символов.\n"
+        "Не задавай вопрос, не обещай прибыль, не выдумывай личный опыт.\n"
+        "Не вставляй URL или @username - системная ссылка добавится автоматически.\n"
+        "Используй только обычный дефис '-'. Верни только готовый текст.\n"
+        f"Категория реакции пользователя: {category}.\n"
+        f"Контекст администратора: {(CHANNEL_PITCH or 'бесплатный канал с материалами из закрытых VIP-каналов')[:300]}."
+        + _recent_block(recent)
+    )
     if AI_DM_ENABLED and OPENAI_API_KEY:
-        for retry in range(3):
+        for attempt in range(MAX_GENERATION_ATTEMPTS):
             try:
-                opening = await _openai_reply(
-                    history,
-                    instruction=_promo_opening_instruction(
-                        category,
-                        retry=retry,
-                        pitch=CHANNEL_PITCH,
-                    ),
-                    temperature=0.72 if retry == 0 else 0.9,
+                retry_note = (
+                    "\nПредыдущий вариант не прошёл проверку. Перестрой фразы и порядок мыслей заметно иначе."
+                    if attempt else ""
                 )
-                opening = _enforce_admin_link(opening or "", include_link=False)
-                if not _promo_opening_ok(opening):
+                text = await _openai_reply(
+                    history,
+                    instruction=instruction + retry_note,
+                    temperature=0.85 if attempt == 0 else 1.0,
+                )
+                clean = _enforce_admin_link(text or "", include_link=False)
+                errors = _promo_validation_errors(clean)
+                if errors and _promo_opening_ok(clean):
+                    clean = _build_promo_with_opening(clean, category)
+                    errors = _promo_validation_errors(clean)
+                if errors:
                     logger.warning(
-                        "Promo opening rejected category={} retry={} text={!r}",
-                        category,
-                        retry,
-                        opening[:100],
+                        "Promo rejected attempt={} reasons={} text={!r}",
+                        attempt + 1,
+                        ",".join(errors),
+                        clean[:140],
                     )
                     continue
-                text = _build_promo_with_opening(opening, category)
-                validation_errors = _promo_validation_errors(text)
-                if validation_errors:
-                    logger.warning(
-                        "Promo assembly rejected category={} retry={} reasons={} text={!r}",
-                        category,
-                        retry,
-                        ",".join(validation_errors),
-                        text[:120],
-                    )
+                if is_too_similar(clean, recent, threshold=0.82):
+                    logger.warning("Promo too similar attempt={} text={!r}", attempt + 1, clean[:140])
                     continue
-                if is_too_similar(text, recent):
-                    logger.warning(
-                        "Promo rejected as duplicate category={} retry={} text={!r}",
-                        category,
-                        retry,
-                        text[:120],
-                    )
-                    continue
-                return _enforce_admin_link(text, include_link=True)
+                return _enforce_admin_link(clean, include_link=True)
             except ChannelLinkNotConfiguredError:
                 raise
             except Exception as exc:
-                logger.warning("Promo AI attempt {} failed: {}", retry + 1, exc)
+                logger.warning("Promo AI attempt {} failed: {}", attempt + 1, exc)
 
-    # Safe compositional fallback. Try several combinations against the same 30-message window.
-    candidate = ""
-    for _ in range(24):
-        candidate = _build_local_promo(category)
-        if _promo_ok(candidate) and not is_too_similar(candidate, recent):
-            return _enforce_admin_link(candidate, include_link=True)
-    return _enforce_admin_link(candidate or _build_local_promo(category), include_link=True)
+    candidates = [item for item in _build_local_promo_candidates(category) if _promo_ok(item)]
+    fallback = _pick_unique_fallback(candidates, recent, threshold=0.82)
+    return _enforce_admin_link(fallback, include_link=True)
+
+
+def _apology_ok(text: str) -> bool:
+    value = _strip_bad_dashes(text)
+    if not 15 <= len(value) <= 180:
+        return False
+    if "?" in value or _URL_RE.search(value) or _TELEGRAM_HANDLE_RE.search(value):
+        return False
+    if re.search(r"(канал|vip|вип|софт|программ|ссылк)", value, re.IGNORECASE):
+        return False
+    return bool(re.search(r"(сорян|извин|не хотел|не хотел|прост|делюсь|поделиться|навяз)", value, re.IGNORECASE))
 
 
 async def generate_smoothing_apology(history: list[dict]) -> str:
+    recent = phrases_svc.recent_texts(
+        phrases_svc.KIND_APOLOGY,
+        limit=ANTI_REPEAT_WINDOW,
+    )
     instruction = (
         "Напиши одно короткое человеческое сообщение после рекламы в Telegram.\n"
-        "Нужно слегка извиниться за внезапное личное сообщение и сказать, что просто хотел поделиться.\n"
-        "Не повторяй рекламу, не упоминай канал, VIP, софт или ссылку.\n"
-        "Не задавай вопрос. До 100 символов. Можно разговорно: сорян, извини, не хотел навязываться.\n"
+        "Смысл: слегка извиниться за внезапное личное сообщение, сказать, что не хотел навязываться и просто поделился, вдруг пригодится.\n"
+        "Каждый раз передавай этот смысл по-разному. Не упоминай канал, VIP, софт или ссылку.\n"
+        "Не задавай вопрос. До 140 символов. Разговорный русский.\n"
         "Только обычный дефис '-'. Верни только сообщение."
+        + _recent_block(recent)
     )
     if AI_DM_ENABLED and OPENAI_API_KEY:
-        try:
-            text = await _openai_reply(history, instruction=instruction, temperature=0.8)
-            text = _enforce_admin_link(text or "", include_link=False)
-            if 10 <= len(text) <= 140 and not _URL_RE.search(text):
-                if not re.search(r"(канал|vip|вип|софт|программ)", text, re.IGNORECASE):
-                    return text
-        except Exception as exc:
-            logger.warning("Smoothing apology fallback used: {}", exc)
-    return random.choice(_SMOOTHING_FALLBACKS)
+        for attempt in range(MAX_GENERATION_ATTEMPTS):
+            try:
+                retry_note = "\nНапиши заметно иначе, чем предыдущая попытка." if attempt else ""
+                text = await _openai_reply(
+                    history,
+                    instruction=instruction + retry_note,
+                    temperature=0.9 if attempt == 0 else 1.05,
+                )
+                clean = _enforce_admin_link(text or "", include_link=False)
+                if not _apology_ok(clean):
+                    logger.warning("Apology rejected attempt={} text={!r}", attempt + 1, clean[:120])
+                    continue
+                if is_too_similar(clean, recent, threshold=0.84):
+                    logger.warning("Apology too similar attempt={} text={!r}", attempt + 1, clean[:120])
+                    continue
+                return clean
+            except Exception as exc:
+                logger.warning("Apology AI attempt {} failed: {}", attempt + 1, exc)
+    return _pick_unique_fallback(_SMOOTHING_FALLBACKS, recent, threshold=0.84)
 
+
+def _link_help_ok(text: str) -> bool:
+    value = _strip_bad_dashes(text)
+    if not 90 <= len(value) <= 360:
+        return False
+    if _URL_RE.search(value) or _TELEGRAM_HANDLE_RE.search(value):
+        return False
+    required = (
+        re.search(r"заблокировать", value, re.IGNORECASE),
+        re.search(r"добавить", value, re.IGNORECASE),
+        re.search(r"(крестик|крестиком|закрой|убери|нажми\s+крест)", value, re.IGNORECASE),
+        re.search(r"ссылк", value, re.IGNORECASE),
+        re.search(r"(ещё\s+раз|снова|повтор|заново)", value, re.IGNORECASE),
+        re.search(r"(скопируй|скопировать).{0,30}вручн|вручн.{0,30}(скопируй|скопировать)", value, re.IGNORECASE),
+    )
+    return all(required)
+
+
+async def generate_link_open_help(history: list[dict]) -> str:
+    """Generate the automatic instruction sent after the smoothing apology."""
+    recent = phrases_svc.recent_texts(
+        phrases_svc.KIND_LINK_HELP,
+        limit=ANTI_REPEAT_WINDOW,
+    )
+    instruction = (
+        "Напиши короткую понятную инструкцию для Telegram.\n"
+        "Обязательный смысл:\n"
+        "1. Закрыть крестиком панель «Заблокировать / Добавить» над чатом.\n"
+        "2. Нажать ссылку ещё раз.\n"
+        "3. Если Telegram всё равно не пускает - скопировать ссылку вручную.\n"
+        "Передай этот смысл другими словами, но не потеряй ни один шаг.\n"
+        "Не вставляй сам URL. Не задавай вопрос. До 300 символов.\n"
+        "Только обычный дефис '-'. Верни только готовую инструкцию."
+        + _recent_block(recent)
+    )
+    if AI_DM_ENABLED and OPENAI_API_KEY:
+        for attempt in range(MAX_GENERATION_ATTEMPTS):
+            try:
+                retry_note = "\nПредыдущая формулировка не подошла. Перестрой текст заметно иначе." if attempt else ""
+                text = await _openai_reply(
+                    history,
+                    instruction=instruction + retry_note,
+                    temperature=0.85 if attempt == 0 else 1.0,
+                )
+                clean = _enforce_admin_link(text or "", include_link=False)
+                if not _link_help_ok(clean):
+                    logger.warning("Link help rejected attempt={} text={!r}", attempt + 1, clean[:160])
+                    continue
+                if is_too_similar(clean, recent, threshold=0.88):
+                    logger.warning("Link help too similar attempt={} text={!r}", attempt + 1, clean[:160])
+                    continue
+                return clean
+            except Exception as exc:
+                logger.warning("Link help AI attempt {} failed: {}", attempt + 1, exc)
+    valid = [item for item in _LINK_HELP_FALLBACKS if _link_help_ok(item)]
+    return _pick_unique_fallback(valid, recent, threshold=0.88)
 
 async def generate_qna_reply(
     history: list[dict],

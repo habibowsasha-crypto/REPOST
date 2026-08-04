@@ -157,7 +157,7 @@ async def on_audience_import(event: events.NewMessage.Event) -> None:
 
     records = audience_svc.parse_import_text(raw)
     if not records:
-        await event.respond(notice("warn", "Не нашёл корректных user ID. /cancel — отмена."))
+        await event.respond(notice("warn", "Не нашёл корректных user ID. /cancel - отмена."))
         return
 
     clear_state(event.sender_id)
