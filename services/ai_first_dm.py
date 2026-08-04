@@ -28,27 +28,25 @@ _SURVEY_RE = re.compile(
     re.IGNORECASE,
 )
 
-_SYSTEM_PROMPT = """Ты пишешь первое короткое сообщение незнакомцу в Telegram.
-Ниша: трейдинг. Цель - чтобы человек коротко ответил.
+_SYSTEM_PROMPT = """Ты — обычный парень из трейдинг-чата. Пишешь незнакомцу в личку ОДНО короткое сообщение.
 
-Правила:
-- 1 короткое предложение (можно "Слушай," в начале).
-- Живой разговорный стиль, как у человека из чата.
-- Тема: торгует ли сейчас, сам или по сигналам, стратегия, новичок, потери - мягко.
-- Без ссылок, без рекламы, без названия канала, без оффера, без t.me.
-- Без хобби / фильмов / города / возраста / работы.
-- Без эмодзи-спама (лучше 0).
-- Только обычный дефис "-". Запрещены длинные тире.
-- Язык: русский, можно "щас", "слушай".
-- Не копируй примеры дословно, каждый раз своя формулировка.
-- Максимум 100 символов.
+Как пишут живые люди (важно):
+- Неровно, по-свойски, без «менеджерского» тона.
+- Можно: щас, а, ну, просто, коротко, без точки в конце иногда.
+- Иногда вообще без «привет/слушай» — сразу вопрос.
+- Иногда мягко: «можно спросить?», «не отвлеку?».
+- Иногда по делу: сам или по сигналам, торгует ли сейчас.
+- 1 фраза, до 90 символов. Как в мессенджере, не как пост.
 
-Примеры смысла (не копируй слово в слово):
-- Слушай, а ты щас торгуешь?
-- А ты сам торгуешь или по сигналам?
-- А не подскажешь новичку?
-- По какой стратегии ты торгуешь?
-- Слушай, а ты много потерял в трейдинге? Можно спросить
+Строго нельзя:
+- Реклама, канал, ссылки, t.me, оффер
+- Канцелярит: «хотел бы уточнить», «интересуюсь возможностью»
+- Одинаковые начала подряд
+- Эмодзи, длинные тире
+- Опросы про хобби/город/возраст
+- Выглядеть как рассылка или бот
+
+Цель: чтобы человек С ХОДУ ответил коротко. Цепляет живой тон + лёгкий вопрос, не шаблон.
 """
 
 
@@ -94,23 +92,125 @@ def validate_first_dm(text: str) -> tuple[bool, str]:
 
 
 def _too_similar_recent(text: str, recent: list[str]) -> bool:
-    """True if text shares a heavy theme with many of the last few DMs."""
-    tl = (text or "").lower()
-    keys = []
-    if "сигнал" in tl:
-        keys.append("сигнал")
-    if any(x in tl for x in ("убыт", "потеря", "слил")):
-        keys.append("loss")
-    if not keys:
+    """Reject if same opening or high token overlap with recent DMs."""
+    if not text or not recent:
         return False
-    hit = 0
-    for r in recent[:5]:
-        rl = (r or "").lower()
-        if "сигнал" in keys and "сигнал" in rl:
-            hit += 1
-        if "loss" in keys and any(x in rl for x in ("убыт", "потеря", "слил")):
-            hit += 1
-    return hit >= 2
+    t = (text or "").strip().lower()
+    # Opening: first 1-2 tokens
+    opener = _opening_key(t)
+    recent_openers = [_opening_key(r) for r in recent[:12]]
+    if opener and recent_openers.count(opener) >= 2:
+        return True
+    # If last 3 all share same opener family "слушай"
+    if opener == "слушай" and any(_opening_key(r) == "слушай" for r in recent[:3]):
+        return True
+
+    words = set(_tokens(t))
+    if not words:
+        return False
+    for r in recent[:10]:
+        rw = set(_tokens((r or "").lower()))
+        if not rw:
+            continue
+        inter = words & rw
+        if len(inter) >= 3 and len(inter) / max(len(words), 1) >= 0.55:
+            return True
+    return False
+
+
+def _opening_key(text: str) -> str:
+    t = (text or "").strip().lower().lstrip(",.!? ")
+    # strip common soft prefixes
+    for p in ("слушай", "эй", "привет", "кстати", "йоу", "хей"):
+        if t.startswith(p):
+            return p
+    # first word
+    parts = t.replace(",", " ").split()
+    return parts[0] if parts else ""
+
+
+def _tokens(text: str) -> list[str]:
+    return [w for w in re.findall(r"[а-яa-z0-9]+", (text or "").lower()) if len(w) > 2]
+
+# Styles optimized for reply rate + human feel. Forced rotation.
+_STYLES = (
+    "soft",      # можно спросить / не отвлеку — highest reply friction-low
+    "signals",   # сам или по сигналам
+    "active",    # щас торгуешь?
+    "newbie",    # подскажи новичку
+)
+
+
+def _detect_style(text: str) -> str:
+    t = (text or "").lower()
+    if any(x in t for x in ("сигнал", "сам торг", "сам анализ", "сам смотр")):
+        return "signals"
+    if any(x in t for x in ("новичк", "подскаж", "помо")):
+        return "newbie"
+    if any(
+        x in t
+        for x in (
+            "можно спросить",
+            "не отвлек",
+            "не помеш",
+            "есть секунд",
+            "есть минут",
+            "на секунду",
+        )
+    ):
+        return "soft"
+    if any(x in t for x in ("торгу", "рынк", "паузе", "щас")):
+        return "active"
+    return "other"
+
+
+def _pick_style(recent: list[str]) -> str:
+    """Least-used style among last messages; soft gets a slight bias (reply rate)."""
+    counts = {s: 0 for s in _STYLES}
+    for r in recent[:10]:
+        st = _detect_style(r)
+        if st in counts:
+            counts[st] += 1
+    # soft may lag: prefer if missing in last 3
+    last3 = [_detect_style(r) for r in recent[:3]]
+    if "soft" not in last3 and counts["soft"] <= min(counts.values()) + 0:
+        return "soft"
+    # round-robin least used
+    return min(_STYLES, key=lambda s: (counts[s], _STYLES.index(s)))
+
+
+def _style_instruction(style: str) -> str:
+    if style == "soft":
+        return (
+            "Стиль СЕЙЧАС: мягкий крючок без трейдинг-терминов. "
+            "Как человек, который стесняется писать первым. "
+            "Примеры смысла (не копируй): «можно спросить?», "
+            "«не отвлеку на секунду?», «есть минутка? хотел спросить». "
+            "Без слова сигнал, стратегия, убыток."
+        )
+    if style == "signals":
+        return (
+            "Стиль СЕЙЧАС: сам торгует или по сигналам. "
+            "Коротко и по-свойски, как в чате. "
+            "Примеры смысла: «ты сам торгуешь или по сигналам?», "
+            "«на сигналах сидишь или сам график смотришь?»."
+        )
+    if style == "active":
+        return (
+            "Стиль СЕЙЧАС: торгует ли сейчас. "
+            "Живой вопрос, не анкета. "
+            "Примеры смысла: «а ты щас торгуешь?», "
+            "«в рынке сейчас или на паузе?»."
+        )
+    # newbie
+    return (
+        "Стиль СЕЙЧАС: просьба к более опытному / новичку нужна подсказка. "
+        "Люди часто отвечают, когда их просят помочь. "
+        "Примеры смысла: «новичку не подскажешь по трейду?», "
+        "«можно глупый вопрос по рынку?»."
+    )
+
+
 
 
 def sanitize_dashes(text: str) -> str:
@@ -123,72 +223,64 @@ def sanitize_dashes(text: str) -> str:
 
 async def generate_first_dm() -> str:
     """
-    Prefer OpenAI unique hook; fallback to local templates.
+    Human-sounding first DM with forced style rotation for reply rate.
     Always returns a validator-passed string.
     """
     recent = phrases_svc.recent_texts(phrases_svc.KIND_FIRST_DM, limit=40)
+    style = _pick_style(recent)
+    logger.info("First DM style picked: {}", style)
 
     if AI_DM_ENABLED and OPENAI_API_KEY:
         try:
-            text = await _openai_first_dm(recent)
-            if text:
+            for attempt in range(2):
+                text = await _openai_first_dm(recent, style=style)
+                if not text:
+                    continue
                 text = sanitize_dashes(text)
                 ok, reason = validate_first_dm(text)
-                if ok and text not in recent and not _too_similar_recent(text, recent):
-                    return text
-                if ok and text not in recent and _too_similar_recent(text, recent):
-                    reason = "theme_repeat"
-                logger.warning(
-                    "AI first DM rejected ({}): {!r}", reason, (text or "")[:80]
-                )
-                # one retry
-                text2 = await _openai_first_dm(recent + ([text] if text else []))
-                if text2:
-                    text2 = sanitize_dashes(text2)
-                    ok2, reason2 = validate_first_dm(text2)
-                    if (
-                        ok2
-                        and text2 not in recent
-                        and not _too_similar_recent(text2, recent)
-                    ):
-                        return text2
+                if not ok:
                     logger.warning(
-                        "AI first DM retry rejected ({}): {!r}",
-                        reason2,
-                        (text2 or "")[:80],
+                        "AI first DM rejected ({}): {!r}", reason, text[:80]
                     )
+                    continue
+                if text in recent or _too_similar_recent(text, recent):
+                    logger.warning("AI first DM too similar: {!r}", text[:80])
+                    continue
+                # Soft check: if we asked for signals, prefer that signal is present
+                # but do not hard-fail — human wording varies.
+                return text
         except Exception as exc:
             logger.exception("AI first DM failed: {}", exc)
 
-    # Local fallback
+    # Local fallback still respects style rotation via recent
     return pick_first_dm(recent=recent)
 
 
-async def _openai_first_dm(recent: list[str]) -> Optional[str]:
+async def _openai_first_dm(
+    recent: list[str], *, style: str = "soft"
+) -> Optional[str]:
     from openai import AsyncOpenAI
 
     client = AsyncOpenAI(api_key=OPENAI_API_KEY)
     avoid = ""
     if recent:
-        sample = "\n".join(f"- {t}" for t in recent[:15])
-        avoid = f"\nНе повторяй эти недавние формулировки:\n{sample}\n"
-
-    # Nudge model away from repeating recent themes (signals / losses).
-    theme_hint = (
-        "Сейчас предпочти тип 1 или 2 (простой вопрос / помощь новичку), "
-        "не про сигналы и не про убытки."
-    )
-    recent_l = " ".join(recent[:6]).lower()
-    if "сигнал" not in recent_l and "убыт" not in recent_l and "потеря" not in recent_l:
-        theme_hint = (
-            "Выбери любой тип 1–3, но формулировка должна быть новой."
+        sample = "\n".join(f"- {x}" for x in recent[:12])
+        avoid = (
+            "\nНедавно уже писали так (не повторяй ни смысл, ни начало):\n"
+            f"{sample}\n"
         )
 
+    style_line = _style_instruction(style)
+    opener_ban = ""
+    if any((r or "").strip().lower().startswith("слушай") for r in recent[:4]):
+        opener_ban = " Не начинай со «Слушай»."
+
     user = (
-        "Сгенерируй одно новое короткое первое сообщение для Telegram ЛС.\n"
-        + theme_hint
-        + "\nТолько текст сообщения, без кавычек и без пояснений."
-        + avoid
+        "Напиши одно сообщение в личку, как живой человек из чата.\n"
+        f"{style_line}"
+        f"{opener_ban}\n"
+        "Только текст. Без кавычек. Без пояснений. Без эмодзи."
+        f"{avoid}"
     )
 
     resp = await client.chat.completions.create(
@@ -197,8 +289,10 @@ async def _openai_first_dm(recent: list[str]) -> Optional[str]:
             {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": user},
         ],
-        temperature=0.95,
-        max_tokens=60,
+        temperature=1.05,
+        max_tokens=55,
+        presence_penalty=0.6,
+        frequency_penalty=0.4,
     )
     content = (resp.choices[0].message.content or "").strip()
     # Strip wrapping quotes if model adds them
