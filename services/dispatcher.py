@@ -517,12 +517,77 @@ def _remember_text(text: str) -> None:
         del _recent_texts[:-50]
 
 
+_USERNAME_LOOKUP_MISS_ERRORS = {
+    "UsernameInvalidError",
+    "UsernameNotOccupiedError",
+}
+
+
+def _entity_user_id(entity: Any) -> int | None:
+    """Return a Telegram user id from common input/entity objects when available."""
+    for attr in ("user_id", "id"):
+        value = getattr(entity, attr, None)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _is_entity_lookup_miss(exc: BaseException) -> bool:
+    """Classify exact lookup misses while preserving real Telegram failures."""
+    return isinstance(exc, (ValueError, TypeError, LookupError, PeerIdInvalidError)) or (
+        type(exc).__name__ in _USERNAME_LOOKUP_MISS_ERRORS
+    )
+
+
 async def _resolve_target_entity(client, account_id: int, lead: dict[str, Any]):
-    """Resolve target on the source account first, then by cached entity/username."""
+    """Resolve by username first, then account cache, then source access hash.
+
+    A username result is accepted only when Telegram returns the same numeric user id.
+    This prevents a changed or recycled username from routing a First DM to another user.
+    """
     target_id = int(lead["target_user_id"])
     username = (lead.get("username") or "").strip().lstrip("@")
     access_hash = lead.get("access_hash")
     source_account_id = lead.get("source_account_user_id")
+
+    if username:
+        try:
+            entity = await client.get_input_entity(username)
+        except Exception as exc:
+            if not _is_entity_lookup_miss(exc):
+                raise
+            logger.debug(
+                "Entity by username unavailable target={} account={} error_type={}",
+                target_id,
+                account_id,
+                type(exc).__name__,
+            )
+        else:
+            resolved_user_id = _entity_user_id(entity)
+            if resolved_user_id == target_id:
+                return entity
+            logger.warning(
+                "Username entity mismatch target={} resolved_target={} account={}",
+                target_id,
+                resolved_user_id,
+                account_id,
+            )
+
+    try:
+        return await client.get_input_entity(target_id)
+    except Exception as exc:
+        if not _is_entity_lookup_miss(exc):
+            raise
+        logger.debug(
+            "Entity by id unavailable target={} account={} error_type={}",
+            target_id,
+            account_id,
+            type(exc).__name__,
+        )
 
     if (
         access_hash is not None
@@ -531,26 +596,6 @@ async def _resolve_target_entity(client, account_id: int, lead: dict[str, Any]):
     ):
         return InputPeerUser(target_id, int(access_hash))
 
-    try:
-        return await client.get_input_entity(target_id)
-    except (ValueError, TypeError, LookupError) as exc:
-        logger.debug(
-            "Entity by id unavailable target={} account={}: {}",
-            target_id,
-            account_id,
-            type(exc).__name__,
-        )
-
-    if username:
-        try:
-            return await client.get_input_entity(username)
-        except (ValueError, TypeError, LookupError) as exc:
-            logger.debug(
-                "Entity by username unavailable target={} account={}: {}",
-                target_id,
-                account_id,
-                type(exc).__name__,
-            )
     return None
 
 

@@ -1,6 +1,18 @@
-# Channel DM Bot v1.0.58
+# Channel DM Bot v1.0.59
 
 Telegram user-account DM bot: monitors selected groups, builds one shared lead queue, sends First DM, continues active dialogs, handles refusals, sends only the administrator's exact channel link, and stores durable state in SQLite.
+
+
+## Changes in v1.0.59 - username-first shared queue delivery
+
+- Every eligible account now attempts Telegram entity resolution by the lead's public username first.
+- A username result is accepted only when its numeric Telegram user id matches the queued target id, preventing delivery to a changed or recycled username.
+- If username resolution is unavailable, the account falls back to its own cached entity by numeric user id.
+- The source account's stored access_hash is used only as the final source-only fallback and is never reused by another account.
+- A non-source account can therefore take a lead from the shared queue and send First DM when that account can resolve the user's public username.
+- AI First DM generation still starts only after a valid entity is resolved.
+- Source-account priority, fallback account order, limits, intervals, global spacing, pause behavior, dialog ownership, global opt-out, five-message maximum and last-30 promo uniqueness remain unchanged.
+- Added 7 dedicated v1.0.59 regression tests.
 
 
 ## Changes in v1.0.58 - safe First DM delivery and exact apology timing
