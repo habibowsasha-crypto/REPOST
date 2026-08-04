@@ -107,7 +107,7 @@ async def _handle_incoming_private_body(
     outgoing = int(dialog.get("outgoing_count") or 0)
 
     if stage in (store.STAGE_WAITING_REPLY, store.STAGE_FOLLOWUP_SENT):
-        # Cancel silence follow-up immediately so it cannot race with explain.
+        # Cancel silence follow-up so it cannot race with the next step.
         store.set_stage(target_user_id, stage, clear_auto_link=True)
         if ai_dialog.is_soft_decline(text):
             await _send_and_close(
@@ -120,10 +120,33 @@ async def _handle_incoming_private_body(
             return
         await asyncio.sleep(_delay_reply())
         history = (store.get_dialog(target_user_id) or {}).get("history") or []
+
+        # Soft first DM → ask a real question first (no pitch yet).
+        if ai_dialog.first_bot_was_soft(history):
+            engage = await ai_dialog.generate_engage_question(history)
+            ok = await _send_private(account_user_id, target_user_id, engage)
+            if not ok:
+                if stage == store.STAGE_WAITING_REPLY:
+                    later = (
+                        _now() + dt.timedelta(hours=store.FOLLOWUP_DELAY_HOURS)
+                    ).isoformat()
+                    store.set_stage(
+                        target_user_id, store.STAGE_WAITING_REPLY, auto_link_at=later
+                    )
+                return
+            store.append_history(target_user_id, "assistant", engage)
+            store.set_stage(
+                target_user_id,
+                store.STAGE_ENGAGED,
+                bump_outgoing=True,
+                clear_auto_link=True,
+            )
+            return
+
+        # Non-soft first DM (signals/active/newbie) → explain + schedule auto-link.
         explain = await ai_dialog.generate_explain(history)
         ok = await _send_private(account_user_id, target_user_id, explain)
         if not ok:
-            # Follow-up timer was cleared above; restore so silence path still works.
             if stage == store.STAGE_WAITING_REPLY:
                 later = (
                     _now() + dt.timedelta(hours=store.FOLLOWUP_DELAY_HOURS)
@@ -131,6 +154,50 @@ async def _handle_incoming_private_body(
                 store.set_stage(
                     target_user_id, store.STAGE_WAITING_REPLY, auto_link_at=later
                 )
+            return
+        phrases_svc.remember(phrases_svc.KIND_EXPLAIN, explain)
+        store.append_history(target_user_id, "assistant", explain)
+        auto_at = (_now() + dt.timedelta(seconds=_auto_link_delay())).isoformat()
+        store.set_stage(
+            target_user_id,
+            store.STAGE_EXPLAINED,
+            bump_outgoing=True,
+            auto_link_at=auto_at,
+        )
+        return
+
+    if stage == store.STAGE_ENGAGED:
+        # After soft engage question — now pitch (still no link unless asked).
+        if ai_dialog.is_soft_decline(text):
+            await _send_and_close(
+                account_user_id,
+                target_user_id,
+                ai_dialog.soft_close_text(),
+                opt_out=False,
+                reason="soft_no",
+            )
+            return
+        await asyncio.sleep(_delay_reply())
+        history = (store.get_dialog(target_user_id) or {}).get("history") or []
+        # User asks for link explicitly → wrap with link
+        if ai_dialog.is_link_request(text):
+            reply = await ai_dialog.generate_link_wrap(history)
+            ok = await _send_private(account_user_id, target_user_id, reply)
+            if not ok:
+                return
+            store.append_history(target_user_id, "assistant", reply)
+            store.set_stage(
+                target_user_id,
+                store.STAGE_LINK_SENT,
+                bump_outgoing=True,
+                link_sent=True,
+                clear_auto_link=True,
+            )
+            phrases_svc.remember(phrases_svc.KIND_LINK, reply)
+            return
+        explain = await ai_dialog.generate_explain(history)
+        ok = await _send_private(account_user_id, target_user_id, explain)
+        if not ok:
             return
         phrases_svc.remember(phrases_svc.KIND_EXPLAIN, explain)
         store.append_history(target_user_id, "assistant", explain)

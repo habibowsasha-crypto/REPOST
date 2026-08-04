@@ -10,6 +10,7 @@ from db.schema import db_lock, get_connection
 
 STAGE_WAITING_REPLY = "waiting_reply"
 STAGE_FOLLOWUP_SENT = "followup_sent"
+STAGE_ENGAGED = "engaged"
 STAGE_EXPLAINED = "explained"
 STAGE_LINK_SENT = "link_sent"
 STAGE_CLOSED = "closed"
@@ -197,9 +198,9 @@ def count_active() -> int:
     row = conn.execute(
         """
         SELECT COUNT(*) AS c FROM dialogs
-         WHERE stage IN (?, ?, ?)
+         WHERE stage IN (?, ?, ?, ?)
         """,
-        (STAGE_WAITING_REPLY, STAGE_FOLLOWUP_SENT, STAGE_EXPLAINED),
+        (STAGE_WAITING_REPLY, STAGE_FOLLOWUP_SENT, STAGE_ENGAGED, STAGE_EXPLAINED),
     ).fetchone()
     return int(row["c"] if row else 0)
 
