@@ -44,6 +44,17 @@ def queue_screen_text() -> str:
             *[queue_svc.format_lead_line(lead) for lead in recent],
         )
 
+    failures = queue_svc.list_recent_failures(5)
+    if failures:
+        failure_lines = []
+        for lead in failures:
+            label = queue_svc.format_target_label(lead)
+            reason = str(lead.get("failure_reason") or "неизвестно")
+            failure_lines.append(f"• {label} · `{reason}`")
+        failure_block = join("**Последние конечные ошибки**", *failure_lines)
+    else:
+        failure_block = ""
+
     return screen(
         "📬",
         "Очередь First DM",
@@ -56,6 +67,7 @@ def queue_screen_text() -> str:
         ),
         mon_line,
         recent_block,
+        failure_block,
     )
 
 

@@ -39,7 +39,10 @@ def prepare(
     target = int(target_user_id)
     account = int(account_user_id)
     now = _now_iso()
-    history = json.dumps([{"role": "assistant", "text": str(text)}], ensure_ascii=False)
+    provisional_purge_at = (
+        _now() + dt.timedelta(days=LOCAL_DIALOG_TEXT_RETENTION_DAYS)
+    ).isoformat()
+    history = json.dumps([{"role": "assistant", "text": str(text), "at": now}], ensure_ascii=False)
     conn = get_connection()
     with db_lock(), conn:
         lead = conn.execute(
@@ -96,8 +99,8 @@ def prepare(
             """
             INSERT INTO dialogs (
                 target_user_id, account_user_id, stage, outgoing_count,
-                link_sent, auto_link_at, history_json, updated_at
-            ) VALUES (?, ?, ?, 0, 0, NULL, ?, ?)
+                link_sent, auto_link_at, history_json, updated_at, history_purge_at
+            ) VALUES (?, ?, ?, 0, 0, NULL, ?, ?, ?)
             ON CONFLICT(target_user_id) DO UPDATE SET
                 account_user_id=excluded.account_user_id,
                 stage=excluded.stage,
@@ -105,9 +108,11 @@ def prepare(
                 link_sent=0,
                 auto_link_at=NULL,
                 history_json=excluded.history_json,
+                history_purge_at=excluded.history_purge_at,
+                history_purged_at=NULL,
                 updated_at=excluded.updated_at
             """,
-            (target, account, PROVISIONAL_STAGE, history, now),
+            (target, account, PROVISIONAL_STAGE, history, now, provisional_purge_at),
         )
         conn.execute(
             """
@@ -154,7 +159,7 @@ def commit_sent(
         final_stage = "closed" if opted_out else WAITING_STAGE
         contact_status = "completed" if opted_out else "in_progress"
         final_auto_link = None if opted_out else follow_at
-        history = json.dumps([{"role": "assistant", "text": text}], ensure_ascii=False)
+        history = json.dumps([{"role": "assistant", "text": text, "at": sent}], ensure_ascii=False)
         try:
             sent_dt = dt.datetime.fromisoformat(str(sent).replace("Z", "+00:00"))
             if sent_dt.tzinfo is None:
@@ -170,6 +175,18 @@ def commit_sent(
         ).isoformat()
         event_key = f"{target}:{account}:{row['prepared_at']}"
 
+        # Bound all previous archived attempts before activating the new one.
+        # This prevents an older 30-day cleanup from deleting this new dialog.
+        from services import dialog_archive
+
+        dialog_archive.bound_previous_attempts(
+            target,
+            next_account_user_id=account,
+            next_first_dm_message_id=telegram_message_id,
+            next_first_dm_at=sent,
+            conn=conn,
+        )
+
         conn.execute(
             """
             UPDATE first_dm_outbox
@@ -182,10 +199,15 @@ def commit_sent(
         conn.execute(
             """
             UPDATE leads
-               SET status='sent', claimed_by_account=?, claimed_at=NULL, updated_at=?
+               SET status='sent', claimed_by_account=?, claimed_at=NULL,
+                   last_error=NULL, failure_reason=NULL, failure_at=NULL, updated_at=?
              WHERE target_user_id=?
             """,
             (account, now, target),
+        )
+        conn.execute(
+            "DELETE FROM lead_account_failures WHERE target_user_id=?",
+            (target,),
         )
         conn.execute(
             """
@@ -230,9 +252,8 @@ def commit_sent(
                 telegram_delete_at=COALESCE(
                     dialogs.telegram_delete_at, excluded.telegram_delete_at
                 ),
-                history_purge_at=COALESCE(
-                    dialogs.history_purge_at, excluded.history_purge_at
-                ),
+                history_purge_at=excluded.history_purge_at,
+                history_purged_at=NULL,
                 updated_at=excluded.updated_at
             """,
             (
@@ -285,10 +306,11 @@ def rollback(target_user_id: int, error: str, *, as_pending: bool = True) -> Non
         conn.execute(
             """
             UPDATE leads
-               SET status=?, claimed_by_account=NULL, claimed_at=NULL, updated_at=?
+               SET status=?, claimed_by_account=NULL, claimed_at=NULL,
+                   last_error=?, updated_at=?
              WHERE target_user_id=? AND status='claimed'
             """,
-            ("pending" if as_pending else "cancelled", now, target),
+            ("pending" if as_pending else "cancelled", str(error)[:500], now, target),
         )
 
 

@@ -10,6 +10,7 @@ from db.schema import db_lock, get_connection
 KIND_FIRST_DM = "first_dm"
 KIND_EXPLAIN = "explain"
 KIND_LINK = "link_wrap"
+KIND_PROMO = "promo"
 
 
 def _now_iso() -> str:
@@ -43,7 +44,9 @@ def remember(kind: str, text: str) -> None:
             """,
             (kind, text, _now_iso()),
         )
-        # Keep table small
+        # Keep exactly the approved anti-repeat window for promo text.
+        # Other phrase kinds retain the historical compact limit.
+        keep_limit = 30 if kind == KIND_PROMO else 200
         conn.execute(
             """
             DELETE FROM sent_phrases
@@ -52,8 +55,8 @@ def remember(kind: str, text: str) -> None:
                    SELECT id FROM sent_phrases
                     WHERE kind=?
                     ORDER BY id DESC
-                    LIMIT 200
+                    LIMIT ?
                )
             """,
-            (kind, kind),
+            (kind, kind, keep_limit),
         )

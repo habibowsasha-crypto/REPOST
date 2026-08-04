@@ -28,6 +28,7 @@ from services import pacing
 from services import phrases as phrases_svc
 from services import queue as queue_svc
 from services import runtime
+from services import telegram_history
 from services.ai_first_dm import generate_first_dm
 
 _worker_task: Optional[asyncio.Task] = None
@@ -152,35 +153,71 @@ def _order_accounts_for_lead(
     return pool
 
 
-async def _tick() -> bool:
-    if not pacing.global_ready():
-        return False
-    ready = _list_ready_accounts()
-    if not ready:
-        return False
+def _participating_sender_ids() -> set[int]:
+    """Accounts that may legitimately send a future First DM for this queue."""
+    return {
+        int(acc["user_id"])
+        for acc in accounts_svc.list_accounts()
+        if acc.get("participates") and acc.get("session_string")
+    }
 
-    # Temporary claim by any ready account, then reassign to preferred sender.
-    claimer = random.choice(ready)
-    lead = queue_svc.claim_random_pending(int(claimer["user_id"]))
-    if not lead:
+
+def _untried_ready_accounts(
+    lead: dict[str, Any], ready: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    attempted = queue_svc.failed_account_ids(
+        int(lead["target_user_id"]), "no_entity"
+    )
+    return [
+        acc
+        for acc in _order_accounts_for_lead(lead, ready)
+        if int(acc["user_id"]) not in attempted
+    ]
+
+
+def _finish_or_defer_unresolvable(target_id: int, lead: dict[str, Any]) -> bool:
+    """Finish only after every participating account proved it cannot resolve target."""
+    if queue_svc.identity_snapshot_changed(target_id, lead):
+        queue_svc.clear_account_failures(target_id)
+        queue_svc.defer_claim(
+            target_id, seconds=1, reason="telegram_identity_updated_during_attempt"
+        )
+        logger.info("Lead entity evidence refreshed during attempt target={}", target_id)
         return False
+    attempted = queue_svc.failed_account_ids(target_id, "no_entity")
+    possible = _participating_sender_ids()
+    if possible and possible.issubset(attempted):
+        reason = f"no_entity_all_accounts:{','.join(map(str, sorted(attempted)))}"
+        queue_svc.mark_terminal_failure(
+            target_id, "no_entity_all_accounts", reason
+        )
+        logger.warning(
+            "Lead terminal: no Telegram entity target={} checked_accounts={}",
+            target_id,
+            sorted(attempted),
+        )
+        return True
+
+    waiting = sorted(possible - attempted)
+    queue_svc.defer_claim(
+        target_id,
+        seconds=60,
+        reason=f"waiting_untried_accounts:{','.join(map(str, waiting))}",
+    )
+    logger.debug(
+        "Lead deferred: target={} waiting_untried_accounts={}", target_id, waiting
+    )
+    return False
+
+
+async def _attempt_lead_across_accounts(
+    lead: dict[str, Any], accounts: list[dict[str, Any]], text: str
+) -> bool:
     target_id = int(lead["target_user_id"])
-
-    if opt_out_svc.is_opted_out(target_id):
-        queue_svc.cancel_lead(target_id, "opt_out")
-        return False
-
-    ordered = _order_accounts_for_lead(lead, ready)
-    if not ordered:
-        queue_svc.release_claim(target_id, as_pending=True)
-        return False
-
-    # One AI/local text per tick — reuse across account fallbacks.
-    text = await generate_first_dm()
-
-    for acc in ordered:
+    had_retryable_error = False
+    had_account_cooldown = False
+    for acc in accounts:
         account_id = int(acc["user_id"])
-        # Re-read from DB: earlier PeerFlood in this tick may have paused someone.
         fresh = accounts_svc.get_account(account_id) or acc
         ok, _reason = pacing.account_is_send_ready(fresh)
         if not ok:
@@ -189,9 +226,8 @@ async def _tick() -> bool:
         if client is None or not client.is_connected():
             continue
 
-        # Previous attempt may have released the claim (PeerFlood/error).
         if not queue_svc.ensure_claim(target_id, account_id):
-            return True  # lead already sent/cancelled
+            return True
 
         result = await _send_first_dm(client, account_id, lead, text)
         if result == "sent":
@@ -199,27 +235,76 @@ async def _tick() -> bool:
             _remember_text(text)
             pacing.mark_global_sent()
             return True
-        if result == "flood":
-            # Account-level cooldown only; try next ready account.
+        if result in {"flood", "peerflood"}:
+            had_account_cooldown = True
             continue
-        if result == "peerflood":
-            # Account paused; try next ready account for this lead.
+        if result == "error":
+            had_retryable_error = True
             continue
-        if result in {"privacy", "invalid"}:
-            return True  # lead closed
+        if result in {"privacy", "invalid", "terminal"}:
+            return True
         if result == "no_entity":
-            # Try next account that may resolve entity.
+            queue_svc.record_account_failure(
+                target_id, account_id, "no_entity", "Telegram entity unavailable"
+            )
             continue
         if result == "ambiguous":
-            # Delivery may already exist in Telegram. Never try another account
-            # until the reconciliation pass proves it was not delivered.
             return True
-        if result == "error":
-            # Soft error: try next account via ensure_claim.
-            continue
-    # Nobody could send — release if still claimed
-    queue_svc.release_claim(target_id, as_pending=True)
-    return False
+
+    if had_retryable_error:
+        last_error = queue_svc.get_last_error(target_id)
+        attempts = queue_svc.bump_send_attempts(target_id)
+        if attempts >= queue_svc.MAX_SEND_ATTEMPTS:
+            detail = (
+                f"{last_error} | retryable rounds exhausted:{attempts}"
+                if last_error else f"retryable rounds exhausted:{attempts}"
+            )
+            queue_svc.mark_terminal_failure(
+                target_id, "max_transient_attempts", detail
+            )
+            logger.error(
+                "Lead terminal after retryable rounds target={} attempts={}",
+                target_id, attempts,
+            )
+            return True
+        queue_svc.defer_claim(
+            target_id, seconds=60,
+            reason=f"retryable_round:{attempts}/{queue_svc.MAX_SEND_ATTEMPTS}",
+        )
+        return False
+    if had_account_cooldown:
+        queue_svc.defer_claim(
+            target_id, seconds=60, reason="sender_account_cooldown"
+        )
+        return False
+    return _finish_or_defer_unresolvable(target_id, lead)
+
+
+async def _tick() -> bool:
+    if not pacing.global_ready():
+        return False
+    ready = _list_ready_accounts()
+    if not ready:
+        return False
+
+    claimer = random.choice(ready)
+    lead = queue_svc.claim_random_pending(int(claimer["user_id"]))
+    if not lead:
+        return False
+    target_id = int(lead["target_user_id"])
+
+    if opt_out_svc.is_opted_out(target_id):
+        queue_svc.cancel_lead(target_id, "opt_out")
+        return True
+
+    ordered = _untried_ready_accounts(lead, ready)
+    if not ordered:
+        return _finish_or_defer_unresolvable(target_id, lead)
+
+    # Generate once and reuse for account fallbacks. No generation occurs while
+    # the lead merely waits for an unavailable, not-yet-tried account.
+    text = await generate_first_dm()
+    return await _attempt_lead_across_accounts(lead, ordered, text)
 
 
 def _target_label(lead: dict[str, Any]) -> str:
@@ -344,8 +429,19 @@ async def recover_ambiguous_first_dms() -> int:
             )
             continue
 
+        prepared_at = pacing._parse_iso(row.get("prepared_at"))
+        lower_bound = (
+            prepared_at - dt.timedelta(minutes=2)
+            if prepared_at is not None
+            else None
+        )
         try:
-            messages = await client.get_messages(entity, limit=30)
+            found = await telegram_history.find_outgoing_text_since(
+                client,
+                entity,
+                str(row.get("text") or ""),
+                since=lower_bound,
+            )
         except Exception as exc:
             logger.exception(
                 "Cannot inspect Telegram history account={} target={}: {}",
@@ -354,27 +450,6 @@ async def recover_ambiguous_first_dms() -> int:
                 exc,
             )
             continue
-
-        expected = _normalize_message_text(row.get("text"))
-        prepared_at = pacing._parse_iso(row.get("prepared_at"))
-        lower_bound = (
-            prepared_at - dt.timedelta(minutes=2)
-            if prepared_at is not None
-            else None
-        )
-        found = None
-        for message in messages or []:
-            if not bool(getattr(message, "out", False)):
-                continue
-            if _normalize_message_text(getattr(message, "message", None)) != expected:
-                continue
-            message_date = getattr(message, "date", None)
-            if message_date is not None and message_date.tzinfo is None:
-                message_date = message_date.replace(tzinfo=dt.timezone.utc)
-            if lower_bound is not None and message_date is not None and message_date < lower_bound:
-                continue
-            found = message
-            break
 
         if found is not None:
             first_dm_delivery.commit_sent(
@@ -455,7 +530,10 @@ async def _send_first_dm(
                 account_id,
                 target_id,
             )
-            queue_svc.release_claim(target_id, as_pending=True)
+            queue_svc.set_last_error(target_id, "first_dm_prepare_rejected")
+            queue_svc.defer_claim(
+                target_id, seconds=60, reason="first_dm_prepare_rejected"
+            )
             return "error"
 
         sent_message = await client.send_message(entity, text)
@@ -551,9 +629,11 @@ async def _send_first_dm(
         if prepared:
             # Do not retry through another account: Telegram may have accepted it.
             return "ambiguous"
-        attempts = queue_svc.bump_send_attempts(target_id)
-        if attempts >= queue_svc.MAX_SEND_ATTEMPTS:
-            queue_svc.cancel_lead(target_id, "max_attempts")
-            return "invalid"
+        detail = f"{type(exc).__name__}: {exc}"
+        queue_svc.set_last_error(target_id, detail)
         queue_svc.release_claim(target_id, as_pending=True)
+        logger.warning(
+            "Retryable pre-send error target={} account={} error={}",
+            target_id, account_id, detail
+        )
         return "error"

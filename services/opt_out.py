@@ -60,8 +60,20 @@ def add(user_id: int, reason: str | None = None) -> None:
             (now, uid),
         )
         conn.execute(
-            "DELETE FROM dialog_outbox WHERE target_user_id=?",
+            """
+            DELETE FROM dialog_outbox
+             WHERE target_user_id=? AND COALESCE(allow_opt_out, 0)=0
+            """,
             (uid,),
+        )
+        conn.execute(
+            """
+            UPDATE dialog_inbox
+               SET status='ignored', processed_at=?, updated_at=?,
+                   last_error='target_opted_out'
+             WHERE target_user_id=? AND status='pending' AND is_hard_stop=0
+            """,
+            (now, now, uid),
         )
 
 

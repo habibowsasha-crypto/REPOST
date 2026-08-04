@@ -59,9 +59,10 @@ def _row_line(row: dict) -> str:
         else f"id {int(row['account_user_id'])}"
     )
     stage = _STAGE_LABELS.get(str(row.get("stage")), str(row.get("stage")))
+    stamp = row.get("lifecycle_completed_at") or row.get("updated_at")
     return (
         f"• **{target}** · {stage}\n"
-        f"  └ {account_label} · обновлён {_date(row.get('updated_at'))}"
+        f"  └ {account_label} · {_date(stamp)}"
     )
 
 
@@ -69,7 +70,6 @@ def _summary_text(*, show_closed: bool = False) -> str:
     active = dialog_store_svc.count_active()
     waiting = dialog_store_svc.count_by_stage(
         dialog_store_svc.STAGE_WAITING_REPLY,
-        dialog_store_svc.STAGE_FOLLOWUP_SENT,
     )
     link_wait = dialog_store_svc.count_by_stage(dialog_store_svc.STAGE_EXPLAINED)
     closed_today = dialog_store_svc.count_closed_today()

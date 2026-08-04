@@ -174,6 +174,7 @@ async def show_account_card(event, user_id: int, *, edit: bool = True) -> None:
     sb_block = f"Ответ: {sb_reply}" if sb_reply else ""
     from services import dialog_store as dialog_store_svc
     active_dialogs = dialog_store_svc.count_open_for_account(user_id)
+    retention_waiting = dialog_store_svc.count_retention_waiting_for_account(user_id)
     if acc.get("is_paused"):
         state_line = f"🔴 Ограничен: **{acc.get('pause_reason') or 'пауза'}**"
     elif acc.get("participates"):
@@ -190,6 +191,7 @@ async def show_account_card(event, user_id: int, *, edit: bool = True) -> None:
             state_line,
             f"📨 First DM: **{'включены' if acc.get('participates') else 'отключены'}**",
             f"💬 Активных диалогов: **{active_dialogs}**",
+            f"🗑 Ожидают очистки: **{retention_waiting}**",
             f"📡 Мониторинг: **{mon_line}**",
         ),
         join(

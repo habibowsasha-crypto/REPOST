@@ -7,8 +7,6 @@ from telethon import events
 from config import (
     app_version,
     ADMIN_ID_LIST,
-    AI_AUTO_LINK_DELAY_MAX,
-    AI_AUTO_LINK_DELAY_MIN,
     AI_DM_ENABLED,
     AI_MODEL,
     AI_REPLY_DELAY_MAX,
@@ -89,7 +87,6 @@ def _dashboard_text() -> str:
     dialogs = dialog_store_svc.count_active()
     waiting_reply = dialog_store_svc.count_by_stage(
         dialog_store_svc.STAGE_WAITING_REPLY,
-        dialog_store_svc.STAGE_FOLLOWUP_SENT,
     )
     closed_today = dialog_store_svc.count_closed_today()
     account_count = accounts_svc.count_accounts()
@@ -338,7 +335,7 @@ def _pacing_text() -> str:
         f"🌐 Global: **{g_lo}–{g_hi} сек**",
         f"📊 Лимит: **{daily}**/сутки",
         f"🤖 AI-ответ: **{r_lo}–{r_hi} сек**",
-        f"🔗 Авто-ссылка: **{l_lo}–{l_hi} сек**",
+        f"🙏 Извинение после рекламы: **{l_lo}-{l_hi} сек**",
         DIV,
         "Нажми параметр, чтобы изменить.",
     )
@@ -357,7 +354,7 @@ def _pacing_buttons():
         [btn(f"🌐 Global · {g_lo}–{g_hi}с", b"pace_edit_glob")],
         [btn(f"📊 Лимит · {daily}/сутки", b"pace_edit_daily")],
         [btn(f"🤖 AI · {r_lo}–{r_hi}с", b"pace_edit_ai")],
-        [btn(f"🔗 Ссылка · {l_lo}–{l_hi}с", b"pace_edit_link")],
+        [btn(f"🙏 Извинение · {l_lo}-{l_hi}с", b"pace_edit_link")],
         back_row(b"menu_settings"),
         back_home_row(),
     ]
@@ -406,10 +403,10 @@ def _pace_edit_screen(kind: str):
             "ai",
         ),
         "link": (
-            "🔗",
-            "Авто-ссылка при тишине",
-            "После explain, если юзер молчит — через сколько кинуть ссылку.",
-            "Пришли два числа в **секундах**: `мин макс`\nПример: `60 120`",
+            "🙏",
+            "Извинение после рекламы",
+            "Если юзер молчит после рекламы со ссылкой, через сколько отправить короткое извинение.",
+            "Пришли два числа в **секундах**: `мин макс`\nПример: `5 60`",
             "link",
         ),
     }
@@ -510,7 +507,7 @@ async def on_pacing_edit(event: events.NewMessage.Event) -> None:
                 msg = f"AI: **{lo}–{hi} сек**"
             elif step == "link":
                 lo, hi = runtime_svc.set_auto_link_delay_range(a, b)
-                msg = f"Ссылка: **{lo}–{hi} сек**"
+                msg = f"Извинение: **{lo}-{hi} сек**"
             else:
                 raise ValueError("bad step")
     except (TypeError, ValueError):
@@ -700,6 +697,7 @@ async def cb_retention(event: events.CallbackQuery.Event) -> None:
             f"⏳ Ждут удаления в Telegram: **{stats['telegram_pending']}**",
             f"⚠️ Уже готовы к удалению: **{stats['telegram_due']}**",
             f"🧹 Ждут очистки текста: **{stats['local_pending']}**",
+            f"🚫 Невозможно удалить без сессии: **{stats['telegram_abandoned']}**",
         ),
         "Если аккаунт временно недоступен, бот повторит удаление позже.",
     )

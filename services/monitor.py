@@ -180,7 +180,7 @@ def _register_handler(client: TelegramClient, account_user_id: int) -> None:
             if event.is_private:
                 await _handle_private(account_user_id, event)
             elif event.is_group or event.is_channel:
-                logger.info(
+                logger.debug(
                     "Group msg account={} chat_id={} is_group={} is_channel={}",
                     account_user_id,
                     int(event.chat_id),
@@ -238,27 +238,51 @@ async def _handle_group(
         source_account_user_id=account_user_id,
     )
     if action == "created":
-        logger.info(
+        logger.debug(
             "Lead created target={} from chat={} via account={}",
             target_id,
             chat_id,
             account_user_id,
         )
     elif action == "refreshed":
-        logger.info(
+        logger.debug(
             "Lead refreshed target={} via account={} chat={}",
             target_id,
             account_user_id,
             chat_id,
         )
     else:
-        logger.info(
+        logger.debug(
             "Lead skip target={} action={} account={} chat={}",
             target_id,
             action,
             account_user_id,
             chat_id,
         )
+
+
+def _private_content_kind(event: events.NewMessage.Event, text: str) -> str:
+    """Classify private content without interpreting its meaning."""
+    message = getattr(event, "message", None)
+    if getattr(message, "voice", False):
+        return "voice"
+    if getattr(message, "sticker", False):
+        return "sticker"
+    if getattr(message, "gif", False):
+        return "gif"
+    if getattr(message, "photo", None) is not None:
+        return "photo"
+    if getattr(message, "video", False):
+        return "video"
+    if getattr(message, "document", None) is not None and not text.strip():
+        return "document"
+    if text.strip():
+        from services import ai_dialog
+
+        if ai_dialog.is_emoji_only(text):
+            return "emoji"
+        return "text"
+    return "non_text"
 
 
 async def _handle_private(
@@ -276,12 +300,38 @@ async def _handle_private(
     if target_id == int(account_user_id):
         return
     text = event.raw_text or ""
+    content_kind = _private_content_kind(event, text)
+    if not text.strip() and content_kind != "text":
+        labels = {
+            "voice": "[голосовое сообщение]",
+            "sticker": "[стикер]",
+            "gif": "[GIF]",
+            "photo": "[фото]",
+            "video": "[видео]",
+            "document": "[файл]",
+            "non_text": "[нетекстовая реакция]",
+        }
+        text = labels.get(content_kind, "[нетекстовая реакция]")
+    message_id = getattr(event, "id", None)
+    received_at = getattr(event, "date", None)
+    if received_at is not None:
+        try:
+            received_at = received_at.isoformat()
+        except AttributeError:
+            received_at = None
 
     from services import dialog_engine
 
     # Schedule so long AI delays do not block this client's event loop.
     task = asyncio.create_task(
-        dialog_engine.handle_incoming_private(account_user_id, target_id, text),
+        dialog_engine.handle_incoming_private(
+            account_user_id,
+            target_id,
+            text,
+            telegram_message_id=message_id,
+            received_at=received_at,
+            content_kind=content_kind,
+        ),
         name=f"dialog-{account_user_id}-{target_id}",
     )
     _track_dialog_task(account_user_id, task)

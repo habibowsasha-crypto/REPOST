@@ -6,6 +6,8 @@ import sqlite3
 import threading
 from typing import Optional
 
+from loguru import logger
+
 from config import DB_PATH
 
 _lock = threading.RLock()
@@ -22,9 +24,23 @@ def get_connection() -> sqlite3.Connection:
             _conn.execute("PRAGMA busy_timeout = 30000")
             try:
                 _conn.execute("PRAGMA journal_mode = WAL")
-            except sqlite3.Error:
-                pass
+            except sqlite3.Error as exc:
+                logger.warning("SQLite WAL mode could not be enabled: {}", exc)
         return _conn
+
+
+def close_connection() -> None:
+    """Close and forget the process-wide SQLite connection safely."""
+    global _conn
+    with _lock:
+        conn = _conn
+        _conn = None
+        if conn is None:
+            return
+        try:
+            conn.close()
+        except sqlite3.Error as exc:
+            logger.warning("SQLite connection close failed: {}", exc)
 
 
 def db_lock() -> threading.RLock:
@@ -39,7 +55,7 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) 
 
 
 def init_db() -> None:
-    """Create tables required from Step 5 onward."""
+    """Create or migrate every SQLite table required by the current release."""
     conn = get_connection()
     with _lock, conn:
         conn.execute(
@@ -194,10 +210,37 @@ def init_db() -> None:
             ON leads(status, eligible_at)
             """
         )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_leads_status_target
+            ON leads(status, target_user_id)
+            """
+        )
         _ensure_column(
             conn, "leads", "send_attempts", "send_attempts INTEGER NOT NULL DEFAULT 0"
         )
         _ensure_column(conn, "leads", "access_hash", "access_hash INTEGER")
+        _ensure_column(conn, "leads", "last_error", "last_error TEXT")
+        _ensure_column(conn, "leads", "failure_reason", "failure_reason TEXT")
+        _ensure_column(conn, "leads", "failure_at", "failure_at TEXT")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS lead_account_failures (
+                target_user_id INTEGER NOT NULL,
+                account_user_id INTEGER NOT NULL,
+                failure_kind TEXT NOT NULL,
+                error TEXT,
+                attempted_at TEXT NOT NULL,
+                PRIMARY KEY (target_user_id, account_user_id, failure_kind)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_lead_account_failures_target
+            ON lead_account_failures(target_user_id, failure_kind, account_user_id)
+            """
+        )
 
         conn.execute(
             """
@@ -226,6 +269,20 @@ def init_db() -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_sent_phrases_kind
             ON sent_phrases(kind, id DESC)
+            """
+        )
+
+        # v1.0.55 stores only the approved last 30 promo texts.
+        conn.execute(
+            """
+            DELETE FROM sent_phrases
+             WHERE kind='promo'
+               AND id NOT IN (
+                   SELECT id FROM sent_phrases
+                    WHERE kind='promo'
+                    ORDER BY id DESC
+                    LIMIT 30
+               )
             """
         )
 
@@ -277,6 +334,83 @@ def init_db() -> None:
         _ensure_column(
             conn, "dialogs", "history_purged_at", "history_purged_at TEXT"
         )
+        _ensure_column(
+            conn, "dialogs", "lifecycle_completed_at", "lifecycle_completed_at TEXT"
+        )
+        _ensure_column(
+            conn,
+            "dialogs",
+            "telegram_delete_abandoned_at",
+            "telegram_delete_abandoned_at TEXT",
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dialog_archives (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                target_user_id INTEGER NOT NULL,
+                account_user_id INTEGER NOT NULL,
+                stage TEXT NOT NULL,
+                outgoing_count INTEGER NOT NULL DEFAULT 0,
+                link_sent INTEGER NOT NULL DEFAULT 0,
+                auto_link_at TEXT,
+                history_json TEXT NOT NULL DEFAULT '[]',
+                original_updated_at TEXT NOT NULL,
+                first_dm_at TEXT,
+                first_dm_message_id INTEGER,
+                telegram_delete_at TEXT,
+                telegram_deleted_at TEXT,
+                telegram_delete_next_attempt_at TEXT,
+                telegram_delete_attempts INTEGER NOT NULL DEFAULT 0,
+                telegram_delete_last_error TEXT,
+                telegram_delete_until_message_id INTEGER,
+                next_attempt_first_dm_at TEXT,
+                history_purge_at TEXT,
+                history_purged_at TEXT,
+                lifecycle_completed_at TEXT,
+                telegram_delete_abandoned_at TEXT,
+                first_dm_text TEXT NOT NULL DEFAULT '',
+                first_dm_prepared_at TEXT,
+                first_dm_sent_at TEXT,
+                first_dm_outbox_status TEXT,
+                dialog_outbox_json TEXT NOT NULL DEFAULT '[]',
+                dialog_inbox_json TEXT NOT NULL DEFAULT '[]',
+                archived_reason TEXT NOT NULL,
+                archived_at TEXT NOT NULL
+            )
+            """
+        )
+        _ensure_column(
+            conn,
+            "dialog_archives",
+            "lifecycle_completed_at",
+            "lifecycle_completed_at TEXT",
+        )
+        _ensure_column(
+            conn,
+            "dialog_archives",
+            "telegram_delete_abandoned_at",
+            "telegram_delete_abandoned_at TEXT",
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_dialog_archives_target
+            ON dialog_archives(target_user_id, id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_dialog_archives_tg_retention
+            ON dialog_archives(telegram_deleted_at, telegram_delete_at,
+                               telegram_delete_next_attempt_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_dialog_archives_local_retention
+            ON dialog_archives(history_purged_at, history_purge_at)
+            """
+        )
 
         conn.execute(
             """
@@ -299,6 +433,94 @@ def init_db() -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_dialog_outbox_status_prepared
             ON dialog_outbox(status, prepared_at)
+            """
+        )
+        _ensure_column(conn, "dialog_outbox", "message_kind", "message_kind TEXT")
+        _ensure_column(conn, "dialog_outbox", "transition_json", "transition_json TEXT")
+        _ensure_column(conn, "dialog_outbox", "source_inbox_id", "source_inbox_id INTEGER")
+        _ensure_column(
+            conn,
+            "dialog_outbox",
+            "allow_opt_out",
+            "allow_opt_out INTEGER NOT NULL DEFAULT 0",
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_dialog_outbox_target_status
+            ON dialog_outbox(target_user_id, status, prepared_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_dialog_outbox_inbox
+            ON dialog_outbox(source_inbox_id, status)
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dialog_inbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_user_id INTEGER NOT NULL,
+                target_user_id INTEGER NOT NULL,
+                telegram_message_id INTEGER,
+                text TEXT NOT NULL,
+                is_hard_stop INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending',
+                received_at TEXT NOT NULL,
+                processing_started_at TEXT,
+                processed_at TEXT,
+                last_error TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        _ensure_column(
+            conn,
+            "dialog_inbox",
+            "history_appended",
+            "history_appended INTEGER NOT NULL DEFAULT 0",
+        )
+        _ensure_column(
+            conn,
+            "dialog_inbox",
+            "content_kind",
+            "content_kind TEXT NOT NULL DEFAULT 'text'",
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_dialog_inbox_telegram_message
+            ON dialog_inbox(account_user_id, target_user_id, telegram_message_id)
+            WHERE telegram_message_id IS NOT NULL
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_dialog_inbox_pending
+            ON dialog_inbox(account_user_id, target_user_id, status, is_hard_stop, id)
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_dialogs_lifecycle
+            ON dialogs(stage, lifecycle_completed_at)
+            """
+        )
+        conn.execute(
+            """
+            UPDATE dialogs
+               SET lifecycle_completed_at=COALESCE(lifecycle_completed_at, updated_at)
+             WHERE stage IN ('followup_sent', 'link_sent', 'closed')
+            """
+        )
+        conn.execute(
+            """
+            UPDATE dialog_archives
+               SET lifecycle_completed_at=COALESCE(
+                       lifecycle_completed_at, original_updated_at, archived_at
+                   )
+             WHERE stage IN ('followup_sent', 'link_sent', 'closed')
             """
         )
 

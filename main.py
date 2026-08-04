@@ -8,7 +8,7 @@ import sys
 from loguru import logger
 
 from config import ADMIN_ID_LIST, BOT_TOKEN, DB_PATH, LOG_LEVEL, app_version, bot
-from db.schema import init_db
+from db.schema import close_connection, init_db
 
 # Register Telethon handlers on the shared bot client.
 import handlers  # noqa: F401,E402
@@ -44,6 +44,7 @@ def run() -> None:
     init_db()
     logger.info("SQLite schema ready")
 
+    background_task = None
     try:
         from services.ai_dialog import configured_channel_link
 
@@ -65,6 +66,35 @@ def run() -> None:
         from services import monitor as monitor_svc
 
         bot.loop.run_until_complete(monitor_svc.start_monitor())
+        from services import dialog_engine as dialog_engine_svc
+
+        recovered_outgoing = bot.loop.run_until_complete(
+            dialog_engine_svc.recover_ambiguous_dialog_messages()
+        )
+        if recovered_outgoing:
+            logger.warning(
+                "Recovered ambiguous dialog deliveries after startup: {}",
+                recovered_outgoing,
+            )
+        recovered_first_dm = bot.loop.run_until_complete(
+            dispatcher_svc.recover_ambiguous_first_dms()
+        )
+        if recovered_first_dm:
+            logger.warning(
+                "Recovered ambiguous First-DM deliveries after startup: {}",
+                recovered_first_dm,
+            )
+        recovered_incoming = bot.loop.run_until_complete(
+            dialog_engine_svc.recover_pending_incoming_messages(
+                reset_stale_processing=True,
+                stale_after_seconds=1,
+            )
+        )
+        if recovered_incoming:
+            logger.warning(
+                "Recovered pending incoming dialogs after startup: {}",
+                recovered_incoming,
+            )
         bot.loop.run_until_complete(dispatcher_svc.ensure_worker_from_runtime())
 
         async def _background_due_loop():
@@ -76,9 +106,13 @@ def run() -> None:
                 except Exception as exc:
                     logger.exception("spambot due loop: {}", exc)
                 try:
-                    await dialog_engine.recover_ambiguous_scheduled_messages()
+                    await dialog_engine.recover_ambiguous_dialog_messages()
                 except Exception as exc:
-                    logger.exception("scheduled delivery recovery loop: {}", exc)
+                    logger.exception("dialog delivery recovery loop: {}", exc)
+                try:
+                    await dialog_engine.recover_pending_incoming_messages(limit=50)
+                except Exception as exc:
+                    logger.exception("incoming dialog recovery loop: {}", exc)
                 try:
                     await dialog_engine.process_due_auto_links()
                 except Exception as exc:
@@ -103,12 +137,22 @@ def run() -> None:
                     logger.exception("stale claims loop: {}", exc)
                 await asyncio.sleep(20)
 
-        bot.loop.create_task(_background_due_loop())
+        background_task = bot.loop.create_task(
+            _background_due_loop(), name="background-due-loop"
+        )
         logger.info("Monitor + dispatcher + SpamBot + dialog delivery + retention ready")
         bot.run_until_disconnected()
     except KeyboardInterrupt:
         logger.info("Stopped by keyboard interrupt")
     finally:
+        if background_task is not None and not background_task.done():
+            background_task.cancel()
+            try:
+                bot.loop.run_until_complete(
+                    asyncio.gather(background_task, return_exceptions=True)
+                )
+            except Exception as exc:
+                logger.debug("Background due-loop shutdown failed: {}", exc)
         try:
             from services import dispatcher as dispatcher_svc
 
@@ -125,6 +169,7 @@ def run() -> None:
             bot.loop.run_until_complete(bot.disconnect())
         except Exception as exc:
             logger.debug("Bot disconnect cleanup failed: {}", exc)
+        close_connection()
         logger.info("Shutdown complete")
 
 

@@ -165,17 +165,30 @@ def upsert_account(
 
 
 def set_participates(user_id: int, value: bool) -> bool:
+    uid = int(user_id)
     conn = get_connection()
+    became_participating = False
     with db_lock(), conn:
+        previous = conn.execute(
+            "SELECT participates FROM accounts WHERE user_id=?", (uid,)
+        ).fetchone()
         cur = conn.execute(
             """
             UPDATE accounts
                SET participates=?, updated_at=?
              WHERE user_id=?
             """,
-            (1 if value else 0, _now_iso(), int(user_id)),
+            (1 if value else 0, _now_iso(), uid),
         )
-        return int(cur.rowcount or 0) == 1
+        changed = int(cur.rowcount or 0) == 1
+        became_participating = bool(
+            changed and value and previous and not bool(previous["participates"])
+        )
+    if became_participating:
+        from services import queue as queue_svc
+
+        queue_svc.reopen_entity_failures_for_new_account(uid)
+    return changed
 
 
 def delete_account(user_id: int) -> bool:
@@ -225,17 +238,55 @@ def delete_account(user_id: int) -> bool:
                 (now, *ambiguous_targets),
             )
 
-        # Existing conversation history stays in DB, but cannot remain scheduled/active.
+        # Only live conversations are closed. Completed attempts keep their final
+        # stage, but every pending Telegram cleanup becomes explicitly abandoned
+        # because the session is intentionally being removed.
+        active_stages = (
+            "first_dm_sending",
+            "waiting_reply",
+            "engaged",
+            "explained",
+        )
+        placeholders = ",".join("?" for _ in active_stages)
         targets = conn.execute(
-            "SELECT target_user_id FROM dialogs WHERE account_user_id=? AND stage<>'closed'",
-            (uid,),
+            f"SELECT target_user_id FROM dialogs "
+            f"WHERE account_user_id=? AND stage IN ({placeholders})",
+            (uid, *active_stages),
         ).fetchall()
         target_ids = [int(r["target_user_id"]) for r in targets]
         conn.execute(
+            f"""
+            UPDATE dialogs
+               SET stage='closed', auto_link_at=NULL,
+                   lifecycle_completed_at=COALESCE(lifecycle_completed_at, ?),
+                   updated_at=?
+             WHERE account_user_id=? AND stage IN ({placeholders})
+            """,
+            (now, now, uid, *active_stages),
+        )
+        conn.execute(
             """
             UPDATE dialogs
-               SET stage='closed', auto_link_at=NULL, updated_at=?
-             WHERE account_user_id=? AND stage<>'closed'
+               SET telegram_delete_abandoned_at=?,
+                   telegram_delete_next_attempt_at=NULL,
+                   telegram_delete_last_error='account_deleted_before_retention'
+             WHERE account_user_id=?
+               AND telegram_deleted_at IS NULL
+               AND telegram_delete_abandoned_at IS NULL
+               AND telegram_delete_at IS NOT NULL
+            """,
+            (now, uid),
+        )
+        conn.execute(
+            """
+            UPDATE dialog_archives
+               SET telegram_delete_abandoned_at=?,
+                   telegram_delete_next_attempt_at=NULL,
+                   telegram_delete_last_error='account_deleted_before_retention'
+             WHERE account_user_id=?
+               AND telegram_deleted_at IS NULL
+               AND telegram_delete_abandoned_at IS NULL
+               AND telegram_delete_at IS NOT NULL
             """,
             (now, uid),
         )
@@ -347,6 +398,9 @@ def dashboard_account_line(acc: dict[str, Any]) -> str:
     if len(label) > 24:
         label = label[:23] + "…"
     dialogs = dialog_store_svc.count_open_for_account(int(acc["user_id"]))
+    retention_waiting = dialog_store_svc.count_retention_waiting_for_account(
+        int(acc["user_id"])
+    )
     participates = bool(acc.get("participates"))
     paused = bool(acc.get("is_paused"))
 
@@ -367,6 +421,11 @@ def dashboard_account_line(acc: dict[str, Any]) -> str:
             return (
                 f"🟡 **{label}**\n"
                 f"└ First DM отключены · завершает диалогов {dialogs}"
+            )
+        if retention_waiting:
+            return (
+                f"🟡 **{label}**\n"
+                f"└ First DM отключены · очистка {retention_waiting}"
             )
         return f"🟡 **{label}**\n└ First DM отключены · диалогов 0"
 

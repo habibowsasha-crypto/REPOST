@@ -13,6 +13,8 @@ STATUS_CLAIMED = "claimed"
 STATUS_SENT = "sent"
 STATUS_CANCELLED = "cancelled"
 
+_claim_cursor = 0
+
 
 def _now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
@@ -54,13 +56,27 @@ def upsert_from_activity(
     conn = get_connection()
     with db_lock(), conn:
         existing = conn.execute(
-            "SELECT status FROM leads WHERE target_user_id=?",
+            """
+            SELECT status, username, access_hash, source_account_user_id, failure_reason
+              FROM leads WHERE target_user_id=?
+            """,
             (target_user_id,),
         ).fetchone()
         if existing:
             status = str(existing["status"])
-            if status in {STATUS_CLAIMED, STATUS_SENT}:
-                # Keep last_seen only; do not reopen claimed/sent here.
+            identity_improved = (
+                (username is not None and username != existing["username"])
+                or (access_hash is not None and access_hash != existing["access_hash"])
+                or (
+                    source_account_user_id is not None
+                    and source_account_user_id != existing["source_account_user_id"]
+                )
+            )
+            reopen_no_entity_terminal = bool(
+                status == STATUS_CANCELLED
+                and existing["failure_reason"] == "no_entity_all_accounts"
+            )
+            if status == STATUS_SENT:
                 conn.execute(
                     """
                     UPDATE leads
@@ -68,54 +84,112 @@ def upsert_from_activity(
                            first_name=COALESCE(?, first_name),
                            last_name=COALESCE(?, last_name),
                            access_hash=COALESCE(?, access_hash),
-                           last_seen_at=?,
-                           updated_at=?
+                           last_seen_at=?, updated_at=?
                      WHERE target_user_id=?
                     """,
-                    (
-                        username,
-                        first_name,
-                        last_name,
-                        access_hash,
-                        now,
-                        now,
-                        target_user_id,
-                    ),
+                    (username, first_name, last_name, access_hash, now, now, target_user_id),
                 )
                 return f"skipped_status_{status}"
 
-            # pending or cancelled → refresh to pending
-            conn.execute(
-                """
-                UPDATE leads
-                   SET username=COALESCE(?, username),
-                       first_name=COALESCE(?, first_name),
-                       last_name=COALESCE(?, last_name),
-                       access_hash=COALESCE(?, access_hash),
-                       source_chat_id=COALESCE(?, source_chat_id),
-                       source_account_user_id=COALESCE(?, source_account_user_id),
-                       status=?,
-                       eligible_at=COALESCE(eligible_at, ?),
-                       claimed_by_account=NULL,
-                       claimed_at=NULL,
-                       last_seen_at=?,
-                       updated_at=?
-                 WHERE target_user_id=?
-                """,
-                (
-                    username,
-                    first_name,
-                    last_name,
-                    access_hash,
-                    source_chat_id,
-                    source_account_user_id,
-                    STATUS_PENDING,
-                    now,
-                    now,
-                    now,
-                    target_user_id,
-                ),
-            )
+            if status == STATUS_CLAIMED:
+                if identity_improved:
+                    conn.execute(
+                        """
+                        UPDATE leads
+                           SET username=COALESCE(?, username),
+                               first_name=COALESCE(?, first_name),
+                               last_name=COALESCE(?, last_name),
+                               access_hash=COALESCE(?, access_hash),
+                               source_chat_id=COALESCE(?, source_chat_id),
+                               source_account_user_id=COALESCE(?, source_account_user_id),
+                               send_attempts=0, last_error=NULL,
+                               failure_reason=NULL, failure_at=NULL,
+                               last_seen_at=?, updated_at=?
+                         WHERE target_user_id=?
+                        """,
+                        (username, first_name, last_name, access_hash, source_chat_id,
+                         source_account_user_id, now, now, target_user_id),
+                    )
+                    conn.execute(
+                        "DELETE FROM lead_account_failures WHERE target_user_id=?",
+                        (target_user_id,),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE leads
+                           SET username=COALESCE(?, username),
+                               first_name=COALESCE(?, first_name),
+                               last_name=COALESCE(?, last_name),
+                               access_hash=COALESCE(?, access_hash),
+                               last_seen_at=?, updated_at=?
+                         WHERE target_user_id=?
+                        """,
+                        (username, first_name, last_name, access_hash, now, now,
+                         target_user_id),
+                    )
+                return f"skipped_status_{status}"
+
+            if status == STATUS_CANCELLED and not (
+                identity_improved or reopen_no_entity_terminal
+            ):
+                conn.execute(
+                    """
+                    UPDATE leads
+                       SET username=COALESCE(?, username),
+                           first_name=COALESCE(?, first_name),
+                           last_name=COALESCE(?, last_name),
+                           access_hash=COALESCE(?, access_hash),
+                           last_seen_at=?, updated_at=?
+                     WHERE target_user_id=?
+                    """,
+                    (username, first_name, last_name, access_hash, now, now,
+                     target_user_id),
+                )
+                return f"skipped_status_{status}"
+
+            # Pending technical retries keep counters/evidence unless Telegram
+            # identity improved. Cancelled technical failures reopen on activity.
+            if identity_improved or reopen_no_entity_terminal:
+                conn.execute(
+                    """
+                    UPDATE leads
+                       SET username=COALESCE(?, username),
+                           first_name=COALESCE(?, first_name),
+                           last_name=COALESCE(?, last_name),
+                           access_hash=COALESCE(?, access_hash),
+                           source_chat_id=COALESCE(?, source_chat_id),
+                           source_account_user_id=COALESCE(?, source_account_user_id),
+                           status=?, eligible_at=?, claimed_by_account=NULL, claimed_at=NULL,
+                           send_attempts=0, last_error=NULL,
+                           failure_reason=NULL, failure_at=NULL,
+                           last_seen_at=?, updated_at=?
+                     WHERE target_user_id=?
+                    """,
+                    (username, first_name, last_name, access_hash, source_chat_id,
+                     source_account_user_id, STATUS_PENDING, now, now, now,
+                     target_user_id),
+                )
+                conn.execute(
+                    "DELETE FROM lead_account_failures WHERE target_user_id=?",
+                    (target_user_id,),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE leads
+                       SET username=COALESCE(?, username),
+                           first_name=COALESCE(?, first_name),
+                           last_name=COALESCE(?, last_name),
+                           access_hash=COALESCE(?, access_hash),
+                           source_chat_id=COALESCE(?, source_chat_id),
+                           source_account_user_id=COALESCE(?, source_account_user_id),
+                           status=?, last_seen_at=?, updated_at=?
+                     WHERE target_user_id=?
+                    """,
+                    (username, first_name, last_name, access_hash, source_chat_id,
+                     source_account_user_id, STATUS_PENDING, now, now, target_user_id),
+                )
             return "refreshed"
 
         conn.execute(
@@ -163,7 +237,8 @@ def list_recent(limit: int = 15, status: str | None = STATUS_PENDING) -> list[di
             """
             SELECT target_user_id, username, first_name, last_name, access_hash,
                    source_chat_id, source_account_user_id, status,
-                   eligible_at, last_seen_at, created_at
+                   eligible_at, last_seen_at, created_at, last_error,
+                   failure_reason, failure_at
               FROM leads
              WHERE status=?
              ORDER BY COALESCE(last_seen_at, created_at) DESC
@@ -176,7 +251,8 @@ def list_recent(limit: int = 15, status: str | None = STATUS_PENDING) -> list[di
             """
             SELECT target_user_id, username, first_name, last_name, access_hash,
                    source_chat_id, source_account_user_id, status,
-                   eligible_at, last_seen_at, created_at
+                   eligible_at, last_seen_at, created_at, last_error,
+                   failure_reason, failure_at
               FROM leads
              ORDER BY COALESCE(last_seen_at, created_at) DESC
              LIMIT ?
@@ -189,6 +265,13 @@ def list_recent(limit: int = 15, status: str | None = STATUS_PENDING) -> list[di
 def clear_pending() -> int:
     conn = get_connection()
     with db_lock(), conn:
+        conn.execute(
+            """
+            DELETE FROM lead_account_failures
+             WHERE target_user_id IN (SELECT target_user_id FROM leads WHERE status=?)
+            """,
+            (STATUS_PENDING,),
+        )
         cur = conn.execute(
             "DELETE FROM leads WHERE status=?",
             (STATUS_PENDING,),
@@ -211,59 +294,67 @@ def format_lead_line(lead: dict[str, Any]) -> str:
 
 
 
-def claim_random_pending(account_user_id: int) -> dict[str, Any] | None:
-    """Claim one random eligible pending lead for account. Returns lead dict or None.
-
-    Skips opt-out users and anyone with contact status sending/in_progress/completed.
+def _eligible_pending_where() -> str:
+    return """
+        l.status=?
+        AND (l.eligible_at IS NULL OR l.eligible_at <= ?)
+        AND NOT EXISTS (
+              SELECT 1 FROM opt_out o WHERE o.user_id = l.target_user_id
+        )
+        AND NOT EXISTS (
+              SELECT 1 FROM contacts c
+               WHERE c.target_user_id = l.target_user_id
+                 AND c.status IN ('sending', 'in_progress', 'completed')
+        )
     """
+
+
+def _select_pending_after_cursor(conn, now: str, cursor: int, *, wrap: bool):
+    comparison = "<=" if wrap else ">"
+    return conn.execute(
+        f"""
+        SELECT l.target_user_id, l.username, l.first_name, l.last_name, l.access_hash,
+               l.source_chat_id, l.source_account_user_id, l.status,
+               l.eligible_at, l.last_seen_at, l.created_at, l.last_error,
+               l.failure_reason, l.failure_at
+          FROM leads l
+         WHERE {_eligible_pending_where()}
+           AND l.target_user_id {comparison} ?
+         ORDER BY l.target_user_id ASC
+         LIMIT 1
+        """,
+        (STATUS_PENDING, now, int(cursor)),
+    ).fetchone()
+
+
+def claim_random_pending(account_user_id: int) -> dict[str, Any] | None:
+    """Claim one eligible lead using an indexed rotating cursor.
+
+    The public name is kept for compatibility, but no full-table random sort is
+    performed. Each successful claim advances a process-local primary-key cursor
+    and wraps at the end of the queue.
+    """
+    global _claim_cursor
     now = _now_iso()
     conn = get_connection()
     with db_lock(), conn:
-        row = conn.execute(
-            """
-            SELECT l.target_user_id, l.username, l.first_name, l.last_name, l.access_hash,
-                   l.source_chat_id, l.source_account_user_id, l.status,
-                   l.eligible_at, l.last_seen_at, l.created_at
-              FROM leads l
-             WHERE l.status=?
-               AND (l.eligible_at IS NULL OR l.eligible_at <= ?)
-               AND NOT EXISTS (
-                     SELECT 1 FROM opt_out o WHERE o.user_id = l.target_user_id
-               )
-               AND NOT EXISTS (
-                     SELECT 1 FROM contacts c
-                      WHERE c.target_user_id = l.target_user_id
-                        AND c.status IN ('sending', 'in_progress', 'completed')
-               )
-             ORDER BY RANDOM()
-             LIMIT 1
-            """,
-            (STATUS_PENDING, now),
-        ).fetchone()
-        if not row:
+        row = _select_pending_after_cursor(conn, now, _claim_cursor, wrap=False)
+        if row is None:
+            row = _select_pending_after_cursor(conn, now, _claim_cursor, wrap=True)
+        if row is None:
             return None
         target = int(row["target_user_id"])
         cur = conn.execute(
             """
             UPDATE leads
-               SET status=?,
-                   claimed_by_account=?,
-                   claimed_at=?,
-                   updated_at=?
-             WHERE target_user_id=?
-               AND status=?
+               SET status=?, claimed_by_account=?, claimed_at=?, updated_at=?
+             WHERE target_user_id=? AND status=?
             """,
-            (
-                STATUS_CLAIMED,
-                int(account_user_id),
-                now,
-                now,
-                target,
-                STATUS_PENDING,
-            ),
+            (STATUS_CLAIMED, int(account_user_id), now, now, target, STATUS_PENDING),
         )
         if int(cur.rowcount or 0) != 1:
             return None
+        _claim_cursor = target
         data = dict(row)
         data["status"] = STATUS_CLAIMED
         data["claimed_by_account"] = int(account_user_id)
@@ -298,6 +389,9 @@ def mark_sent(target_user_id: int, account_user_id: int) -> None:
             UPDATE leads
                SET status=?,
                    claimed_by_account=?,
+                   last_error=NULL,
+                   failure_reason=NULL,
+                   failure_at=NULL,
                    updated_at=?
              WHERE target_user_id=?
             """,
@@ -314,6 +408,10 @@ def mark_sent(target_user_id: int, account_user_id: int) -> None:
             """,
             (int(target_user_id), int(account_user_id), now),
         )
+        conn.execute(
+            "DELETE FROM lead_account_failures WHERE target_user_id=?",
+            (int(target_user_id),),
+        )
 
 
 def cancel_lead(target_user_id: int, reason: str | None = None) -> None:
@@ -326,10 +424,13 @@ def cancel_lead(target_user_id: int, reason: str | None = None) -> None:
                SET status=?,
                    claimed_by_account=NULL,
                    claimed_at=NULL,
+                   last_error=?,
+                   failure_reason=?,
+                   failure_at=?,
                    updated_at=?
              WHERE target_user_id=?
             """,
-            (STATUS_CANCELLED, now, int(target_user_id)),
+            (STATUS_CANCELLED, reason, reason, now, now, int(target_user_id)),
         )
         # Prevent re-queue from group activity for privacy/invalid targets.
         conn.execute(
@@ -588,8 +689,8 @@ def reassign_claim(target_user_id: int, account_user_id: int) -> None:
         )
 
 
-def bump_send_attempts(target_user_id: int) -> int:
-    """Increment and return new attempt count."""
+def bump_send_attempts(target_user_id: int, error: str | None = None) -> int:
+    """Increment and return retry count, keeping a concise diagnostic."""
     now = _now_iso()
     conn = get_connection()
     with db_lock(), conn:
@@ -597,10 +698,11 @@ def bump_send_attempts(target_user_id: int) -> int:
             """
             UPDATE leads
                SET send_attempts=COALESCE(send_attempts, 0) + 1,
+                   last_error=COALESCE(?, last_error),
                    updated_at=?
              WHERE target_user_id=?
             """,
-            (now, int(target_user_id)),
+            ((str(error)[:500] if error else None), now, int(target_user_id)),
         )
         row = conn.execute(
             "SELECT COALESCE(send_attempts, 0) AS c FROM leads WHERE target_user_id=?",
@@ -617,6 +719,174 @@ def get_send_attempts(target_user_id: int) -> int:
     ).fetchone()
     return int(row["c"] if row else 0)
 
+
+
+
+def reopen_entity_failures_for_new_account(account_user_id: int) -> int:
+    """Reopen terminal no-entity leads when a genuinely untried sender joins."""
+    uid = int(account_user_id)
+    now = _now_iso()
+    conn = get_connection()
+    with db_lock(), conn:
+        cur = conn.execute(
+            """
+            UPDATE leads
+               SET status=?, eligible_at=?, claimed_by_account=NULL, claimed_at=NULL,
+                   failure_reason=NULL, failure_at=NULL,
+                   last_error='new_sender_account_available', updated_at=?
+             WHERE status=?
+               AND failure_reason='no_entity_all_accounts'
+               AND NOT EXISTS (
+                   SELECT 1 FROM lead_account_failures f
+                    WHERE f.target_user_id=leads.target_user_id
+                      AND f.account_user_id=?
+                      AND f.failure_kind='no_entity'
+               )
+            """,
+            (STATUS_PENDING, now, now, STATUS_CANCELLED, uid),
+        )
+        return int(cur.rowcount or 0)
+
+
+def get_last_error(target_user_id: int) -> str | None:
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT last_error FROM leads WHERE target_user_id=?",
+        (int(target_user_id),),
+    ).fetchone()
+    if row is None or row["last_error"] is None:
+        return None
+    return str(row["last_error"])
+
+def set_last_error(target_user_id: int, error: str | None) -> None:
+    now = _now_iso()
+    conn = get_connection()
+    with db_lock(), conn:
+        conn.execute(
+            "UPDATE leads SET last_error=?, updated_at=? WHERE target_user_id=?",
+            ((str(error)[:500] if error else None), now, int(target_user_id)),
+        )
+
+
+def defer_claim(target_user_id: int, *, seconds: int, reason: str) -> None:
+    """Release a claimed lead for a short operational retry without a tight loop."""
+    eligible = (
+        dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=max(1, int(seconds)))
+    ).isoformat()
+    now = _now_iso()
+    conn = get_connection()
+    with db_lock(), conn:
+        conn.execute(
+            """
+            UPDATE leads
+               SET status=?, claimed_by_account=NULL, claimed_at=NULL,
+                   eligible_at=?, last_error=COALESCE(last_error, ?), updated_at=?
+             WHERE target_user_id=? AND status IN (?, ?)
+            """,
+            (STATUS_PENDING, eligible, str(reason)[:500], now,
+             int(target_user_id), STATUS_CLAIMED, STATUS_PENDING),
+        )
+
+
+def record_account_failure(
+    target_user_id: int, account_user_id: int, failure_kind: str, error: str | None = None
+) -> None:
+    now = _now_iso()
+    conn = get_connection()
+    with db_lock(), conn:
+        conn.execute(
+            """
+            INSERT INTO lead_account_failures (
+                target_user_id, account_user_id, failure_kind, error, attempted_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(target_user_id, account_user_id, failure_kind) DO UPDATE SET
+                error=excluded.error, attempted_at=excluded.attempted_at
+            """,
+            (int(target_user_id), int(account_user_id), str(failure_kind),
+             (str(error)[:500] if error else None), now),
+        )
+        conn.execute(
+            "UPDATE leads SET last_error=?, updated_at=? WHERE target_user_id=?",
+            ((str(error)[:500] if error else str(failure_kind)), now, int(target_user_id)),
+        )
+
+
+def failed_account_ids(target_user_id: int, failure_kind: str) -> set[int]:
+    conn = get_connection()
+    rows = conn.execute(
+        """
+        SELECT account_user_id FROM lead_account_failures
+         WHERE target_user_id=? AND failure_kind=?
+        """,
+        (int(target_user_id), str(failure_kind)),
+    ).fetchall()
+    return {int(row["account_user_id"]) for row in rows}
+
+
+
+def clear_account_failures(target_user_id: int) -> None:
+    conn = get_connection()
+    with db_lock(), conn:
+        conn.execute(
+            "DELETE FROM lead_account_failures WHERE target_user_id=?",
+            (int(target_user_id),),
+        )
+
+
+def identity_snapshot_changed(target_user_id: int, lead: dict[str, Any]) -> bool:
+    """Detect better entity evidence arriving while a lead was being attempted."""
+    conn = get_connection()
+    row = conn.execute(
+        """
+        SELECT username, access_hash, source_account_user_id
+          FROM leads WHERE target_user_id=?
+        """,
+        (int(target_user_id),),
+    ).fetchone()
+    if row is None:
+        return False
+    def _norm(value):
+        return None if value is None else str(value)
+    return any(
+        _norm(row[key]) != _norm(lead.get(key))
+        for key in ("username", "access_hash", "source_account_user_id")
+    )
+
+def mark_terminal_failure(target_user_id: int, reason: str, error: str | None = None) -> None:
+    """Stop automatic retries while allowing fresh future activity/import to reopen it."""
+    now = _now_iso()
+    detail = str(error or reason)[:500]
+    conn = get_connection()
+    with db_lock(), conn:
+        conn.execute(
+            """
+            UPDATE leads
+               SET status=?, claimed_by_account=NULL, claimed_at=NULL,
+                   last_error=?, failure_reason=?, failure_at=?, updated_at=?
+             WHERE target_user_id=?
+            """,
+            (STATUS_CANCELLED, detail, str(reason)[:120], now, now, int(target_user_id)),
+        )
+        conn.execute(
+            "DELETE FROM contacts WHERE target_user_id=? AND status='sending'",
+            (int(target_user_id),),
+        )
+
+
+def list_recent_failures(limit: int = 10) -> list[dict[str, Any]]:
+    conn = get_connection()
+    rows = conn.execute(
+        """
+        SELECT target_user_id, username, first_name, last_name, failure_reason,
+               failure_at, last_error, send_attempts
+          FROM leads
+         WHERE status=? AND failure_reason IS NOT NULL
+         ORDER BY COALESCE(failure_at, updated_at) DESC
+         LIMIT ?
+        """,
+        (STATUS_CANCELLED, int(limit)),
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 def clear_sending_contact(target_user_id: int) -> None:
     """Remove pre-send / in_progress contact if first DM did not complete."""
@@ -666,12 +936,18 @@ def force_requeue(
     now = _now_iso()
     conn = get_connection()
     with db_lock(), conn:
+        # Preserve the previous attempt before opening a new campaign cycle.
+        # The archive keeps its own 30/180-day retention schedule and statistics.
+        from services import dialog_archive
+
+        dialog_archive.archive_current_attempt(
+            target_user_id, reason="explicit_import_requeue", conn=conn
+        )
         conn.execute(
             "DELETE FROM contacts WHERE target_user_id=?",
             (target_user_id,),
         )
-        # Import/requeue is an explicit new campaign attempt approved by the admin.
-        # Remove the previous delivery journal so a new First DM can be prepared.
+        # The operational tables must contain only the new/current attempt.
         conn.execute(
             "DELETE FROM first_dm_outbox WHERE target_user_id=?",
             (target_user_id,),
@@ -680,9 +956,16 @@ def force_requeue(
             "DELETE FROM dialog_outbox WHERE target_user_id=?",
             (target_user_id,),
         )
-        # Drop old funnel so auto-link / closed stage cannot fire on re-queue.
+        conn.execute(
+            "DELETE FROM dialog_inbox WHERE target_user_id=?",
+            (target_user_id,),
+        )
         conn.execute(
             "DELETE FROM dialogs WHERE target_user_id=?",
+            (target_user_id,),
+        )
+        conn.execute(
+            "DELETE FROM lead_account_failures WHERE target_user_id=?",
             (target_user_id,),
         )
         existing = conn.execute(
@@ -704,6 +987,9 @@ def force_requeue(
                        claimed_by_account=NULL,
                        claimed_at=NULL,
                        send_attempts=0,
+                       last_error=NULL,
+                       failure_reason=NULL,
+                       failure_at=NULL,
                        last_seen_at=?,
                        updated_at=?
                  WHERE target_user_id=?

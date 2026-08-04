@@ -275,10 +275,10 @@ def set_ai_reply_delay_range(lo: int, hi: int) -> tuple[int, int]:
 
 
 def get_auto_link_delay_range() -> tuple[int, int]:
-    from config import AI_AUTO_LINK_DELAY_MAX, AI_AUTO_LINK_DELAY_MIN
+    from config import AI_APOLOGY_DELAY_MAX, AI_APOLOGY_DELAY_MIN
 
-    lo = _int_or(AI_AUTO_LINK_DELAY_MIN, _get(KEY_PACE_LINK_LO), lo=10, hi=1800)
-    hi = _int_or(AI_AUTO_LINK_DELAY_MAX, _get(KEY_PACE_LINK_HI), lo=10, hi=1800)
+    lo = _int_or(AI_APOLOGY_DELAY_MIN, _get(KEY_PACE_LINK_LO), lo=5, hi=1800)
+    hi = _int_or(AI_APOLOGY_DELAY_MAX, _get(KEY_PACE_LINK_HI), lo=5, hi=1800)
     if lo > hi:
         lo, hi = hi, lo
     return lo, hi
@@ -288,8 +288,8 @@ def set_auto_link_delay_range(lo: int, hi: int) -> tuple[int, int]:
     lo, hi = int(lo), int(hi)
     if lo > hi:
         lo, hi = hi, lo
-    lo = max(10, min(1800, lo))
-    hi = max(10, min(1800, hi))
+    lo = max(5, min(1800, lo))
+    hi = max(5, min(1800, hi))
     _set(KEY_PACE_LINK_LO, str(lo))
     _set(KEY_PACE_LINK_HI, str(hi))
     return lo, hi

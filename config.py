@@ -47,7 +47,10 @@ os.makedirs(MEDIA_DIR, exist_ok=True)
 CHANNEL_LINK: str = config("CHANNEL_LINK", default="").strip()
 CHANNEL_PITCH: str = config(
     "CHANNEL_PITCH",
-    default="Бесплатный канал: посты из VIP-каналов копируются моментально, платить не нужно",
+    default=(
+        "Бесплатный канал: софт автоматически почти сразу копирует новые посты "
+        "из закрытых VIP-каналов, отдельные доступы покупать не нужно"
+    ),
 ).strip()
 
 # ---------------------------------------------------------------------------
@@ -75,8 +78,21 @@ DM_GLOBAL_SPACING_MAX: int = int(config("DM_GLOBAL_SPACING_MAX", default="180"))
 DM_DAILY_LIMIT_PER_ACCOUNT: int = int(config("DM_DAILY_LIMIT_PER_ACCOUNT", default="45"))
 AI_REPLY_DELAY_MIN: int = int(config("AI_REPLY_DELAY_MIN", default="30"))
 AI_REPLY_DELAY_MAX: int = int(config("AI_REPLY_DELAY_MAX", default="90"))
-AI_AUTO_LINK_DELAY_MIN: int = int(config("AI_AUTO_LINK_DELAY_MIN", default="60"))
-AI_AUTO_LINK_DELAY_MAX: int = int(config("AI_AUTO_LINK_DELAY_MAX", default="120"))
+AI_APOLOGY_DELAY_MIN: int = int(
+    config(
+        "AI_APOLOGY_DELAY_MIN",
+        default=config("AI_AUTO_LINK_DELAY_MIN", default="5"),
+    )
+)
+AI_APOLOGY_DELAY_MAX: int = int(
+    config(
+        "AI_APOLOGY_DELAY_MAX",
+        default=config("AI_AUTO_LINK_DELAY_MAX", default="60"),
+    )
+)
+# Backward-compatible aliases for existing runtime code and old deployments.
+AI_AUTO_LINK_DELAY_MIN: int = AI_APOLOGY_DELAY_MIN
+AI_AUTO_LINK_DELAY_MAX: int = AI_APOLOGY_DELAY_MAX
 PEER_FLOOD_MIN_COOLDOWN_MINUTES: int = int(
     config("PEER_FLOOD_MIN_COOLDOWN_MINUTES", default="30")
 )
@@ -112,16 +128,26 @@ def is_admin(user_id: int | None) -> bool:
 
 
 def app_version() -> str:
-    """Read VERSION file next to the package, fallback to 1.0.0."""
+    """Read the authoritative VERSION file or fail loudly.
+
+    A fabricated fallback version makes production diagnostics unreliable, so a
+    missing or unreadable VERSION file is treated as a broken release.
+    """
     import pathlib
-    for candidate in (
+
+    candidates = (
         pathlib.Path(__file__).resolve().parent / "VERSION",
         pathlib.Path("VERSION"),
-    ):
+    )
+    errors: list[str] = []
+    for candidate in candidates:
         try:
-            v = candidate.read_text(encoding="utf-8").strip()
-            if v:
-                return v
-        except (OSError, UnicodeError):
+            value = candidate.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError) as exc:
+            errors.append(f"{candidate}: {exc}")
             continue
-    return "1.0.0"
+        if value:
+            return value
+        errors.append(f"{candidate}: empty")
+    detail = "; ".join(errors) or "no candidates"
+    raise RuntimeError(f"VERSION file is missing, unreadable or empty ({detail})")

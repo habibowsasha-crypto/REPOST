@@ -13,9 +13,29 @@ STAGE_FIRST_DM_SENDING = "first_dm_sending"
 STAGE_WAITING_REPLY = "waiting_reply"
 STAGE_FOLLOWUP_SENT = "followup_sent"
 STAGE_ENGAGED = "engaged"
-STAGE_EXPLAINED = "explained"
-STAGE_LINK_SENT = "link_sent"
+STAGE_EXPLAINED = "explained"  # legacy pre-v1.0.55 state
+STAGE_LINK_SENT = "link_sent"  # legacy pre-v1.0.55 terminal state
+STAGE_PROMO_SENT = "promo_sent"
+STAGE_APOLOGY_SENT = "apology_sent"
 STAGE_CLOSED = "closed"
+
+ACTIVE_STAGES = (
+    STAGE_FIRST_DM_SENDING,
+    STAGE_WAITING_REPLY,
+    STAGE_ENGAGED,
+    STAGE_EXPLAINED,
+    STAGE_PROMO_SENT,
+    STAGE_APOLOGY_SENT,
+)
+TERMINAL_STAGES = (STAGE_FOLLOWUP_SENT, STAGE_LINK_SENT, STAGE_CLOSED)
+
+
+def is_active_stage(stage: str | None) -> bool:
+    return str(stage or "") in ACTIVE_STAGES
+
+
+def is_terminal_stage(stage: str | None) -> bool:
+    return str(stage or "") in TERMINAL_STAGES
 
 # Silence after first DM before soft follow-up (hours)
 FOLLOWUP_DELAY_HOURS = 24
@@ -40,7 +60,8 @@ def get_dialog(target_user_id: int) -> Optional[dict[str, Any]]:
                first_dm_at, first_dm_message_id, telegram_delete_at,
                telegram_deleted_at, telegram_delete_next_attempt_at,
                telegram_delete_attempts, telegram_delete_last_error,
-               history_purge_at, history_purged_at
+               history_purge_at, history_purged_at, lifecycle_completed_at,
+               telegram_delete_abandoned_at
           FROM dialogs
          WHERE target_user_id=?
         """,
@@ -67,7 +88,7 @@ def create_after_first_dm(target_user_id: int, account_user_id: int, first_text:
     history_purge_at = (
         _now() + dt.timedelta(days=LOCAL_DIALOG_TEXT_RETENTION_DAYS)
     ).isoformat()
-    history = [{"role": "assistant", "text": first_text}]
+    history = [{"role": "assistant", "text": first_text, "at": first_dm_at}]
     conn = get_connection()
     with db_lock(), conn:
         conn.execute(
@@ -91,6 +112,8 @@ def create_after_first_dm(target_user_id: int, account_user_id: int, first_text:
                 history_purge_at=COALESCE(
                     dialogs.history_purge_at, excluded.history_purge_at
                 ),
+                lifecycle_completed_at=NULL,
+                telegram_delete_abandoned_at=NULL,
                 updated_at=excluded.updated_at
             """,
             (
@@ -108,21 +131,44 @@ def create_after_first_dm(target_user_id: int, account_user_id: int, first_text:
 
 
 def append_history(target_user_id: int, role: str, text: str) -> None:
-    d = get_dialog(target_user_id)
-    if not d:
-        return
-    history = list(d.get("history") or [])
-    history.append({"role": role, "text": text})
-    history = history[-20:]
     conn = get_connection()
     with db_lock(), conn:
+        row = conn.execute(
+            "SELECT history_json, history_purge_at FROM dialogs WHERE target_user_id=?",
+            (int(target_user_id),),
+        ).fetchone()
+        if not row:
+            return
+        try:
+            history = json.loads(row["history_json"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            history = []
+        if not isinstance(history, list):
+            history = []
+        now = _now_iso()
+        history.append({"role": role, "text": text, "at": now})
+        history = history[-20:]
+        purge_due = (
+            dt.datetime.fromisoformat(now) + dt.timedelta(days=LOCAL_DIALOG_TEXT_RETENTION_DAYS)
+        ).isoformat()
         conn.execute(
             """
             UPDATE dialogs
-               SET history_json=?, updated_at=?
+               SET history_json=?, updated_at=?,
+                   history_purge_at=CASE
+                       WHEN history_purge_at IS NULL OR history_purge_at>? THEN ?
+                       ELSE history_purge_at
+                   END,
+                   history_purged_at=NULL
              WHERE target_user_id=?
             """,
-            (json.dumps(history, ensure_ascii=False), _now_iso(), int(target_user_id)),
+            (
+                json.dumps(history, ensure_ascii=False),
+                now,
+                purge_due,
+                purge_due,
+                int(target_user_id),
+            ),
         )
 
 
@@ -138,6 +184,10 @@ def set_stage(
     d = get_dialog(target_user_id)
     if not d:
         return
+    # Closed is terminal for normal dialog processing. Explicit requeue/import
+    # creates a fresh dialog separately and must not be achieved by a late task.
+    if d.get("stage") == STAGE_CLOSED and stage != STAGE_CLOSED:
+        return
     outgoing = int(d.get("outgoing_count") or 0)
     if bump_outgoing:
         outgoing += 1
@@ -149,6 +199,12 @@ def set_stage(
         ala = None
     elif auto_link_at is not None:
         ala = auto_link_at
+    now = _now_iso()
+    completed_at = d.get("lifecycle_completed_at")
+    if is_active_stage(stage):
+        completed_at = None
+    elif is_terminal_stage(stage) and not completed_at:
+        completed_at = now
     conn = get_connection()
     with db_lock(), conn:
         conn.execute(
@@ -158,14 +214,28 @@ def set_stage(
                    outgoing_count=?,
                    link_sent=?,
                    auto_link_at=?,
+                   lifecycle_completed_at=?,
                    updated_at=?
              WHERE target_user_id=?
             """,
-            (stage, outgoing, ls, ala, _now_iso(), int(target_user_id)),
+            (
+                stage,
+                outgoing,
+                ls,
+                ala,
+                completed_at,
+                now,
+                int(target_user_id),
+            ),
         )
 
-
 def list_due_auto_links() -> list[dict[str, Any]]:
+    """Return due legacy links and v1.0.55 smoothing apologies.
+
+    The function name is retained because the main loop and older integrations call it.
+    New dialogs use STAGE_PROMO_SENT with link_sent=1, where auto_link_at is the
+    apology deadline. Legacy STAGE_EXPLAINED rows are still recoverable after upgrade.
+    """
     now = _now_iso()
     conn = get_connection()
     rows = conn.execute(
@@ -177,12 +247,15 @@ def list_due_auto_links() -> list[dict[str, Any]]:
                telegram_delete_attempts, telegram_delete_last_error,
                history_purge_at, history_purged_at
           FROM dialogs
-         WHERE stage=?
-           AND link_sent=0
-           AND auto_link_at IS NOT NULL
+         WHERE auto_link_at IS NOT NULL
            AND auto_link_at <= ?
+           AND (
+                (stage=? AND link_sent=0)
+                OR
+                (stage=? AND link_sent=1)
+           )
         """,
-        (STAGE_EXPLAINED, now),
+        (now, STAGE_EXPLAINED, STAGE_PROMO_SENT),
     ).fetchall()
     result = []
     for r in rows:
@@ -226,15 +299,7 @@ def list_due_followups() -> list[dict[str, Any]]:
 
 
 def count_active() -> int:
-    conn = get_connection()
-    row = conn.execute(
-        """
-        SELECT COUNT(*) AS c FROM dialogs
-         WHERE stage IN (?, ?, ?, ?)
-        """,
-        (STAGE_WAITING_REPLY, STAGE_FOLLOWUP_SENT, STAGE_ENGAGED, STAGE_EXPLAINED),
-    ).fetchone()
-    return int(row["c"] if row else 0)
+    return count_by_stage(*ACTIVE_STAGES)
 
 
 def mark_contact_completed(target_user_id: int) -> None:
@@ -251,22 +316,41 @@ def mark_contact_completed(target_user_id: int) -> None:
 
 
 def count_open_for_account(account_user_id: int) -> int:
-    """Count dialogs that still belong to an account and are not closed."""
+    """Count only dialogs that still require a live Telegram client."""
     conn = get_connection()
+    placeholders = ",".join("?" for _ in ACTIVE_STAGES)
     row = conn.execute(
-        """
+        f"""
         SELECT COUNT(*) AS c
           FROM dialogs
          WHERE account_user_id=?
-           AND stage<>?
+           AND stage IN ({placeholders})
         """,
-        (int(account_user_id), STAGE_CLOSED),
+        (int(account_user_id), *ACTIVE_STAGES),
     ).fetchone()
     return int(row["c"] if row else 0)
 
 
 def has_open_for_account(account_user_id: int) -> bool:
     return count_open_for_account(account_user_id) > 0
+
+
+def count_retention_waiting_for_account(account_user_id: int) -> int:
+    """Completed attempts that only wait for 30-day Telegram cleanup."""
+    conn = get_connection()
+    placeholders = ",".join("?" for _ in TERMINAL_STAGES)
+    row = conn.execute(
+        f"""
+        SELECT COUNT(*) AS c FROM dialogs
+         WHERE account_user_id=?
+           AND stage IN ({placeholders})
+           AND telegram_deleted_at IS NULL
+           AND telegram_delete_abandoned_at IS NULL
+           AND telegram_delete_at IS NOT NULL
+        """,
+        (int(account_user_id), *TERMINAL_STAGES),
+    ).fetchone()
+    return int(row["c"] if row else 0)
 
 
 def close_for_opt_out(target_user_id: int) -> None:
@@ -277,10 +361,12 @@ def close_for_opt_out(target_user_id: int) -> None:
         conn.execute(
             """
             UPDATE dialogs
-               SET stage=?, auto_link_at=NULL, updated_at=?
+               SET stage=?, auto_link_at=NULL,
+                   lifecycle_completed_at=COALESCE(lifecycle_completed_at, ?),
+                   updated_at=?
              WHERE target_user_id=?
             """,
-            (STAGE_CLOSED, now, int(target_user_id)),
+            (STAGE_CLOSED, now, now, int(target_user_id)),
         )
         conn.execute(
             """
@@ -302,22 +388,25 @@ def close_open_for_account(account_user_id: int) -> int:
     uid = int(account_user_id)
     conn = get_connection()
     with db_lock(), conn:
+        placeholders = ",".join("?" for _ in ACTIVE_STAGES)
         rows = conn.execute(
-            """
+            f"""
             SELECT target_user_id
               FROM dialogs
-             WHERE account_user_id=? AND stage<>?
+             WHERE account_user_id=? AND stage IN ({placeholders})
             """,
-            (uid, STAGE_CLOSED),
+            (uid, *ACTIVE_STAGES),
         ).fetchall()
         targets = [int(r["target_user_id"]) for r in rows]
         conn.execute(
-            """
+            f"""
             UPDATE dialogs
-               SET stage=?, auto_link_at=NULL, updated_at=?
-             WHERE account_user_id=? AND stage<>?
+               SET stage=?, auto_link_at=NULL,
+                   lifecycle_completed_at=COALESCE(lifecycle_completed_at, ?),
+                   updated_at=?
+             WHERE account_user_id=? AND stage IN ({placeholders})
             """,
-            (STAGE_CLOSED, now, uid, STAGE_CLOSED),
+            (STAGE_CLOSED, now, now, uid, *ACTIVE_STAGES),
         )
         if targets:
             placeholders = ",".join("?" for _ in targets)
@@ -350,49 +439,39 @@ def count_closed_today() -> int:
     start_utc = local_start.astimezone(dt.timezone.utc).isoformat()
     end_utc = (local_start + dt.timedelta(days=1)).astimezone(dt.timezone.utc).isoformat()
     conn = get_connection()
+    placeholders = ",".join("?" for _ in TERMINAL_STAGES)
     row = conn.execute(
-        """
+        f"""
         SELECT COUNT(*) AS c FROM dialogs
-         WHERE stage=? AND updated_at >= ? AND updated_at < ?
+         WHERE stage IN ({placeholders})
+           AND lifecycle_completed_at >= ? AND lifecycle_completed_at < ?
         """,
-        (STAGE_CLOSED, start_utc, end_utc),
+        (*TERMINAL_STAGES, start_utc, end_utc),
     ).fetchone()
     return int(row["c"] if row else 0)
 
 
 def list_recent(*, active_only: bool = True, limit: int = 15) -> list[dict[str, Any]]:
     conn = get_connection()
-    where = "WHERE d.stage<>'closed'" if active_only else ""
+    stages = ACTIVE_STAGES if active_only else TERMINAL_STAGES
+    placeholders = ",".join("?" for _ in stages)
+    order_field = "d.updated_at" if active_only else "d.lifecycle_completed_at"
     rows = conn.execute(
         f"""
         SELECT d.target_user_id, d.account_user_id, d.stage, d.outgoing_count,
                d.link_sent, d.updated_at, d.first_dm_at, d.telegram_delete_at,
-               d.history_purge_at, a.username, a.first_name, a.last_name
+               d.history_purge_at, d.lifecycle_completed_at,
+               a.username, a.first_name, a.last_name
           FROM dialogs d
           LEFT JOIN audience a ON a.user_id=d.target_user_id
-          {where}
-         ORDER BY d.updated_at DESC
+         WHERE d.stage IN ({placeholders})
+         ORDER BY {order_field} DESC
          LIMIT ?
         """,
-        (int(limit),),
+        (*stages, int(limit)),
     ).fetchall()
     return [dict(r) for r in rows]
-
 
 
 def list_recent_closed(limit: int = 15) -> list[dict[str, Any]]:
-    conn = get_connection()
-    rows = conn.execute(
-        """
-        SELECT d.target_user_id, d.account_user_id, d.stage, d.outgoing_count,
-               d.link_sent, d.updated_at, d.first_dm_at, d.telegram_delete_at,
-               d.history_purge_at, a.username, a.first_name, a.last_name
-          FROM dialogs d
-          LEFT JOIN audience a ON a.user_id=d.target_user_id
-         WHERE d.stage=?
-         ORDER BY d.updated_at DESC
-         LIMIT ?
-        """,
-        (STAGE_CLOSED, int(limit)),
-    ).fetchall()
-    return [dict(r) for r in rows]
+    return list_recent(active_only=False, limit=limit)
