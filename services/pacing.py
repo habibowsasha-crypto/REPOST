@@ -90,11 +90,8 @@ def account_is_send_ready(acc: dict[str, Any]) -> tuple[bool, str]:
     cooldown = _parse_iso(acc.get("cooldown_until"))
     if cooldown and cooldown > _now():
         return False, "cooldown"
-
-    # Stale pause: is_paused=1 but cooldown already elapsed/null → do not block.
-    # Active pause always has cooldown_until in the PeerFlood path.
-    if acc.get("is_paused") and cooldown and cooldown > _now():
-        return False, "paused"
+    # is_paused without active cooldown is treated as stale and ignored
+    # (PeerFlood path always sets cooldown_until together with pause).
 
     # Random 10-15 min window stored as next_send_at after each success.
     next_send = _parse_iso(acc.get("next_send_at"))

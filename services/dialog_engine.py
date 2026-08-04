@@ -101,18 +101,8 @@ async def _handle_incoming_private_body(
         )
         return
 
-    # Pause: no funnel replies / auto-link while worker is off.
-    # Group monitoring still fills the queue independently.
-    from services import runtime as runtime_svc
-
-    if not runtime_svc.is_worker_enabled():
-        logger.info(
-            "Dialog paused (worker off) target={} account={}",
-            target_user_id,
-            account_user_id,
-        )
-        return
-
+    # Pause on main menu only stops first DM from the queue.
+    # If the user already replied, we MUST continue the dialog.
     stage = dialog.get("stage")
     outgoing = int(dialog.get("outgoing_count") or 0)
 

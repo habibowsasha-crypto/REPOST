@@ -78,9 +78,9 @@ def _dashboard_text() -> str:
     if wst.get("enabled") and wst.get("loop_running"):
         w_line = f"{ON} Рассылка работает"
     elif wst.get("enabled"):
-        w_line = f"{WAIT} Рассылка пауза цикла"
+        w_line = f"{WAIT} Очередь на паузе (диалоги идут)"
     else:
-        w_line = f"{OFF} Рассылка выкл"
+        w_line = f"{OFF} Очередь на паузе · диалоги идут"
 
     wait = float(wst.get("global_wait_sec") or 0)
     wait_txt = f"~{int(wait)}с" if wait else "сейчас"
@@ -775,7 +775,10 @@ async def cb_help(event: events.CallbackQuery.Event) -> None:
             "Команды",
             join("`/start`  `/menu`  `меню`", "`/ping`  `/status`  `/cancel`"),
         ),
-        "На главном экране — живые цифры очереди.",
+        join(
+            "На главном экране — живые цифры очереди.",
+            "Пауза: только first DM из очереди. Диалоги с ответившими продолжаются.",
+        ),
     )
     await render_menu(event, text, [back_home_row()])
     await event.answer()

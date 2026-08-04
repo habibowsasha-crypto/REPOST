@@ -647,7 +647,9 @@ async def process_due_checks() -> int:
             actions += 1
             continue
         if status == STATUS_CHECKING:
-            # Already checked inline in on_peer_flood; do not /start again
+            # Stuck CHECKING past next_check_at → re-check once (prior run may have crashed).
+            await check_account(uid, force=True)
+            actions += 1
             continue
         if status in {STATUS_LIMITED, STATUS_ERROR}:
             await check_account(uid, force=True)
