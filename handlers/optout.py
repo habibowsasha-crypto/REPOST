@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from loguru import logger
 from telethon import events
 
 from config import bot, is_admin
@@ -24,7 +25,7 @@ def _optout_text() -> str:
     total = opt_out_svc.count()
     rows = opt_out_svc.list_all(limit=20)
     if not rows:
-        body = "Список пуст — никто не в opt-out."
+        body = "Список пуст — запретов на отправку нет."
     else:
         lines = []
         for r in rows:
@@ -35,17 +36,17 @@ def _optout_text() -> str:
     return screen(
         "🚫",
         "Кому не писать",
-        kv("Всего в стоп-листе", str(total)),
+        f"🚫 Всего людей: **{total}**",
         body,
-        "Это не очередь. Сюда — кого больше не беспокоить.",
+        "Этим людям бот больше не пишет и не продолжает активные диалоги.",
     )
 
 
 def _optout_buttons():
     return [
-        [btn("🔄 Обновить", b"menu_optout")],
-        [btn("➕ Добавить по ID", b"opt_add")],
-        [btn("➖ Снять по ID", b"opt_remove")],
+        [btn("🔄 ОБНОВИТЬ", b"menu_optout")],
+        [btn("➕ ДОБАВИТЬ", b"opt_add")],
+        [btn("➖ УБРАТЬ", b"opt_remove")],
         back_home_row(),
     ]
 
@@ -67,7 +68,7 @@ async def cb_opt_add(event: events.CallbackQuery.Event) -> None:
     set_state(event.sender_id, flow="optout", step="opt_add")
     text = screen(
         "➕",
-        "Добавить в opt-out",
+        "Добавить в «Не писать»",
         "Пришли **числовой user id** одним сообщением.",
         "Отмена: /cancel",
     )
@@ -83,7 +84,7 @@ async def cb_opt_remove(event: events.CallbackQuery.Event) -> None:
     set_state(event.sender_id, flow="optout", step="opt_remove")
     text = screen(
         "➖",
-        "Снять opt-out",
+        "Убрать из «Не писать»",
         "Пришли **числовой user id** одним сообщением.",
         "Отмена: /cancel",
     )
@@ -112,11 +113,22 @@ async def on_optout_text(event: events.NewMessage.Event) -> None:
     target_id = int(raw)
     clear_state(event.sender_id)
     if step == "opt_add":
+        from services import dialog_store as dialog_store_svc
+
+        dialog = dialog_store_svc.get_dialog(target_id)
+        account_user_id = int(dialog.get("account_user_id") or 0) if dialog else 0
         opt_out_svc.add(target_id, reason="manual_admin")
-        msg = notice("ok", f"`{target_id}` добавлен в opt-out.")
+        if account_user_id:
+            try:
+                from services import monitor as monitor_svc
+
+                await monitor_svc.maybe_disconnect_inactive_account(account_user_id)
+            except Exception as exc:
+                logger.warning("Opt-out account cleanup failed account={}: {}", account_user_id, exc)
+        msg = notice("ok", f"`{target_id}` добавлен в «Не писать». Активный диалог остановлен.")
     else:
         opt_out_svc.remove(target_id)
-        msg = notice("ok", f"`{target_id}` снят с opt-out.")
+        msg = notice("ok", f"`{target_id}` убран из «Не писать».")
     await event.respond(
         screen("🚫", "Кому не писать", msg),
         buttons=[back_home_row()],

@@ -1,7 +1,7 @@
 """Start / pause dispatcher worker UI — unified style.
 
-Pause stops first DM + dialog funnel / auto-link.
-Group monitoring keeps collecting leads into the queue.
+Pause stops only new First DM from the queue.
+Active dialogs and group monitoring continue.
 """
 
 from __future__ import annotations
@@ -43,16 +43,16 @@ def _worker_body() -> str:
         kv("Мониторинг (очередь)", f"{mon['connected_count']} акк.", icon="📡"),
         kv("Pending", str(pending), icon="⏳"),
         "",
-        "Пауза = нет first DM и ответов воронки.",
-        "Сбор юзеров из групп **не** останавливается.",
+        "Пауза = нет новых First DM из очереди.",
+        "Активные диалоги и сбор пользователей продолжаются.",
     )
 
 
 def _toggle_row():
     st = dispatcher_svc.worker_status()
     if st.get("enabled"):
-        return [btn("⏸ Пауза", b"bc_toggle")]
-    return [btn("▶️ Запустить", b"bc_toggle")]
+        return [btn("⏸ ПАУЗА FIRST DM", b"bc_toggle")]
+    return [btn("▶️ ЗАПУСТИТЬ FIRST DM", b"bc_toggle")]
 
 
 @bot.on(events.CallbackQuery(data=b"bc_toggle"))

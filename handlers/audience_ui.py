@@ -1,6 +1,9 @@
-"""Audience (crypto base) admin UI."""
+"""Audience (crypto base) admin UI with downloadable CSV import/export."""
 
 from __future__ import annotations
+
+import datetime as dt
+import io
 
 from telethon import events
 
@@ -20,6 +23,8 @@ from services.ui import (
     section,
 )
 
+MAX_IMPORT_BYTES = 10 * 1024 * 1024
+
 
 def _audience_text() -> str:
     total = audience_svc.count()
@@ -27,24 +32,25 @@ def _audience_text() -> str:
     if recent:
         body = join(*[audience_svc.format_line(r) for r in recent])
     else:
-        body = "Пока пусто. База пополняется после first DM."
+        body = "Пока пусто. База пополняется после First DM или импорта."
     return screen(
         "📁",
-        "База (крипто-аудитория)",
-        kv("Всего", str(total)),
-        section("Последние", body),
+        "База людей",
+        f"👥 Всего записей: **{total}**",
+        section("Последние записи", body),
         join(
-            "Авто: каждый, кому ушёл first DM.",
-            "Загрузка: id → очередь (opt-out пропускается).",
+            "📥 Скачать: подробный UTF-8 CSV",
+            "📤 Загрузить: CSV, TXT или список ID",
+            "🚫 Люди из «Не писать» всегда пропускаются",
         ),
     )
 
 
 def _audience_buttons():
     return [
-        [btn("🔄 Обновить", b"menu_audience")],
-        [btn("📥 Выгрузить", b"aud_export")],
-        [btn("📤 Загрузить id", b"aud_import")],
+        [btn("🔄 ОБНОВИТЬ", b"menu_audience")],
+        [btn("📥 СКАЧАТЬ CSV", b"aud_export")],
+        [btn("📤 ЗАГРУЗИТЬ CSV / TXT", b"aud_import")],
         back_home_row(),
     ]
 
@@ -63,36 +69,26 @@ async def cb_aud_export(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
         await event.answer(DENIED, alert=True)
         return
-    lines = audience_svc.export_lines(only_with_dm=True)
-    total = max(0, len(lines) - 1)
+    total = len(audience_svc.export_rows(only_with_dm=False))
     if total == 0:
         await event.answer("База пуста", alert=True)
         return
-    # Telegram message limit ~4096; chunk if needed
-    chunk: list[str] = []
-    size = 0
-    files = 0
-    for line in lines:
-        if size + len(line) + 1 > 3500 and chunk:
-            files += 1
-            await event.respond(
-                f"**Выгрузка {files}** ({len(chunk)} строк)\n\n"
-                + "```\n"
-                + "\n".join(chunk)
-                + "\n```"
-            )
-            chunk = []
-            size = 0
-        chunk.append(line)
-        size += len(line) + 1
-    if chunk:
-        files += 1
-        await event.respond(
-            f"**Выгрузка** · {total} id (с first DM)\n\n"
-            + "```\n"
-            + "\n".join(chunk)
-            + "\n```"
-        )
+
+    payload = audience_svc.export_csv_bytes(only_with_dm=False)
+    stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    file_obj = io.BytesIO(payload)
+    file_obj.name = f"channel_dm_audience_{stamp}.csv"
+    await bot.send_file(
+        event.chat_id,
+        file_obj,
+        caption=(
+            "📤 **ЭКСПОРТ БАЗЫ ГОТОВ**\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            f"👥 Записей: **{total}**\n"
+            "📄 Формат: **UTF-8 CSV**\n\n"
+            "Этот же файл можно загрузить обратно через раздел «База людей»."
+        ),
+    )
     await event.answer(f"Выгружено: {total}")
 
 
@@ -101,20 +97,18 @@ async def cb_aud_import(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
         await event.answer(DENIED, alert=True)
         return
-    set_state(event.sender_id, flow="audience", step="import_ids")
+    set_state(event.sender_id, flow="audience", step="import_file")
     text = screen(
         "📤",
-        "Загрузить в очередь",
-        "Пришли список **user id** (по одному в строке) или CSV:",
-        "`user_id,username,first_dm_at`",
-        "Opt-out и уже sent/in_progress не ставятся в pending.",
+        "Загрузить базу",
+        "Пришли **CSV/TXT-файл** из выгрузки бота или вставь данные текстом.",
+        "Поддерживается подробный CSV: `user_id, username, access_hash, ...`",
+        "Также можно прислать обычные user ID по одному или несколько в строке.",
+        "Импорт сохраняет username, access_hash и исходный аккаунт, если они есть.",
+        "По текущему правилу проекта импортированные записи повторно ставятся в очередь; opt-out пропускается.",
         "Отмена: /cancel",
     )
-    await render_menu(
-        event,
-        text,
-        [back_row(b"menu_audience"), back_home_row()],
-    )
+    await render_menu(event, text, [back_row(b"menu_audience"), back_home_row()])
     await event.answer()
 
 
@@ -127,33 +121,63 @@ def _is_audience_flow(event) -> bool:
     return st.get("flow") == "audience"
 
 
+def _decode_import_bytes(payload: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "cp1251"):
+        try:
+            return payload.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    raise ValueError("unsupported_encoding")
+
+
 @bot.on(events.NewMessage(func=_is_audience_flow))
 async def on_audience_import(event: events.NewMessage.Event) -> None:
     st = get_state(event.sender_id) or {}
-    if st.get("step") != "import_ids":
+    if st.get("step") not in {"import_file", "import_ids"}:
         return
+
     raw = (event.raw_text or "").strip()
     if raw.startswith("/"):
         return
-    ids = audience_svc.parse_ids_from_text(raw)
-    if not ids:
-        await event.respond(notice("warn", "Не нашёл ни одного user id. /cancel — отмена."))
+
+    if event.message.file:
+        size = int(getattr(event.message.file, "size", 0) or 0)
+        if size > MAX_IMPORT_BYTES:
+            await event.respond(notice("warn", "Файл больше 10 МБ. Раздели его на части."))
+            return
+        payload = await event.message.download_media(file=bytes)
+        if not isinstance(payload, (bytes, bytearray)):
+            await event.respond(notice("warn", "Не удалось прочитать файл. Пришли CSV или TXT."))
+            return
+        try:
+            raw = _decode_import_bytes(bytes(payload))
+        except ValueError:
+            await event.respond(notice("warn", "Неизвестная кодировка. Нужен UTF-8 CSV/TXT."))
+            return
+
+    records = audience_svc.parse_import_text(raw)
+    if not records:
+        await event.respond(notice("warn", "Не нашёл корректных user ID. /cancel — отмена."))
         return
+
     clear_state(event.sender_id)
-    stats = audience_svc.import_user_ids(ids, source="import")
+    stats = audience_svc.import_records(records, source="import")
     await event.respond(
         screen(
             "📁",
-            "Импорт базы",
+            "Импорт базы завершён",
             join(
-                kv("Распознано id", str(len(ids))),
-                kv("В базу", str(stats["added_or_touch"])),
-                kv("В очередь", str(stats["queued"])),
-                kv("Opt-out пропуск", str(stats["skipped_opt_out"])),
-                kv("Уже заняты / skip", str(stats["skipped_queue"])),
-                kv("Битые", str(stats["skipped_invalid"])),
+                kv("Распознано записей", str(stats["recognized"])),
+                kv("Сохранено в базу", str(stats["added_or_touch"])),
+                kv("Поставлено в очередь", str(stats["queued"])),
+                kv("С username", str(stats["with_username"])),
+                kv("С access_hash", str(stats["with_access_hash"])),
+                kv("С исходным аккаунтом", str(stats["with_source_account"])),
+                kv("Opt-out пропущено", str(stats["skipped_opt_out"])),
+                kv("Не поставлено в очередь", str(stats["skipped_queue"])),
+                kv("Повреждённых строк", str(stats["skipped_invalid"])),
             ),
-            "Дальше: главная → **Запустить**, если воркер на паузе.",
+            "Новые First DM начнут отправляться только когда рассылка включена в главном меню.",
         ),
         buttons=[back_home_row()],
     )

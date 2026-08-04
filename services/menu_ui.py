@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Optional, Sequence, Union
 
+from loguru import logger
 from telethon import Button
 from telethon.events.callbackquery import CallbackQuery
 from telethon.events.newmessage import NewMessage
@@ -41,7 +42,9 @@ async def render_menu(
                 or "content of the message" in err
             ):
                 return
-            # Other edit failures: do not open a second menu from a callback.
+            # Other edit failures: do not open a second menu from a callback,
+            # but keep the cause visible in logs.
+            logger.warning("Menu edit failed: {}", exc)
             return
 
     respond = getattr(event, "respond", None)

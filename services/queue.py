@@ -33,6 +33,7 @@ def upsert_from_activity(
     username: str | None = None,
     first_name: str | None = None,
     last_name: str | None = None,
+    access_hash: int | None = None,
     source_chat_id: int | None = None,
     source_account_user_id: int | None = None,
 ) -> str:
@@ -66,6 +67,7 @@ def upsert_from_activity(
                        SET username=COALESCE(?, username),
                            first_name=COALESCE(?, first_name),
                            last_name=COALESCE(?, last_name),
+                           access_hash=COALESCE(?, access_hash),
                            last_seen_at=?,
                            updated_at=?
                      WHERE target_user_id=?
@@ -74,6 +76,7 @@ def upsert_from_activity(
                         username,
                         first_name,
                         last_name,
+                        access_hash,
                         now,
                         now,
                         target_user_id,
@@ -88,6 +91,7 @@ def upsert_from_activity(
                    SET username=COALESCE(?, username),
                        first_name=COALESCE(?, first_name),
                        last_name=COALESCE(?, last_name),
+                       access_hash=COALESCE(?, access_hash),
                        source_chat_id=COALESCE(?, source_chat_id),
                        source_account_user_id=COALESCE(?, source_account_user_id),
                        status=?,
@@ -102,6 +106,7 @@ def upsert_from_activity(
                     username,
                     first_name,
                     last_name,
+                    access_hash,
                     source_chat_id,
                     source_account_user_id,
                     STATUS_PENDING,
@@ -116,16 +121,17 @@ def upsert_from_activity(
         conn.execute(
             """
             INSERT INTO leads (
-                target_user_id, username, first_name, last_name,
+                target_user_id, username, first_name, last_name, access_hash,
                 source_chat_id, source_account_user_id, status,
                 eligible_at, last_seen_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 target_user_id,
                 username,
                 first_name,
                 last_name,
+                access_hash,
                 source_chat_id,
                 source_account_user_id,
                 STATUS_PENDING,
@@ -155,7 +161,7 @@ def list_recent(limit: int = 15, status: str | None = STATUS_PENDING) -> list[di
     if status:
         rows = conn.execute(
             """
-            SELECT target_user_id, username, first_name, last_name,
+            SELECT target_user_id, username, first_name, last_name, access_hash,
                    source_chat_id, source_account_user_id, status,
                    eligible_at, last_seen_at, created_at
               FROM leads
@@ -168,7 +174,7 @@ def list_recent(limit: int = 15, status: str | None = STATUS_PENDING) -> list[di
     else:
         rows = conn.execute(
             """
-            SELECT target_user_id, username, first_name, last_name,
+            SELECT target_user_id, username, first_name, last_name, access_hash,
                    source_chat_id, source_account_user_id, status,
                    eligible_at, last_seen_at, created_at
               FROM leads
@@ -215,7 +221,7 @@ def claim_random_pending(account_user_id: int) -> dict[str, Any] | None:
     with db_lock(), conn:
         row = conn.execute(
             """
-            SELECT l.target_user_id, l.username, l.first_name, l.last_name,
+            SELECT l.target_user_id, l.username, l.first_name, l.last_name, l.access_hash,
                    l.source_chat_id, l.source_account_user_id, l.status,
                    l.eligible_at, l.last_seen_at, l.created_at
               FROM leads l
@@ -372,7 +378,16 @@ def release_stale_claims(*, older_than_seconds: int = 900) -> int:
                 (tid,),
             ).fetchone()
             cstatus = str(contact["status"]) if contact else None
-            if cstatus in {"in_progress", "completed"}:
+            outbox = conn.execute(
+                "SELECT status FROM first_dm_outbox WHERE target_user_id=?",
+                (tid,),
+            ).fetchone()
+            outbox_status = str(outbox["status"]) if outbox else None
+            if outbox_status == "prepared":
+                # Delivery is ambiguous and must be reconciled against Telegram.
+                # Never release it blindly: that could create a duplicate First DM.
+                continue
+            if cstatus in {"in_progress", "completed"} or outbox_status == "sent":
                 # Message was acknowledged as sent at least once.
                 conn.execute(
                     """
@@ -407,19 +422,55 @@ def release_stale_claims(*, older_than_seconds: int = 900) -> int:
 
 
 
+def count_first_dm_total() -> int:
+    """Durable all-time number of confirmed First-DM sends."""
+    conn = get_connection()
+    row = conn.execute("SELECT COUNT(*) AS c FROM first_dm_events").fetchone()
+    return int(row["c"] if row else 0)
+
+
+def source_label(lead: dict[str, Any]) -> str:
+    """Readable source for admin notifications and queue screens."""
+    chat_id = lead.get("source_chat_id")
+    account_id = lead.get("source_account_user_id")
+    if chat_id is not None:
+        conn = get_connection()
+        row = conn.execute(
+            """
+            SELECT title, username
+              FROM account_discovered_chats
+             WHERE account_user_id=? AND chat_id=?
+            """,
+            (int(account_id or 0), int(chat_id)),
+        ).fetchone()
+        if row:
+            title = str(row["title"] or "").strip()
+            username = str(row["username"] or "").strip().lstrip("@")
+            if title:
+                return title
+            if username:
+                return f"@{username}"
+        return f"чат {chat_id}"
+    return "импорт" if not account_id else "активность в группе"
+
+
 def count_first_dm_today() -> int:
-    """Sum of accounts' daily_sent_count for today (UTC date)."""
+    """Confirmed First-DM sends since midnight in admin time (UTC+3)."""
     import datetime as dt
 
-    today = dt.datetime.now(dt.timezone.utc).date().isoformat()
+    admin_tz = dt.timezone(dt.timedelta(hours=3))
+    local_now = dt.datetime.now(admin_tz)
+    local_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_utc = local_start.astimezone(dt.timezone.utc).isoformat()
+    end_utc = (local_start + dt.timedelta(days=1)).astimezone(dt.timezone.utc).isoformat()
     conn = get_connection()
     row = conn.execute(
         """
-        SELECT COALESCE(SUM(COALESCE(daily_sent_count, 0)), 0) AS c
-          FROM accounts
-         WHERE daily_sent_date = ?
+        SELECT COUNT(*) AS c
+          FROM first_dm_events
+         WHERE sent_at >= ? AND sent_at < ?
         """,
-        (today,),
+        (start_utc, end_utc),
     ).fetchone()
     return int(row["c"] if row else 0)
 
@@ -601,6 +652,9 @@ def force_requeue(
     username: str | None = None,
     first_name: str | None = None,
     last_name: str | None = None,
+    access_hash: int | None = None,
+    source_chat_id: int | None = None,
+    source_account_user_id: int | None = None,
 ) -> bool:
     """
     Put target into pending for a new first DM even if previously sent.
@@ -614,6 +668,16 @@ def force_requeue(
     with db_lock(), conn:
         conn.execute(
             "DELETE FROM contacts WHERE target_user_id=?",
+            (target_user_id,),
+        )
+        # Import/requeue is an explicit new campaign attempt approved by the admin.
+        # Remove the previous delivery journal so a new First DM can be prepared.
+        conn.execute(
+            "DELETE FROM first_dm_outbox WHERE target_user_id=?",
+            (target_user_id,),
+        )
+        conn.execute(
+            "DELETE FROM dialog_outbox WHERE target_user_id=?",
             (target_user_id,),
         )
         # Drop old funnel so auto-link / closed stage cannot fire on re-queue.
@@ -632,6 +696,9 @@ def force_requeue(
                    SET username=COALESCE(?, username),
                        first_name=COALESCE(?, first_name),
                        last_name=COALESCE(?, last_name),
+                       access_hash=COALESCE(?, access_hash),
+                       source_chat_id=COALESCE(?, source_chat_id),
+                       source_account_user_id=COALESCE(?, source_account_user_id),
                        status=?,
                        eligible_at=?,
                        claimed_by_account=NULL,
@@ -645,6 +712,9 @@ def force_requeue(
                     username,
                     first_name,
                     last_name,
+                    access_hash,
+                    source_chat_id,
+                    source_account_user_id,
                     STATUS_PENDING,
                     now,
                     now,
@@ -656,17 +726,20 @@ def force_requeue(
             conn.execute(
                 """
                 INSERT INTO leads (
-                    target_user_id, username, first_name, last_name,
+                    target_user_id, username, first_name, last_name, access_hash,
                     source_chat_id, source_account_user_id, status,
                     eligible_at, claimed_by_account, claimed_at,
                     last_seen_at, created_at, updated_at, send_attempts
-                ) VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, NULL, NULL, ?, ?, ?, 0)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, 0)
                 """,
                 (
                     target_user_id,
                     username,
                     first_name,
                     last_name,
+                    access_hash,
+                    source_chat_id,
+                    source_account_user_id,
                     STATUS_PENDING,
                     now,
                     now,

@@ -230,8 +230,8 @@ async def refresh_discovered_chats(account_user_id: int) -> int:
     finally:
         try:
             await client.disconnect()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Temporary chat client disconnect failed: {}", exc)
 
     now = _now_iso()
     conn = get_connection()

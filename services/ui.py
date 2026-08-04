@@ -7,7 +7,7 @@ from typing import Iterable, Optional, Sequence, Union
 from telethon import Button
 
 # ── layout ────────────────────────────────────────────────────────────────
-DIV = "──────────────"
+DIV = "━━━━━━━━━━━━━━━━━━"
 DIV_SOFT = "· · · · · · · ·"
 
 # ── status dots ───────────────────────────────────────────────────────────
@@ -36,7 +36,7 @@ def join(*parts: str) -> str:
 
 
 def title(emoji: str, text: str) -> str:
-    return f"{emoji} **{text}**"
+    return f"{emoji} **{str(text).upper()}**"
 
 
 def header(emoji: str, text: str) -> str:

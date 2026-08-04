@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import Optional
 
 from loguru import logger
 
-from config import AI_DM_ENABLED, AI_MODEL, OPENAI_API_KEY
+from config import AI_DM_ENABLED, AI_MODEL, AI_REQUEST_TIMEOUT_SECONDS, OPENAI_API_KEY
 from services import phrases as phrases_svc
 from texts.first_dm import pick_first_dm
 
@@ -263,7 +264,7 @@ async def _openai_first_dm(
 ) -> Optional[str]:
     from openai import AsyncOpenAI
 
-    client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+    client = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=AI_REQUEST_TIMEOUT_SECONDS, max_retries=1)
     avoid = ""
     if recent:
         sample = "\n".join(f"- {x}" for x in recent[:12])
@@ -285,16 +286,19 @@ async def _openai_first_dm(
         f"{avoid}"
     )
 
-    resp = await client.chat.completions.create(
-        model=AI_MODEL,
-        messages=[
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": user},
-        ],
-        temperature=1.05,
-        max_tokens=55,
-        presence_penalty=0.6,
-        frequency_penalty=0.4,
+    resp = await asyncio.wait_for(
+        client.chat.completions.create(
+            model=AI_MODEL,
+            messages=[
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": user},
+            ],
+            temperature=1.05,
+            max_tokens=55,
+            presence_penalty=0.6,
+            frequency_penalty=0.4,
+        ),
+        timeout=AI_REQUEST_TIMEOUT_SECONDS + 2.0,
     )
     content = (resp.choices[0].message.content or "").strip()
     # Strip wrapping quotes if model adds them

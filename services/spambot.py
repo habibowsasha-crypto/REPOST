@@ -57,28 +57,40 @@ def _format_admin_time(iso_or_dt) -> str:
     return local.strftime("%d.%m.%Y %H:%M МСК")
 
 
-def _notify_peerflood(label: str, seconds: int, *, streak: int = 1, interval_bumped: bool = False) -> str:
+def _notify_peerflood(
+    label: str,
+    seconds: int,
+    *,
+    streak: int = 1,
+    interval_bumped: bool = False,
+) -> str:
     from services import runtime as runtime_svc
+
     pause = runtime_svc.format_duration(int(seconds))
-    rng = runtime_svc.format_peer_flood_range()
-    line1 = f"⚠️ Аккаунт **{label}** словил PeerFlood."
-    if streak >= 2 or seconds >= 25 * 60:
-        line2 = (
-            f"Повтор быстрее 10–15 мин → пауза **{pause}** "
-            f"(обычно {rng}). Спрашиваю @SpamBot."
-        )
-        extra = "\n🔁 Временный cooldown, потом как в настройках."
-    else:
-        line2 = f"Пауза **{pause}** (настройки {rng}). Спрашиваю @SpamBot."
-        extra = ""
-    if interval_bumped:
-        extra += "\n⏱ На 30 мин увеличена задержка first DM на этом аккаунте."
-    return line1 + "\n" + line2 + extra
+    extra = (
+        "\n⏱ Интервал First DM временно увеличен на 30 минут."
+        if interval_bumped
+        else ""
+    )
+    return (
+        "🚨 **ОБНАРУЖЕН PEERFLOOD**\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 Аккаунт: **{label}**\n"
+        "⏸ First DM: **остановлены**\n"
+        f"⏳ Пауза: **{pause}**\n"
+        f"🔁 Срабатываний подряд: **{streak}**\n"
+        "🤖 SpamBot: **проверка запущена**"
+        f"{extra}"
+    )
+
 
 def _notify_free_manual(label: str) -> str:
     return (
-        f"✅ @SpamBot: **{label}** свободен.\n"
-        f"Auto-resume выкл — сними паузу вручную."
+        "🟢 **SPAMBOT: ОГРАНИЧЕНИЙ НЕТ**\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 Аккаунт: **{label}**\n"
+        "✅ Telegram не подтвердил ограничение.\n"
+        "⏸ Автовозобновление выключено — сними паузу вручную."
     )
 
 
@@ -86,24 +98,42 @@ def _notify_limited(label: str, until: str, next_check: str) -> str:
     until_h = _format_admin_time(until)
     next_h = _format_admin_time(next_check)
     return (
-        f"⏳ @SpamBot: **{label}** ещё ограничен.\n"
-        f"Снятие примерно **{until_h}**.\n"
-        f"Проверю снова после **{next_h}**."
+        "🔴 **SPAMBOT: АККАУНТ ОГРАНИЧЕН**\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 Аккаунт: **{label}**\n"
+        f"⏳ Ограничение примерно до: **{until_h}**\n"
+        f"🔄 Следующая проверка: **{next_h}**\n"
+        "📨 First DM: **остановлены**"
     )
 
 
 def _notify_unknown(label: str, reply: str) -> str:
+    snippet = (reply or "").replace("\n", " ").strip()
+    if len(snippet) > 240:
+        snippet = snippet[:237] + "…"
     return (
-        f"❔ Неясный ответ @SpamBot по **{label}**.\n"
-        f"{reply}"
+        "⚠️ **НЕЯСНЫЙ ОТВЕТ SPAMBOT**\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 Аккаунт: **{label}**\n"
+        f"💬 Ответ: {snippet}\n"
+        "📌 Аккаунт останется на паузе до следующей проверки."
     )
 
 
 def _notify_resumed(label: str, source: str) -> str:
-    src = {"manual": "вручную", "auto": "auto-resume", "spambot_free": "auto-resume"}.get(
-        source, source
+    src = {
+        "manual": "вручную",
+        "auto": "автоматически",
+        "spambot_free": "после проверки SpamBot",
+        "spambot_auto": "после автоматической проверки SpamBot",
+    }.get(source, source)
+    return (
+        "▶️ **FIRST DM АККАУНТА ВОЗОБНОВЛЕНЫ**\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 Аккаунт: **{label}**\n"
+        f"🔄 Возобновление: **{src}**\n"
+        "✅ Аккаунт снова участвует в отправке First DM."
     )
-    return f"✅ **{label}** снова можно использовать в рассылке ({src})."
 
 
 def _now() -> dt.datetime:
@@ -123,8 +153,23 @@ def _parse_iso(value: str | None) -> Optional[dt.datetime]:
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=dt.timezone.utc)
         return parsed
-    except Exception:
+    except (TypeError, ValueError):
         return None
+
+
+def _timezone_from_text(text: str) -> dt.tzinfo:
+    """Extract UTC/GMT offset or Moscow time marker from SpamBot text."""
+    lower = (text or "").lower()
+    offset = re.search(r"(?:utc|gmt)\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?", lower)
+    if offset:
+        sign = 1 if offset.group(1) == "+" else -1
+        hours = int(offset.group(2))
+        minutes = int(offset.group(3) or 0)
+        if hours <= 23 and minutes <= 59:
+            return dt.timezone(sign * dt.timedelta(hours=hours, minutes=minutes))
+    if re.search(r"\b(?:мск|msk|moscow)\b", lower):
+        return _MSK
+    return dt.timezone.utc
 
 
 def get_state(account_user_id: int) -> dict[str, Any]:
@@ -323,8 +368,9 @@ def _extract_until(text: str) -> Optional[str]:
       - 2026-08-03 23:42 / 2026-08-03T23:42:00
       - 03.08.2026 23:42
       - 3 Aug 2026, 23:42 UTC  (English months)
-      - 3 августа 2026, 23:42  (Russian months)
-    Fallback +24h only if nothing matched.
+      - 3 августа 2026, 23:42 МСК  (Russian months)
+      - UTC/GMT offsets such as UTC+3
+    Parsed values are normalized to UTC. Fallback +24h only if nothing matched.
     """
     raw = text or ""
 
@@ -334,19 +380,19 @@ def _extract_until(text: str) -> Optional[str]:
         try:
             parsed = dt.datetime.fromisoformat(m.group(1).replace(" ", "T"))
             if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=dt.timezone.utc)
-            return parsed.isoformat()
-        except Exception:
-            pass
+                parsed = parsed.replace(tzinfo=_timezone_from_text(raw))
+            return parsed.astimezone(dt.timezone.utc).isoformat()
+        except (TypeError, ValueError, OverflowError) as exc:
+            logger.debug("SpamBot ISO date parse failed: {}", exc)
 
     # dd.mm.yyyy hh:mm
     m = re.search(r"(\d{1,2})[./](\d{1,2})[./](\d{4})\s+(\d{1,2}):(\d{2})", raw)
     if m:
         d, mo, y, h, mi = map(int, m.groups())
         try:
-            return dt.datetime(y, mo, d, h, mi, tzinfo=dt.timezone.utc).isoformat()
-        except Exception:
-            pass
+            return dt.datetime(y, mo, d, h, mi, tzinfo=_timezone_from_text(raw)).astimezone(dt.timezone.utc).isoformat()
+        except (TypeError, ValueError, OverflowError) as exc:
+            logger.debug("SpamBot numeric date parse failed: {}", exc)
 
     months_en = {
         "jan": 1, "january": 1,
@@ -380,9 +426,9 @@ def _extract_until(text: str) -> Optional[str]:
         mo = months_en.get(mon_s) or months_en.get(mon_s[:3])
         if mo:
             try:
-                return dt.datetime(y, mo, d, h, mi, tzinfo=dt.timezone.utc).isoformat()
-            except Exception:
-                pass
+                return dt.datetime(y, mo, d, h, mi, tzinfo=_timezone_from_text(raw)).astimezone(dt.timezone.utc).isoformat()
+            except (TypeError, ValueError, OverflowError) as exc:
+                logger.debug("SpamBot English date parse failed: {}", exc)
 
     # 3 августа 2026, 23:42  (optional UTC/МСК words ignored)
     m = re.search(
@@ -410,9 +456,9 @@ def _extract_until(text: str) -> Optional[str]:
                     break
         if mo:
             try:
-                return dt.datetime(y, mo, d, h, mi, tzinfo=dt.timezone.utc).isoformat()
-            except Exception:
-                pass
+                return dt.datetime(y, mo, d, h, mi, tzinfo=_timezone_from_text(raw)).astimezone(dt.timezone.utc).isoformat()
+            except (TypeError, ValueError, OverflowError) as exc:
+                logger.debug("SpamBot Russian date parse failed: {}", exc)
 
     logger.warning("SpamBot until date unparsed, fallback +24h. snippet={!r}", raw[:180])
     return (_now() + dt.timedelta(hours=24)).isoformat()
@@ -467,8 +513,8 @@ async def check_account(account_user_id: int, *, force: bool = False) -> dict[st
             if temp:
                 try:
                     await client.disconnect()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Temporary SpamBot client disconnect failed: {}", exc)
     else:
         return await _run_spambot_dialog(client, account_user_id)
 

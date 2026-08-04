@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import random
 import re
 from typing import Optional
@@ -18,6 +19,7 @@ from loguru import logger
 from config import (
     AI_DM_ENABLED,
     AI_MODEL,
+    AI_REQUEST_TIMEOUT_SECONDS,
     CHANNEL_LINK,
     CHANNEL_PITCH,
     OPENAI_API_KEY,
@@ -26,7 +28,9 @@ from services import phrases as phrases_svc
 from services.ai_first_dm import sanitize_dashes
 
 _STOP_RE = re.compile(
-    r"(не\s+пиши|не\s+пишите|отстань|отстаньте|заблокирую|в\s+блок|жалоб|"
+    r"(не\s+пиши|не\s+пишите|больше\s+не\s+пиши|не\s+надо\s+писать|"
+    r"не\s+нужно\s+писать|не\s+беспокой|не\s+отвлекай|убери\s+меня|"
+    r"удали\s+меня|отстань|отстаньте|заблокирую|в\s+блок|жалоб|спам|"
     r"не\s+пиш(и|ите)\s+мне|leave\s+me|stop\s+writing|do\s+not\s+write|"
     r"fuck\s+off|пошёл\s+на|пошел\s+на|иди\s+нахуй|отвали)",
     re.IGNORECASE,
@@ -42,6 +46,38 @@ _SOFT_NO_RE = re.compile(
 )
 
 _BAD_DASHES = ("\u2014", "\u2013", "\u2212")
+_URL_RE = re.compile(
+    r"(?i)(?:"
+    r"(?:https?://|tg://|www\.|t\.me/)[^\s<>()]+"
+    r"|(?:[a-z0-9-]+\.)+(?:com|net|org|io|ru|me|xyz|app|site)(?:/[^\s<>()]*)?"
+    r")"
+)
+_TELEGRAM_HANDLE_RE = re.compile(r"(?<![\w@])@[A-Za-z][A-Za-z0-9_]{4,31}")
+
+
+class ChannelLinkNotConfiguredError(RuntimeError):
+    """Raised when a link step is reached without a valid admin CHANNEL_LINK."""
+
+
+def configured_channel_link() -> str:
+    link = (CHANNEL_LINK or "").strip()
+    if not link or not re.match(r"(?i)^(?:https?://|tg://|t\.me/)", link):
+        raise ChannelLinkNotConfiguredError(
+            "CHANNEL_LINK is empty or invalid; exact admin link is required"
+        )
+    return link
+
+
+def _enforce_admin_link(text: str, *, include_link: bool) -> str:
+    """Remove every model-provided URL and optionally append the exact admin link once."""
+    cleaned = _URL_RE.sub("", text or "")
+    cleaned = _TELEGRAM_HANDLE_RE.sub("", cleaned)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip(" \n-:")
+    if not include_link:
+        return cleaned
+    link = configured_channel_link()
+    return f"{cleaned}\n{link}".strip()
 
 # Small-talk that must NOT appear as "explain"
 _GREETING_RE = re.compile(
@@ -184,12 +220,11 @@ def followup_silence_text() -> str:
 
 
 def soft_close_text() -> str:
-
     return random.choice(
         [
-            "Ок, не навязываю. Удачного дня.",
-            "Понял, не буду отвлекать.",
-            "Ок, тогда не настаиваю.",
+            "Понял, извини что отвлёк. Больше не буду писать.",
+            "Ок, извини за беспокойство. Продолжать не буду.",
+            "Понял тебя, извини. Больше не отвлекаю.",
         ]
     )
 
@@ -289,8 +324,8 @@ async def generate_engage_question(history: list[dict]) -> str:
             if text and len(text) <= 90 and "t.me" not in text.lower() and "http" not in text.lower():
                 if not _GREETING_RE.search(text):
                     return text
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Engage-question AI fallback used: {}", exc)
     return random.choice(_ENGAGE_FALLBACKS)
 
 
@@ -310,8 +345,7 @@ async def generate_explain(history: list[dict]) -> str:
             )
             if text:
                 text = _strip_em_dash(text)
-                if CHANNEL_LINK and CHANNEL_LINK in text:
-                    text = text.replace(CHANNEL_LINK, "").strip()
+                text = _enforce_admin_link(text, include_link=False)
                 if _explain_ok(text) and text not in recent:
                     return text
                 logger.warning("explain rejected: {!r}", (text or "")[:80])
@@ -328,8 +362,8 @@ async def generate_explain(history: list[dict]) -> str:
 
 
 async def generate_link_wrap(history: list[dict]) -> str:
-    """Soft CTA + channel link (auto after silence or explicit)."""
-    link = CHANNEL_LINK or "ссылка не задана (CHANNEL_LINK)"
+    """Soft CTA with exactly the link configured by the admin."""
+    link = configured_channel_link()
     recent = phrases_svc.recent_texts(phrases_svc.KIND_LINK, limit=20)
     if AI_DM_ENABLED and OPENAI_API_KEY:
         try:
@@ -337,47 +371,40 @@ async def generate_link_wrap(history: list[dict]) -> str:
                 history,
                 instruction=(
                     "Нужно мягко дать ссылку на канал и слегка извиниться за беспокойство.\n"
-                    f"Ссылка обязательно одна и точная: {link}\n"
-                    "Структура 2-3 предложения:\n"
-                    "1) коротко извинись что отвлёк / побеспокоил\n"
-                    "2) можно просто глянуть, подписываться не обязательно\n"
-                    "3) вставь ссылку\n"
-                    "Не здоровайся, не спрашивай как дела, без давления, без длинного тире."
+                    f"Ссылка будет добавлена системой отдельно и точно: {link}\n"
+                    "Сам не пиши никаких URL или @username.\n"
+                    "Структура 1-2 коротких предложения: извинись и скажи, что можно "
+                    "просто посмотреть без обязательств. Без давления и длинного тире."
                 ),
             )
             if text:
                 text = _strip_em_dash(text)
-                if link not in text and CHANNEL_LINK:
-                    text = f"{text}\n{link}"
-                if text not in recent and "http" not in text.lower().replace(link.lower(), ""):
-                    # link itself may contain t.me - ok
-                    return text
+                text = _enforce_admin_link(text, include_link=True)
                 if text not in recent:
                     return text
+        except ChannelLinkNotConfiguredError:
+            raise
         except Exception as exp:
             logger.exception("generate_link_wrap failed: {}", exp)
 
     pool = [t for t in _LINK_FALLBACKS if t.format(link=link) not in recent]
     if not pool:
         pool = list(_LINK_FALLBACKS)
-    return random.choice(pool).format(link=link)
+    return _enforce_admin_link(random.choice(pool).format(link=link), include_link=True)
 
 
 async def generate_contextual_reply(history: list[dict], *, include_link: bool) -> str:
-    """
-    User wrote again after explain.
-    Not small talk: short answer + pitch, optionally with link.
-    """
-    link = CHANNEL_LINK or ""
+    """Short funnel reply; any included URL is always the exact admin link."""
+    link = configured_channel_link() if include_link else ""
     pitch = CHANNEL_PITCH or "бесплатный канал: посты из VIP копируются моментально"
 
     if AI_DM_ENABLED and OPENAI_API_KEY:
         try:
-            if include_link and link:
+            if include_link:
                 extra = (
-                    f"Обязательно один раз вставь ссылку: {link}\n"
-                    "Сначала коротко извинись за беспокойство, потом скажи что можно "
-                    "просто глянуть без обязательств, и дай ссылку."
+                    "Сначала коротко извинись за беспокойство, затем скажи, что можно "
+                    "просто посмотреть без обязательств. Ссылку добавит система: "
+                    "не пиши URL или @username самостоятельно."
                 )
             else:
                 extra = (
@@ -390,32 +417,31 @@ async def generate_contextual_reply(history: list[dict], *, include_link: bool) 
                     "Это продолжение воронки в Telegram, не дружеский чат.\n"
                     f"Оффер: {pitch}\n"
                     f"{extra}\n"
-                    "Запрещено: повторный привет, 'как дела', 'чем занимаешься', "
-                    "личные вопросы, давление, длинное тире.\n"
+                    "Запрещено: повторный привет, small talk, личные вопросы, давление, "
+                    "любые самостоятельно придуманные ссылки и длинное тире.\n"
                     "1-3 коротких предложения по делу."
                 ),
             )
             if text:
                 text = _strip_em_dash(text)
-                # Reject pure small talk
                 if _SMALLTALK_RE.search(text):
                     logger.warning("contextual smalltalk rejected: {!r}", text[:80])
                 else:
-                    if include_link and link and link not in text:
-                        text = f"{text}\n{link}"
-                    return text
+                    return _enforce_admin_link(text, include_link=include_link)
+        except ChannelLinkNotConfiguredError:
+            raise
         except Exception as exc:
             logger.exception("contextual reply failed: {}", exc)
 
-    if include_link and link:
-        return random.choice(_LINK_FALLBACKS).format(link=link)
-    return random.choice(_EXPLAIN_FALLBACKS)
+    if include_link:
+        return _enforce_admin_link(random.choice(_LINK_FALLBACKS).format(link=link), include_link=True)
+    return _enforce_admin_link(random.choice(_EXPLAIN_FALLBACKS), include_link=False)
 
 
 async def _openai_reply(history: list[dict], *, instruction: str) -> Optional[str]:
     from openai import AsyncOpenAI
 
-    client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+    client = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=AI_REQUEST_TIMEOUT_SECONDS, max_retries=1)
     messages = [
         {
             "role": "system",
@@ -432,11 +458,14 @@ async def _openai_reply(history: list[dict], *, instruction: str) -> Optional[st
         role = "assistant" if item.get("role") == "assistant" else "user"
         messages.append({"role": role, "content": str(item.get("text") or "")[:500]})
 
-    resp = await client.chat.completions.create(
-        model=AI_MODEL,
-        messages=messages,
-        temperature=0.7,
-        max_tokens=160,
+    resp = await asyncio.wait_for(
+        client.chat.completions.create(
+            model=AI_MODEL,
+            messages=messages,
+            temperature=0.7,
+            max_tokens=160,
+        ),
+        timeout=AI_REQUEST_TIMEOUT_SECONDS + 2.0,
     )
     content = (resp.choices[0].message.content or "").strip()
     if len(content) >= 2 and content[0] in "\"'«" and content[-1] in "\"'»":

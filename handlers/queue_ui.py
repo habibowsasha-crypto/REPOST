@@ -25,49 +25,44 @@ from services.ui import (
 def queue_screen_text() -> str:
     pending = queue_svc.count_by_status(queue_svc.STATUS_PENDING)
     claimed = queue_svc.count_by_status(queue_svc.STATUS_CLAIMED)
-    sent = queue_svc.count_by_status(queue_svc.STATUS_SENT)
+    sent_today = queue_svc.count_first_dm_today()
+    sent_total = queue_svc.count_first_dm_total()
     cancelled = queue_svc.count_by_status(queue_svc.STATUS_CANCELLED)
     mon = monitor_svc.monitor_status()
-    if mon["running"]:
-        mon_line = kv("Мониторинг", f"{mon['connected_count']} акк. онлайн", icon=ON)
-    else:
-        mon_line = kv("Мониторинг", "выкл", icon=OFF)
+    mon_line = (
+        f"📡 Мониторинг: ✅ активен · **{mon['connected_count']} акк.**"
+        if mon["running"]
+        else "📡 Мониторинг: ❌ остановлен"
+    )
 
-    recent = queue_svc.list_recent(12, status=queue_svc.STATUS_PENDING)
+    recent = queue_svc.list_recent(10, status=queue_svc.STATUS_PENDING)
     if not recent:
-        recent_block = (
-            "Pending пуст.\n"
-            "Нужны: участие + чаты в мониторинге + сообщения в группах."
-        )
+        recent_block = "Очередь пуста. Новые люди появятся из выбранных групп или импорта."
     else:
         recent_block = join(
-            "Последние «ждут»:",
+            "**Последние в очереди**",
             *[queue_svc.format_lead_line(lead) for lead in recent],
         )
 
     return screen(
         "📬",
-        "Очередь",
-        mon_line,
-        section(
-            "Сводка",
-            tree(
-                [
-                    ("⏳", "ждут DM", pending),
-                    ("🔄", "в работе", claimed),
-                    ("✅", "написали", sent),
-                    ("🗑", "отменены", cancelled),
-                ]
-            ),
+        "Очередь First DM",
+        join(
+            f"├ Ждут сообщения: **{pending}**",
+            f"├ Сейчас отправляется: **{claimed}**",
+            f"├ Отправлено сегодня: **{sent_today}**",
+            f"├ Отправлено всего: **{sent_total}**",
+            f"└ Отменено: **{cancelled}**",
         ),
+        mon_line,
         recent_block,
     )
 
 
 def _queue_buttons():
     return [
-        [btn("🔄 Обновить", b"bc_queue")],
-        [btn("🧹 Очистить «ждут»", b"bc_queue_clear")],
+        [btn("🔄 ОБНОВИТЬ", b"bc_queue")],
+        [btn("🧹 ОЧИСТИТЬ ОЧЕРЕДЬ", b"bc_queue_clear")],
         back_home_row(),
     ]
 

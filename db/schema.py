@@ -197,6 +197,7 @@ def init_db() -> None:
         _ensure_column(
             conn, "leads", "send_attempts", "send_attempts INTEGER NOT NULL DEFAULT 0"
         )
+        _ensure_column(conn, "leads", "access_hash", "access_hash INTEGER")
 
         conn.execute(
             """
@@ -242,6 +243,107 @@ def init_db() -> None:
             )
             """
         )
+        _ensure_column(conn, "dialogs", "first_dm_at", "first_dm_at TEXT")
+        _ensure_column(
+            conn, "dialogs", "first_dm_message_id", "first_dm_message_id INTEGER"
+        )
+        _ensure_column(
+            conn, "dialogs", "telegram_delete_at", "telegram_delete_at TEXT"
+        )
+        _ensure_column(
+            conn, "dialogs", "telegram_deleted_at", "telegram_deleted_at TEXT"
+        )
+        _ensure_column(
+            conn,
+            "dialogs",
+            "telegram_delete_next_attempt_at",
+            "telegram_delete_next_attempt_at TEXT",
+        )
+        _ensure_column(
+            conn,
+            "dialogs",
+            "telegram_delete_attempts",
+            "telegram_delete_attempts INTEGER NOT NULL DEFAULT 0",
+        )
+        _ensure_column(
+            conn,
+            "dialogs",
+            "telegram_delete_last_error",
+            "telegram_delete_last_error TEXT",
+        )
+        _ensure_column(
+            conn, "dialogs", "history_purge_at", "history_purge_at TEXT"
+        )
+        _ensure_column(
+            conn, "dialogs", "history_purged_at", "history_purged_at TEXT"
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dialog_outbox (
+                target_user_id INTEGER NOT NULL,
+                action_kind TEXT NOT NULL,
+                account_user_id INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                status TEXT NOT NULL,
+                prepared_at TEXT NOT NULL,
+                telegram_message_id INTEGER,
+                sent_at TEXT,
+                last_error TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (target_user_id, action_kind)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_dialog_outbox_status_prepared
+            ON dialog_outbox(status, prepared_at)
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS first_dm_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_key TEXT NOT NULL UNIQUE,
+                target_user_id INTEGER NOT NULL,
+                account_user_id INTEGER,
+                telegram_message_id INTEGER,
+                sent_at TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_first_dm_events_sent_at
+            ON first_dm_events(sent_at)
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS first_dm_outbox (
+                target_user_id INTEGER PRIMARY KEY,
+                account_user_id INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                status TEXT NOT NULL,
+                prepared_at TEXT NOT NULL,
+                telegram_message_id INTEGER,
+                sent_at TEXT,
+                last_error TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_first_dm_outbox_status_prepared
+            ON first_dm_outbox(status, prepared_at)
+            """
+        )
+
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS audience (
@@ -258,9 +360,82 @@ def init_db() -> None:
             )
             """
         )
+        _ensure_column(conn, "audience", "access_hash", "access_hash INTEGER")
+        _ensure_column(
+            conn,
+            "audience",
+            "source_account_user_id",
+            "source_account_user_id INTEGER",
+        )
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_audience_last_touch
             ON audience(last_touch_at DESC)
             """
         )
+
+        # Backfill a durable baseline for the all-time First-DM counter.
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO first_dm_events (
+                event_key, target_user_id, account_user_id, telegram_message_id,
+                sent_at, created_at
+            )
+            SELECT 'legacy:' || a.user_id, a.user_id, a.source_account_user_id,
+                   o.telegram_message_id, a.first_dm_at, a.first_dm_at
+              FROM audience a
+              LEFT JOIN first_dm_outbox o ON o.target_user_id=a.user_id
+             WHERE a.first_dm_at IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM first_dm_events e
+                    WHERE e.target_user_id=a.user_id
+               )
+            """
+        )
+
+        # Backfill retention timestamps for dialogs created by v1.0.47.
+        rows = conn.execute(
+            """
+            SELECT d.target_user_id, d.first_dm_at, d.first_dm_message_id,
+                   o.sent_at, o.telegram_message_id, a.first_dm_at AS audience_dm_at
+              FROM dialogs d
+              LEFT JOIN first_dm_outbox o ON o.target_user_id=d.target_user_id
+              LEFT JOIN audience a ON a.user_id=d.target_user_id
+             WHERE d.first_dm_at IS NULL OR d.history_purge_at IS NULL
+                OR d.telegram_delete_at IS NULL
+            """
+        ).fetchall()
+        if rows:
+            import datetime as _dt
+            from config import (
+                LOCAL_DIALOG_TEXT_RETENTION_DAYS,
+                TELEGRAM_DIALOG_DELETE_DAYS,
+            )
+
+            for row in rows:
+                raw = row["first_dm_at"] or row["sent_at"] or row["audience_dm_at"]
+                if not raw:
+                    continue
+                try:
+                    base = _dt.datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+                    if base.tzinfo is None:
+                        base = base.replace(tzinfo=_dt.timezone.utc)
+                except (TypeError, ValueError):
+                    continue
+                conn.execute(
+                    """
+                    UPDATE dialogs
+                       SET first_dm_at=COALESCE(first_dm_at, ?),
+                           first_dm_message_id=COALESCE(first_dm_message_id, ?),
+                           telegram_delete_at=COALESCE(telegram_delete_at, ?),
+                           history_purge_at=COALESCE(history_purge_at, ?)
+                     WHERE target_user_id=?
+                    """,
+                    (
+                        base.isoformat(),
+                        row["telegram_message_id"],
+                        (base + _dt.timedelta(days=TELEGRAM_DIALOG_DELETE_DAYS)).isoformat(),
+                        (base + _dt.timedelta(days=LOCAL_DIALOG_TEXT_RETENTION_DAYS)).isoformat(),
+                        int(row["target_user_id"]),
+                    ),
+                )

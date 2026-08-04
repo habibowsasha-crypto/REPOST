@@ -24,6 +24,8 @@ from config import (
 )
 from services import ai_dialog
 from services import dialog_store as store
+from services import dialog_delivery
+from services import first_dm_delivery
 from services import monitor as monitor_svc
 from services import opt_out as opt_out_svc
 from services import pacing
@@ -49,6 +51,17 @@ def _auto_link_delay() -> int:
 
     lo, hi = runtime_svc.get_auto_link_delay_range()
     return random.randint(lo, hi)
+
+
+async def _cleanup_disabled_account(account_user_id: int) -> None:
+    try:
+        await monitor_svc.maybe_disconnect_inactive_account(account_user_id)
+    except Exception as exc:
+        logger.debug("dialog account cleanup failed account={}: {}", account_user_id, exc)
+
+
+def _link_retry_at() -> str:
+    return (_now() + dt.timedelta(minutes=15)).isoformat()
 
 
 async def on_first_dm_sent(target_user_id: int, account_user_id: int, text: str) -> None:
@@ -84,9 +97,39 @@ async def _handle_incoming_private_body(
         return
     if dialog.get("stage") == store.STAGE_CLOSED:
         return
+    if dialog.get("stage") == store.STAGE_FIRST_DM_SENDING:
+        # A real incoming reply proves the prepared First DM reached Telegram,
+        # even if the process crashed before committing the SQLite transaction.
+        if not first_dm_delivery.confirm_from_incoming(target_user_id, account_user_id):
+            logger.error(
+                "Cannot confirm provisional First DM from incoming reply account={} target={}",
+                account_user_id,
+                target_user_id,
+            )
+            return
+        dialog = store.get_dialog(target_user_id)
+        if not dialog:
+            logger.error("Confirmed First DM but dialog missing target={}", target_user_id)
+            return
+    # A scheduled link/follow-up may have been accepted by Telegram just before a
+    # crash. Reconcile it before generating another reply, otherwise the dialog
+    # could advance twice.
+    for action_kind in (
+        dialog_delivery.KIND_AUTO_LINK,
+        dialog_delivery.KIND_FOLLOWUP,
+    ):
+        prepared_action = dialog_delivery.get_prepared(target_user_id, action_kind)
+        if prepared_action is not None:
+            reconciled = await _reconcile_prepared_action(prepared_action)
+            if not reconciled:
+                return
+            dialog = store.get_dialog(target_user_id)
+            if not dialog or dialog.get("stage") == store.STAGE_CLOSED:
+                return
+
     if opt_out_svc.is_opted_out(target_user_id):
-        store.set_stage(target_user_id, store.STAGE_CLOSED, clear_auto_link=True)
-        store.mark_contact_completed(target_user_id)
+        store.close_for_opt_out(target_user_id)
+        await _cleanup_disabled_account(account_user_id)
         return
 
     store.append_history(target_user_id, "user", text)
@@ -181,7 +224,11 @@ async def _handle_incoming_private_body(
         history = (store.get_dialog(target_user_id) or {}).get("history") or []
         # User asks for link explicitly → wrap with link
         if ai_dialog.is_link_request(text):
-            reply = await ai_dialog.generate_link_wrap(history)
+            try:
+                reply = await ai_dialog.generate_link_wrap(history)
+            except ai_dialog.ChannelLinkNotConfiguredError as exc:
+                logger.error("Exact CHANNEL_LINK unavailable target={}: {}", target_user_id, exc)
+                return
             ok = await _send_private(account_user_id, target_user_id, reply)
             if not ok:
                 return
@@ -223,14 +270,17 @@ async def _handle_incoming_private_body(
         await asyncio.sleep(_delay_reply())
         history = (store.get_dialog(target_user_id) or {}).get("history") or []
         link_already = bool(dialog.get("link_sent"))
-        reply = await ai_dialog.generate_contextual_reply(
-            history, include_link=not link_already
-        )
-        from config import CHANNEL_LINK
-
-        # Ensure link is in the text BEFORE send when we still need it.
-        if (not link_already) and CHANNEL_LINK and CHANNEL_LINK not in (reply or ""):
-            reply = f"{(reply or '').rstrip()}\n{CHANNEL_LINK}"
+        try:
+            reply = await ai_dialog.generate_contextual_reply(
+                history, include_link=not link_already
+            )
+        except ai_dialog.ChannelLinkNotConfiguredError as exc:
+            logger.error("Exact CHANNEL_LINK unavailable target={}: {}", target_user_id, exc)
+            if not link_already:
+                store.set_stage(
+                    target_user_id, store.STAGE_EXPLAINED, auto_link_at=_link_retry_at()
+                )
+            return
 
         ok = await _send_private(account_user_id, target_user_id, reply)
         if not ok:
@@ -244,7 +294,7 @@ async def _handle_incoming_private_body(
                 )
             return
 
-        link_now = bool(CHANNEL_LINK and CHANNEL_LINK in (reply or ""))
+        link_now = (not link_already)
         store.append_history(target_user_id, "assistant", reply)
 
         if link_now:
@@ -267,8 +317,9 @@ async def _handle_incoming_private_body(
             )
         d2 = store.get_dialog(target_user_id)
         if d2 and int(d2.get("outgoing_count") or 0) >= store.MAX_OUTGOING:
-            store.set_stage(target_user_id, store.STAGE_CLOSED)
+            store.set_stage(target_user_id, store.STAGE_CLOSED, clear_auto_link=True)
             store.mark_contact_completed(target_user_id)
+            await _cleanup_disabled_account(account_user_id)
         return
 
     if stage == store.STAGE_LINK_SENT:
@@ -300,12 +351,166 @@ async def _handle_incoming_private_body(
         return
 
 
-async def process_due_auto_links() -> int:
-    """Send link messages for explained dialogs past auto_link_at."""
-    from services import runtime as runtime_svc
+def _normalize_message_text(value: str | None) -> str:
+    return (value or "").replace("\r\n", "\n").strip()
 
-    if not runtime_svc.is_worker_enabled():
-        return 0
+
+async def _send_prepared_action(
+    account_user_id: int,
+    target_user_id: int,
+    action_kind: str,
+    text: str,
+) -> str:
+    """Return sent | failed | ambiguous after a durable prepare."""
+    client = monitor_svc.get_client(account_user_id)
+    if client is None or not client.is_connected():
+        dialog_delivery.mark_failed(target_user_id, action_kind, "client_unavailable")
+        return "failed"
+    try:
+        entity = await client.get_input_entity(int(target_user_id))
+        message = await client.send_message(entity, text)
+        sent_at = getattr(message, "date", None)
+        if sent_at is not None and sent_at.tzinfo is None:
+            sent_at = sent_at.replace(tzinfo=dt.timezone.utc)
+        committed = dialog_delivery.commit_sent(
+            target_user_id,
+            action_kind,
+            telegram_message_id=getattr(message, "id", None),
+            sent_at=(sent_at or _now()).isoformat(),
+        )
+        if not committed:
+            logger.error(
+                "Telegram accepted scheduled message but DB commit failed kind={} "
+                "account={} target={}",
+                action_kind,
+                account_user_id,
+                target_user_id,
+            )
+            return "ambiguous"
+        return "sent"
+    except FloodWaitError as exc:
+        seconds = int(getattr(exc, "seconds", 60) or 60)
+        pacing.apply_floodwait(account_user_id, seconds)
+        dialog_delivery.mark_failed(target_user_id, action_kind, f"FloodWait:{seconds}")
+        return "failed"
+    except PeerFloodError:
+        try:
+            from services import spambot as spambot_svc
+
+            await spambot_svc.on_peer_flood(account_user_id)
+        except Exception as sp_exc:
+            logger.exception("SpamBot from scheduled dialog: {}", sp_exc)
+            pacing.set_paused(account_user_id, "PeerFlood", paused=True)
+        dialog_delivery.mark_failed(target_user_id, action_kind, "PeerFlood")
+        return "failed"
+    except (UserPrivacyRestrictedError, UserIsBlockedError, ChatWriteForbiddenError):
+        dialog_delivery.mark_failed(target_user_id, action_kind, "privacy_or_blocked")
+        store.set_stage(target_user_id, store.STAGE_CLOSED, clear_auto_link=True)
+        store.mark_contact_completed(target_user_id)
+        await _cleanup_disabled_account(account_user_id)
+        return "failed"
+    except Exception as exc:
+        # Telegram may have accepted the message even when the network response was
+        # lost. Keep PREPARED and reconcile against real chat history before retry.
+        logger.exception(
+            "Scheduled send ambiguous kind={} account={} target={}: {}",
+            action_kind,
+            account_user_id,
+            target_user_id,
+            exc,
+        )
+        return "ambiguous"
+
+
+async def _reconcile_prepared_action(row: dict) -> bool:
+    target = int(row["target_user_id"])
+    account = int(row["account_user_id"])
+    kind = str(row["action_kind"])
+    client = monitor_svc.get_client(account)
+    if client is None or not client.is_connected():
+        return False
+    try:
+        entity = await client.get_input_entity(target)
+        messages = await client.get_messages(entity, limit=40)
+    except Exception as exc:
+        logger.exception(
+            "Cannot inspect scheduled Telegram history kind={} account={} target={}: {}",
+            kind,
+            account,
+            target,
+            exc,
+        )
+        return False
+
+    expected = _normalize_message_text(row.get("text"))
+    prepared_at = pacing._parse_iso(row.get("prepared_at"))
+    lower_bound = prepared_at - dt.timedelta(minutes=2) if prepared_at else None
+    found = None
+    for message in messages or []:
+        if not bool(getattr(message, "out", False)):
+            continue
+        if _normalize_message_text(getattr(message, "message", None)) != expected:
+            continue
+        message_date = getattr(message, "date", None)
+        if message_date is not None and message_date.tzinfo is None:
+            message_date = message_date.replace(tzinfo=dt.timezone.utc)
+        if lower_bound is not None and message_date is not None and message_date < lower_bound:
+            continue
+        found = message
+        break
+
+    if found is not None:
+        dialog_delivery.commit_sent(
+            target,
+            kind,
+            telegram_message_id=getattr(found, "id", None),
+            sent_at=(getattr(found, "date", None) or _now()).isoformat(),
+        )
+        if kind == dialog_delivery.KIND_AUTO_LINK:
+            phrases_svc.remember(phrases_svc.KIND_LINK, str(row.get("text") or ""))
+        logger.warning(
+            "Recovered scheduled message from Telegram kind={} account={} target={} msg_id={}",
+            kind,
+            account,
+            target,
+            getattr(found, "id", None),
+        )
+        return True
+
+    dialog_delivery.mark_failed(target, kind, "telegram_history_no_match")
+    if kind == dialog_delivery.KIND_AUTO_LINK:
+        store.set_stage(
+            target,
+            store.STAGE_EXPLAINED,
+            auto_link_at=(_now() + dt.timedelta(minutes=5)).isoformat(),
+        )
+    else:
+        store.set_stage(
+            target,
+            store.STAGE_WAITING_REPLY,
+            auto_link_at=(_now() + dt.timedelta(hours=2)).isoformat(),
+        )
+    logger.warning(
+        "Prepared scheduled message not found; rescheduled kind={} account={} target={}",
+        kind,
+        account,
+        target,
+    )
+    return True
+
+
+async def recover_ambiguous_scheduled_messages() -> int:
+    recovered = 0
+    rows = dialog_delivery.list_stale_prepared(older_than_seconds=90, limit=20)
+    for row in rows:
+        if await _reconcile_prepared_action(row):
+            recovered += 1
+    return recovered
+
+
+async def process_due_auto_links() -> int:
+    """Send crash-safe automatic link messages for due explained dialogs."""
+    # Main-menu pause stops only new First DM. Existing dialogs continue.
     due = store.list_due_auto_links()
     n = 0
     for d in due:
@@ -313,49 +518,62 @@ async def process_due_auto_links() -> int:
         account = int(d["account_user_id"])
         if int(d.get("link_sent") or 0):
             continue
+        if opt_out_svc.is_opted_out(target):
+            store.close_for_opt_out(target)
+            await _cleanup_disabled_account(account)
+            continue
         key = (account, target)
         if key in _inflight:
             continue
         _inflight.add(key)
         try:
             history = d.get("history") or []
-            text = await ai_dialog.generate_link_wrap(history)
-            ok = await _send_private(account, target, text)
-            if not ok:
-                later = (_now() + dt.timedelta(minutes=5)).isoformat()
-                store.set_stage(target, store.STAGE_EXPLAINED, auto_link_at=later)
+            try:
+                text = await ai_dialog.generate_link_wrap(history)
+            except ai_dialog.ChannelLinkNotConfiguredError as exc:
+                logger.error("Auto-link blocked: exact CHANNEL_LINK unavailable: {}", exc)
+                store.set_stage(target, store.STAGE_EXPLAINED, auto_link_at=_link_retry_at())
                 continue
-            phrases_svc.remember(phrases_svc.KIND_LINK, text)
-            store.append_history(target, "assistant", text)
-            store.set_stage(
-                target,
-                store.STAGE_LINK_SENT,
-                bump_outgoing=True,
-                link_sent=True,
-                clear_auto_link=True,
+            if not dialog_delivery.prepare(
+                target, account, dialog_delivery.KIND_AUTO_LINK, text
+            ):
+                continue
+            result = await _send_prepared_action(
+                account, target, dialog_delivery.KIND_AUTO_LINK, text
             )
-            n += 1
-            logger.info("Auto-link sent target={} account={}", target, account)
+            if result == "sent":
+                phrases_svc.remember(phrases_svc.KIND_LINK, text)
+                n += 1
+                logger.info("Auto-link sent target={} account={}", target, account)
+            elif result == "failed":
+                current = store.get_dialog(target)
+                if current and current.get("stage") != store.STAGE_CLOSED:
+                    store.set_stage(
+                        target,
+                        store.STAGE_EXPLAINED,
+                        auto_link_at=(_now() + dt.timedelta(minutes=5)).isoformat(),
+                    )
         finally:
             _inflight.discard(key)
     return n
 
 
 async def process_due_followups() -> int:
-    """After ~24h silence on first DM: one soft apology, no channel/link."""
-    from services import runtime as runtime_svc
-
-    if not runtime_svc.is_worker_enabled():
-        return 0
+    """Send one crash-safe silence follow-up after the First DM."""
     due = store.list_due_followups()
     n = 0
     for d in due:
         target = int(d["target_user_id"])
         account = int(d["account_user_id"])
         outgoing = int(d.get("outgoing_count") or 0)
+        if opt_out_svc.is_opted_out(target):
+            store.close_for_opt_out(target)
+            await _cleanup_disabled_account(account)
+            continue
         if outgoing >= store.MAX_OUTGOING:
             store.set_stage(target, store.STAGE_CLOSED, clear_auto_link=True)
             store.mark_contact_completed(target)
+            await _cleanup_disabled_account(account)
             continue
         key = (account, target)
         if key in _inflight:
@@ -363,23 +581,24 @@ async def process_due_followups() -> int:
         _inflight.add(key)
         try:
             text = ai_dialog.followup_silence_text()
-            ok = await _send_private(account, target, text)
-            if not ok:
-                # retry later (+2h)
-                later = (_now() + dt.timedelta(hours=2)).isoformat()
-                store.set_stage(
-                    target, store.STAGE_WAITING_REPLY, auto_link_at=later
-                )
+            if not dialog_delivery.prepare(
+                target, account, dialog_delivery.KIND_FOLLOWUP, text
+            ):
                 continue
-            store.append_history(target, "assistant", text)
-            store.set_stage(
-                target,
-                store.STAGE_FOLLOWUP_SENT,
-                bump_outgoing=True,
-                clear_auto_link=True,
+            result = await _send_prepared_action(
+                account, target, dialog_delivery.KIND_FOLLOWUP, text
             )
-            n += 1
-            logger.info("Silence follow-up sent target={} account={}", target, account)
+            if result == "sent":
+                n += 1
+                logger.info("Silence follow-up sent target={} account={}", target, account)
+            elif result == "failed":
+                current = store.get_dialog(target)
+                if current and current.get("stage") != store.STAGE_CLOSED:
+                    store.set_stage(
+                        target,
+                        store.STAGE_WAITING_REPLY,
+                        auto_link_at=(_now() + dt.timedelta(hours=2)).isoformat(),
+                    )
         finally:
             _inflight.discard(key)
     return n
@@ -405,6 +624,7 @@ async def _send_and_close(
             reason,
         )
     # Always stop our side; hard-stop still opts out even if apology failed to send.
+    dialog_delivery.clear_for_target(target_user_id)
     store.set_stage(
         target_user_id,
         store.STAGE_CLOSED,
@@ -415,6 +635,7 @@ async def _send_and_close(
     if opt_out:
         opt_out_svc.add(target_user_id, reason)
         logger.info("Opt-out target={} reason={}", target_user_id, reason)
+    await _cleanup_disabled_account(account_user_id)
 
 
 async def _send_private(account_user_id: int, target_user_id: int, text: str) -> bool:
@@ -456,6 +677,7 @@ async def _send_private(account_user_id: int, target_user_id: int, text: str) ->
         )
         store.set_stage(target_user_id, store.STAGE_CLOSED, clear_auto_link=True)
         store.mark_contact_completed(target_user_id)
+        await _cleanup_disabled_account(account_user_id)
         return False
     except Exception as exc:
         logger.exception(

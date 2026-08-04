@@ -22,6 +22,8 @@ from config import (
     DM_GLOBAL_SPACING_MIN,
     OPENAI_API_KEY,
     SPAMBOT_AUTO_RESUME,
+    TELEGRAM_DIALOG_DELETE_DAYS,
+    LOCAL_DIALOG_TEXT_RETENTION_DAYS,
     bot,
     is_admin,
 )
@@ -49,19 +51,18 @@ from services.ui import (
 def _main_menu_buttons():
     from services import dispatcher as dispatcher_svc
 
-    st = dispatcher_svc.worker_status()
-    running = bool(st.get("enabled"))
+    running = bool(dispatcher_svc.worker_status().get("enabled"))
     toggle = (
-        btn("⏸ Пауза", b"bc_toggle")
+        btn("⏸ ПАУЗА FIRST DM", b"bc_toggle")
         if running
-        else btn("▶️ Запустить", b"bc_toggle")
+        else btn("▶️ ЗАПУСТИТЬ FIRST DM", b"bc_toggle")
     )
     return [
-        [toggle, btn("🔄 Обновить", b"menu_refresh")],
-        [btn("📊 Статус", b"bc_status")],
-        [btn("👤 Аккаунты", b"menu_accounts"), btn("📬 Очередь", b"bc_queue")],
-        [btn("📁 База", b"menu_audience"), btn("🚫 Opt-out", b"menu_optout")],
-        [btn("⚙️ Настройки", b"menu_settings"), btn("ℹ️ Помощь", b"menu_help")],
+        [toggle, btn("🔄 ОБНОВИТЬ", b"menu_refresh")],
+        [btn("👤 АККАУНТЫ", b"menu_accounts"), btn("💬 ДИАЛОГИ", b"menu_dialogs")],
+        [btn("📬 ОЧЕРЕДЬ", b"bc_queue"), btn("📁 БАЗА ЛЮДЕЙ", b"menu_audience")],
+        [btn("🚫 НЕ ПИСАТЬ", b"menu_optout"), btn("📊 СТАТИСТИКА", b"bc_status")],
+        [btn("⚙️ НАСТРОЙКИ", b"menu_settings"), btn("ℹ️ ПОМОЩЬ", b"menu_help")],
     ]
 
 
@@ -69,73 +70,71 @@ def _dashboard_text() -> str:
     from services import accounts as accounts_svc
     from services import dialog_store as dialog_store_svc
     from services import dispatcher as dispatcher_svc
-    from services import audience as audience_svc
-    from services import opt_out as opt_out_svc
+    from services import monitor as monitor_svc
     from services import queue as queue_svc
-    from services import runtime as runtime_svc
 
     wst = dispatcher_svc.worker_status()
-    if wst.get("enabled") and wst.get("loop_running"):
-        w_line = f"{ON} Рассылка работает"
-    elif wst.get("enabled"):
-        w_line = f"{WAIT} Очередь на паузе (диалоги идут)"
+    running = bool(wst.get("enabled") and wst.get("loop_running"))
+    if running:
+        status_title = "🟢 **FIRST DM РАБОТАЮТ**"
+        status_hint = "Новые сообщения отправляются\nАктивные диалоги продолжаются всегда"
     else:
-        w_line = f"{OFF} Очередь на паузе · диалоги идут"
-
-    wait = float(wst.get("global_wait_sec") or 0)
-    wait_txt = f"~{int(wait)}с" if wait else "сейчас"
+        status_title = "⏸ **FIRST DM НА ПАУЗЕ**"
+        status_hint = "Новые сообщения из очереди не отправляются\nАктивные диалоги продолжаются всегда"
 
     pending = queue_svc.count_by_status(queue_svc.STATUS_PENDING)
     claimed = queue_svc.count_by_status(queue_svc.STATUS_CLAIMED)
     first_today = queue_svc.count_first_dm_today()
+    first_total = queue_svc.count_first_dm_total()
     dialogs = dialog_store_svc.count_active()
-    optouts = opt_out_svc.count()
-    audience_n = audience_svc.count()
-
-    link = CHANNEL_LINK or "не задана"
-    # show full invite link if fits; Telegram allows long messages
-    if len(link) > 48:
-        link_show = link[:45] + "…"
-    else:
-        link_show = link
-
-    if AI_DM_ENABLED and OPENAI_API_KEY:
-        ai_line = f"{ON} AI · `{AI_MODEL}`"
-    elif AI_DM_ENABLED:
-        ai_line = f"{WAIT} AI без ключа · шаблоны"
-    else:
-        ai_line = f"{OFF} AI выкл"
-
-    pf = runtime_svc.format_peer_flood_range()
+    waiting_reply = dialog_store_svc.count_by_stage(
+        dialog_store_svc.STAGE_WAITING_REPLY,
+        dialog_store_svc.STAGE_FOLLOWUP_SENT,
+    )
+    closed_today = dialog_store_svc.count_closed_today()
+    account_count = accounts_svc.count_accounts()
     acc_block = accounts_svc.dashboard_accounts_block(limit=8)
 
-    queue_block = tree(
-        [
-            ("⏳", "ждут", pending),
-            ("🔄", "в работе", claimed),
-            ("✅", "сегодня", first_today),
-        ]
+    if CHANNEL_LINK:
+        link_line = "🔗 Канал: ✅ настроен"
+    else:
+        link_line = "🔗 Канал: ❌ не настроен"
+    if AI_DM_ENABLED and OPENAI_API_KEY:
+        ai_line = "🤖 AI: ✅ работает"
+    elif AI_DM_ENABLED:
+        ai_line = "🤖 AI: 🟡 локальные шаблоны"
+    else:
+        ai_line = "🤖 AI: 🔴 выключен"
+    mon = monitor_svc.monitor_status()
+    monitor_line = (
+        f"📡 Мониторинг: ✅ активен · {mon['connected_count']} акк."
+        if mon.get("running")
+        else "📡 Мониторинг: ❌ остановлен"
     )
 
     return join(
-        f"✨ **Channel DM Bot · v{app_version()}**",
+        f"✨ **CHANNEL DM BOT · v{app_version()}**",
         DIV,
-        w_line,
-        f"⏳ До след. DM {wait_txt}",
-        "📬 Очередь",
-        queue_block,
+        status_title,
+        status_hint,
+        "",
+        "📬 **ОЧЕРЕДЬ**",
+        f"├ Ждут сообщения: **{pending}**",
+        f"├ Сейчас отправляется: **{claimed}**",
+        f"├ Отправлено сегодня: **{first_today}**",
+        f"└ Отправлено всего: **{first_total}**",
         DIV,
-        "👤 Аккаунты",
+        f"👤 **АККАУНТЫ · {account_count}**",
         acc_block,
         DIV,
-        f"💬 Диалоги: {dialogs}",
-        f"📁 База: {audience_n}",
-        f"🚫 Opt-out: {optouts}",
-        f"🔗 {link_show}",
-        ai_line,
-        f"⚠️ PeerFlood {pf}",
+        "💬 **ДИАЛОГИ**",
+        f"├ Активные: **{dialogs}**",
+        f"├ Ждут ответа: **{waiting_reply}**",
+        f"└ Завершено сегодня: **{closed_today}**",
         DIV,
-        "Таймер паузы · 🔄 Обновить",
+        link_line,
+        ai_line,
+        monitor_line,
     )
 
 
@@ -208,6 +207,7 @@ def _settings_buttons():
         [btn("⚠️ После PeerFlood", b"bc_peerflood")],
         [btn("🔗 Канал", b"bc_link")],
         [btn("🤖 AI", b"menu_ai")],
+        [btn("🗑 Хранение и удаление", b"bc_retention")],
         back_home_row(),
     ]
 
@@ -236,6 +236,7 @@ async def cb_settings(event: events.CallbackQuery.Event) -> None:
             kv("После PeerFlood", pf, icon="⚠️"),
             kv("AI", ai, icon="🤖"),
             f"🔗 `{link_short}`",
+            f"🗑 Telegram {TELEGRAM_DIALOG_DELETE_DAYS}д · база {LOCAL_DIALOG_TEXT_RETENTION_DAYS}д",
         ),
     )
     await render_menu(event, text, _settings_buttons())
@@ -262,6 +263,7 @@ def _status_text() -> str:
     cancelled = queue_svc.count_by_status(queue_svc.STATUS_CANCELLED)
     dialog_active = dialog_store_svc.count_active()
     first_dm_today = queue_svc.count_first_dm_today()
+    first_dm_total = queue_svc.count_first_dm_total()
     optouts = opt_out_svc.count()
     wst = dispatcher_svc.worker_status()
     if wst["enabled"] and wst["loop_running"]:
@@ -287,8 +289,9 @@ def _status_text() -> str:
         ),
         join(
             kv("Диалоги", str(dialog_active), icon="💬"),
-            kv("Сегодня first DM", str(first_dm_today), icon="📨"),
-            kv("Opt-out", str(optouts), icon="🚫"),
+            kv("First DM сегодня", str(first_dm_today), icon="📨"),
+            kv("First DM всего", str(first_dm_total), icon="📊"),
+            kv("Не писать", str(optouts), icon="🚫"),
         ),
         join(
             f"🔗 `{link}`",
@@ -510,7 +513,7 @@ async def on_pacing_edit(event: events.NewMessage.Event) -> None:
                 msg = f"Ссылка: **{lo}–{hi} сек**"
             else:
                 raise ValueError("bad step")
-    except Exception:
+    except (TypeError, ValueError):
         await event.respond(
             notice("warn", "Неверный формат. Смотри пример на экране или /cancel")
         )
@@ -675,6 +678,39 @@ async def on_peerflood_custom(event: events.NewMessage.Event) -> None:
     )
 
 
+@bot.on(events.CallbackQuery(data=b"bc_retention"))
+async def cb_retention(event: events.CallbackQuery.Event) -> None:
+    if not is_admin(event.sender_id):
+        await event.answer(DENIED, alert=True)
+        return
+    from services import retention as retention_svc
+
+    stats = retention_svc.retention_stats()
+    text = screen(
+        "🗑",
+        "Хранение и удаление",
+        join(
+            f"📱 Telegram: удалить через **{TELEGRAM_DIALOG_DELETE_DAYS} дней**",
+            "└ С First DM и до конца диалога · у обеих сторон",
+            "",
+            f"🧠 База бота: очистить тексты через **{LOCAL_DIALOG_TEXT_RETENTION_DAYS} дней**",
+            "└ Статусы, статистика и «Не писать» сохраняются",
+        ),
+        join(
+            f"⏳ Ждут удаления в Telegram: **{stats['telegram_pending']}**",
+            f"⚠️ Уже готовы к удалению: **{stats['telegram_due']}**",
+            f"🧹 Ждут очистки текста: **{stats['local_pending']}**",
+        ),
+        "Если аккаунт временно недоступен, бот повторит удаление позже.",
+    )
+    await render_menu(
+        event,
+        text,
+        [[btn("🔄 Обновить", b"bc_retention")], back_row(b"menu_settings"), back_home_row()],
+    )
+    await event.answer()
+
+
 @bot.on(events.CallbackQuery(data=b"bc_link"))
 async def cb_bc_link(event: events.CallbackQuery.Event) -> None:
     if not is_admin(event.sender_id):
@@ -777,7 +813,7 @@ async def cb_help(event: events.CallbackQuery.Event) -> None:
         ),
         join(
             "На главном экране — живые цифры очереди.",
-            "Пауза: только first DM из очереди. Диалоги с ответившими продолжаются.",
+            "Пауза останавливает только новые First DM. Активные диалоги продолжаются.",
         ),
     )
     await render_menu(event, text, [back_home_row()])

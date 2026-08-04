@@ -61,21 +61,31 @@ async def _disconnect_client(client: TelegramClient | None) -> None:
 async def show_accounts_menu(event, *, edit: bool = True) -> None:
     total = accounts_svc.count_accounts()
     active = accounts_svc.count_participating()
+    rows = accounts_svc.list_accounts()
+    paused = sum(1 for row in rows if row.get("is_paused"))
+    finishing = sum(
+        1
+        for row in rows
+        if not row.get("participates")
+        and accounts_svc.dashboard_account_line(row).find("завершает") >= 0
+    )
     text = screen(
         "👤",
         "Аккаунты",
         join(
-            kv("Всего", str(total)),
-            kv("Участвуют", str(active), icon=ON),
+            f"├ Всего подключено: **{total}**",
+            f"├ First DM включены: **{active}**",
+            f"├ Ограничены Telegram: **{paused}**",
+            f"└ Завершают диалоги: **{finishing}**",
         ),
-        "Добавь user-аккаунт и включи участие.",
+        "🟢 работает · 🟡 отключён от новых First DM · 🔴 ограничен Telegram",
     )
     await render_menu(
         event,
         text,
         [
-            [btn("➕ Добавить аккаунт", b"acc_add")],
-            [btn("📋 Список аккаунтов", b"acc_list")],
+            [btn("➕ ДОБАВИТЬ АККАУНТ", b"acc_add")],
+            [btn("📋 ОТКРЫТЬ СПИСОК", b"acc_list")],
             back_home_row(),
         ],
         edit=edit,
@@ -87,9 +97,9 @@ async def show_account_list(event, *, edit: bool = True) -> None:
     if not rows:
         await render_menu(
             event,
-            screen("📋", "Список аккаунтов", "Пока пусто. Нажми «Добавить аккаунт»."),
+            screen("📋", "Список аккаунтов", "Аккаунты ещё не добавлены."),
             [
-                [Button.inline("➕ Добавить аккаунт", b"acc_add")],
+                [Button.inline("➕ ДОБАВИТЬ АККАУНТ", b"acc_add")],
                 back_row(b"menu_accounts"),
                 back_home_row(),
             ],
@@ -97,23 +107,26 @@ async def show_account_list(event, *, edit: bool = True) -> None:
         )
         return
 
-    lines = [screen("📋", "Список аккаунтов", "")]
+    body = "\n\n".join(accounts_svc.dashboard_account_line(acc) for acc in rows)
     buttons: list[list[Button]] = []
     for acc in rows:
-        label = accounts_svc.format_account_label(acc)
-        status = accounts_svc.account_status_line(acc)
-        icon = ON if acc.get("participates") and not acc.get("is_paused") else OFF
-        lines.append(f"{icon} `{acc['user_id']}` | {label}\n{status}")
+        if acc.get("is_paused"):
+            icon = "🔴"
+        elif acc.get("participates"):
+            icon = "🟢"
+        else:
+            icon = "🟡"
         short = accounts_svc.format_account_label(acc, include_id=False)[:28]
-        buttons.append(
-            [
-                btn(f"{icon} {short}", f"acc_card_{acc['user_id']}")
-            ]
-        )
-    buttons.append([btn("➕ Добавить", b"acc_add")])
+        buttons.append([btn(f"{icon} {short}", f"acc_card_{acc['user_id']}")])
+    buttons.append([btn("➕ ДОБАВИТЬ АККАУНТ", b"acc_add")])
     buttons.append(back_row(b"menu_accounts"))
     buttons.append(back_home_row())
-    await render_menu(event, "\n\n".join(lines), buttons, edit=edit)
+    await render_menu(
+        event,
+        screen("📋", "Список аккаунтов", body),
+        buttons,
+        edit=edit,
+    )
 
 
 async def show_account_card(event, user_id: int, *, edit: bool = True) -> None:
@@ -131,9 +144,9 @@ async def show_account_card(event, user_id: int, *, edit: bool = True) -> None:
     status = accounts_svc.account_status_line(acc)
     phone = (acc.get("phone") or "").strip() or "не указан"
     toggle_label = (
-        "⏸ Выключить участие"
+        "⏸ ОТКЛЮЧИТЬ FIRST DM"
         if acc.get("participates")
-        else "▶️ Включить участие"
+        else "▶️ ВКЛЮЧИТЬ FIRST DM"
     )
     from services import chats as chats_svc
 
@@ -159,31 +172,47 @@ async def show_account_card(event, user_id: int, *, edit: bool = True) -> None:
     cooldown = (acc.get("cooldown_until") or "")[:19] or "-"
     mon_icon = ON if connected else OFF
     sb_block = f"Ответ: {sb_reply}" if sb_reply else ""
+    from services import dialog_store as dialog_store_svc
+    active_dialogs = dialog_store_svc.count_open_for_account(user_id)
+    if acc.get("is_paused"):
+        state_line = f"🔴 Ограничен: **{acc.get('pause_reason') or 'пауза'}**"
+    elif acc.get("participates"):
+        state_line = "🟢 Состояние: **работает**"
+    elif active_dialogs:
+        state_line = "🟡 Состояние: **завершает активные диалоги**"
+    else:
+        state_line = "🟡 Состояние: **First DM отключены**"
+
     text = screen(
         "👤",
-        "Аккаунт",
+        label,
         join(
-            f"**{label}**",
-            f"ID: `{acc['user_id']}`",
-            f"Телефон: `{phone}`",
-            f"Статус: {status}",
-            kv("Монитор", mon_line, icon=mon_icon),
-            kv("Задержка DM", accounts_svc.format_dm_interval(acc), icon="⏱"),
-            *( [f"🔁 PeerFlood цикл: **{int(acc.get('peerflood_streak') or 0)}**"] if int(acc.get("peerflood_streak") or 0) else [] ),
-            f"Cooldown: `{cooldown}`",
-            f"SpamBot: **{sb_status}** · next `{sb_next}`",
-            sb_block,
-            kv("Чаты", f"{mode_label} · найдено {discovered_n} · монитор {watchable}"),
-            f"Добавлен: {(acc.get('created_at') or '')[:19]}",
+            state_line,
+            f"📨 First DM: **{'включены' if acc.get('participates') else 'отключены'}**",
+            f"💬 Активных диалогов: **{active_dialogs}**",
+            f"📡 Мониторинг: **{mon_line}**",
+        ),
+        join(
+            f"⏱ Интервал First DM: **{accounts_svc.format_dm_interval(acc)}**",
+            f"📍 Чаты: **{mode_label} · {watchable} в мониторинге**",
+            f"🤖 SpamBot: **{sb_status}**",
+            *( [f"⏳ Ограничение до: `{cooldown}`"] if cooldown != "-" else [] ),
+            *( [f"🔄 Следующая проверка: `{sb_next}`"] if sb_next != "-" else [] ),
+            *( [sb_block] if sb_block else [] ),
+        ),
+        join(
+            f"🆔 ID: `{acc['user_id']}`",
+            f"📱 Телефон: `{phone}`",
+            f"📅 Добавлен: `{(acc.get('created_at') or '')[:19]}`",
         ),
     )
     buttons = [
         [btn(toggle_label, f"acc_toggle_{user_id}")],
-        [btn("⏱ Задержка DM", f"acc_delay_{user_id}")],
-        [btn("💬 Чаты", f"acc_chats_{user_id}")],
-        [btn("🤖 Проверить @SpamBot", f"acc_spambot_{user_id}")],
-        [btn("▶️ Снять паузу", f"acc_unpause_{user_id}")],
-        [btn("🗑 Удалить", f"acc_del_ask_{user_id}")],
+        [btn("⏱ ИНТЕРВАЛ FIRST DM", f"acc_delay_{user_id}")],
+        [btn("📡 ГРУППЫ", f"acc_chats_{user_id}")],
+        [btn("🤖 ПРОВЕРИТЬ SPAMBOT", f"acc_spambot_{user_id}")],
+        [btn("▶️ СНЯТЬ ПАУЗУ", f"acc_unpause_{user_id}")],
+        [btn("🗑 УДАЛИТЬ АККАУНТ", f"acc_del_ask_{user_id}")],
         back_row(b"acc_list"),
         back_home_row(),
     ]
@@ -258,13 +287,25 @@ async def cb_acc_del_ask(event: events.CallbackQuery.Event) -> None:
         await event.answer("Не найден", alert=True)
         return
     label = accounts_svc.format_account_label(acc)
+    from services import retention as retention_svc
+
+    pending_cleanup = retention_svc.count_pending_for_account(user_id)
+    blocks = [
+        f"👤 **{label}**",
+        "Сессия будет удалена из бота и аккаунт сразу отключится.",
+        "История и статистика останутся в базе как неактивные записи.",
+    ]
+    if pending_cleanup:
+        blocks.append(
+            f"⚠️ Ожидают удаления в Telegram: **{pending_cleanup}** диалогов.\n"
+            "После удаления сессии бот уже не сможет очистить их у обеих сторон."
+        )
     await render_menu(
         event,
-        f"**🗑 Удалить аккаунт?**\n\n{label}\n\n"
-        "Сессия будет удалена из бота. Очередь/диалоги затронем в следующих шагах.",
+        screen("🗑", "Удалить аккаунт?", *blocks),
         [
-            [Button.inline("✅ Да, удалить", f"acc_del_yes_{user_id}".encode())],
-            [Button.inline("❌ Отмена", f"acc_card_{user_id}".encode())],
+            [Button.inline("✅ ДА, УДАЛИТЬ", f"acc_del_yes_{user_id}".encode())],
+            [Button.inline("❌ ОТМЕНА", f"acc_card_{user_id}".encode())],
         ],
     )
     await event.answer()
@@ -276,8 +317,18 @@ async def cb_acc_del_yes(event: events.CallbackQuery.Event) -> None:
         await event.answer(DENIED, alert=True)
         return
     user_id = int(event.pattern_match.group(1))
+    try:
+        from services import monitor as monitor_svc
+        await monitor_svc.disconnect_account(user_id, cancel_tasks=True)
+    except Exception as exc:
+        logger.warning("disconnect before account delete: {}", exc)
     ok = accounts_svc.delete_account(user_id)
     if ok:
+        try:
+            from services import monitor as monitor_svc
+            await monitor_svc.refresh_monitor()
+        except Exception as exc:
+            logger.warning("monitor refresh after delete: {}", exc)
         await event.answer("Удалён")
         await show_account_list(event)
     else:
@@ -516,8 +567,8 @@ async def cb_acc_spambot(event: events.CallbackQuery.Event) -> None:
     await show_account_card(event, user_id)
     try:
         await event.answer(str(result.get("result") or "done")[:20])
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Second callback answer ignored: {}", exc)
 
 
 @bot.on(events.CallbackQuery(pattern=rb"^acc_unpause_(\d+)$"))

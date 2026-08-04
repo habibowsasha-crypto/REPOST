@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from loguru import logger
 from telethon import Button, events
 
 from config import bot, is_admin
@@ -153,8 +154,8 @@ async def cb_chat_mode(event: events.CallbackQuery.Event) -> None:
     try:
         from services import monitor as monitor_svc
         await monitor_svc.refresh_monitor()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Monitor refresh after chat mode change failed: {}", exc)
     await event.answer(_mode_label(mode))
 
 
@@ -186,6 +187,7 @@ async def cb_chat_refresh(event: events.CallbackQuery.Event) -> None:
         )
         return
     except Exception as exc:
+        logger.exception("Chat discovery refresh failed account={}: {}", account_user_id, exc)
         await render_menu(
             event,
             screen("⚠️", "Обновление групп", f"Не удалось: `{type(exc).__name__}`"),
@@ -200,13 +202,13 @@ async def cb_chat_refresh(event: events.CallbackQuery.Event) -> None:
     try:
         from services import monitor as monitor_svc
         await monitor_svc.refresh_monitor()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Monitor refresh after chat discovery failed: {}", exc)
     # Second answer not always allowed; ignore if already answered.
     try:
         await event.answer(f"Найдено: {count}")
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Second chat refresh callback answer ignored: {}", exc)
 
 
 @bot.on(events.CallbackQuery(pattern=rb"^chat_sel_(\d+)_(-?\d+)_(\d+)$"))
@@ -222,8 +224,8 @@ async def cb_chat_sel(event: events.CallbackQuery.Event) -> None:
     try:
         from services import monitor as monitor_svc
         await monitor_svc.refresh_monitor()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Monitor refresh after chat selection failed: {}", exc)
     await event.answer("Выбран" if now_on else "Снят")
 
 
@@ -240,6 +242,6 @@ async def cb_chat_exc(event: events.CallbackQuery.Event) -> None:
     try:
         from services import monitor as monitor_svc
         await monitor_svc.refresh_monitor()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Monitor refresh after chat exclusion failed: {}", exc)
     await event.answer("Исключён" if now_exc else "Снова слушать")

@@ -95,14 +95,10 @@ def get_peer_flood_range_seconds() -> tuple[int, int]:
         except ValueError:
             pass
 
-    # Default: env minutes as center, range ~ half (min 3–10 style if 30 default → use 180-600)
+    # Default: honor the configured environment value exactly. The previous
+    # implicit 3–10 minute rewrite contradicted PEER_FLOOD_MIN_COOLDOWN_MINUTES.
     base = _clamp_sec(int(PEER_FLOOD_MIN_COOLDOWN_MINUTES) * 60)
-    # Prefer a sensible default window 3–10 min when env is classic 30
-    if base >= 15 * 60:
-        return 3 * 60, 10 * 60
-    lo = max(PEER_FLOOD_MIN_ALLOWED_SEC, base // 2)
-    hi = max(lo, base)
-    return lo, hi
+    return base, base
 
 
 def set_peer_flood_range_seconds(lo: int, hi: int) -> tuple[int, int]:

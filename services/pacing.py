@@ -32,7 +32,7 @@ def _parse_iso(value: str | None) -> Optional[dt.datetime]:
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=dt.timezone.utc)
         return parsed
-    except Exception:
+    except (TypeError, ValueError):
         return None
 
 
@@ -132,8 +132,9 @@ def record_successful_send(account_user_id: int) -> None:
     try:
         accounts_svc.maybe_restore_interval_after_success(int(account_user_id))
         acc = accounts_svc.get_account(int(account_user_id)) or acc
-    except Exception:
-        pass
+    except Exception as exc:
+        from loguru import logger
+        logger.warning("Account interval restore failed account={}: {}", account_user_id, exc)
     interval = random_account_interval_seconds(acc)
     next_send = (now + dt.timedelta(seconds=interval)).isoformat()
     conn = get_connection()
@@ -178,7 +179,8 @@ def apply_floodwait(account_user_id: int, seconds: int) -> None:
         conn.execute(
             """
             UPDATE accounts
-               SET cooldown_until=?,
+               SET is_paused=1,
+                   cooldown_until=?,
                    pause_reason=?,
                    updated_at=?
              WHERE user_id=?

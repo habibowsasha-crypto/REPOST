@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import random
 from typing import Any, Optional
 
@@ -16,8 +17,10 @@ from telethon.errors import (
     ChatWriteForbiddenError,
     UserBannedInChannelError,
 )
+from telethon.tl.types import InputPeerUser
 
 from services import accounts as accounts_svc
+from services import first_dm_delivery
 from services import chats as chats_svc
 from services import monitor as monitor_svc
 from services import opt_out as opt_out_svc
@@ -62,8 +65,10 @@ async def stop_worker() -> None:
     if _worker_task is not None:
         try:
             await asyncio.wait_for(_worker_task, timeout=15)
-        except Exception:
+        except asyncio.TimeoutError:
+            logger.warning("Dispatcher stop timed out; cancelling worker")
             _worker_task.cancel()
+            await asyncio.gather(_worker_task, return_exceptions=True)
         _worker_task = None
     _stop_event = None
     logger.info("Dispatcher worker stopped")
@@ -87,6 +92,13 @@ async def _worker_loop() -> None:
             logger.exception("Dispatcher tick error: {}", exc)
             did = False
         ticks += 1
+        if ticks % 3 == 0:
+            try:
+                recovered = await recover_ambiguous_first_dms()
+                if recovered:
+                    logger.warning("Reconciled {} ambiguous First-DM delivery(s)", recovered)
+            except Exception as recovery_exc:
+                logger.exception("First-DM recovery loop failed: {}", recovery_exc)
         if ticks % 6 == 0:
             try:
                 n = queue_svc.release_stale_claims(older_than_seconds=900)
@@ -121,10 +133,9 @@ def _list_ready_accounts() -> list[dict[str, Any]]:
 def _order_accounts_for_lead(
     lead: dict[str, Any], ready: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    """Random order among ready accounts.
+    """Try the account that discovered the user first, then random fallbacks.
 
-    Soft preference: ~35% chance to try source account first if it is ready;
-    otherwise pure shuffle so one account is not sticky.
+    The source account is the most likely to have the correct Telegram entity/access hash.
     """
     if not ready:
         return []
@@ -136,9 +147,7 @@ def _order_accounts_for_lead(
     source_id = int(source)
     for i, acc in enumerate(pool):
         if int(acc["user_id"]) == source_id:
-            if random.random() < 0.35:
-                # move source to front
-                pool.insert(0, pool.pop(i))
+            pool.insert(0, pool.pop(i))
             break
     return pool
 
@@ -201,6 +210,10 @@ async def _tick() -> bool:
         if result == "no_entity":
             # Try next account that may resolve entity.
             continue
+        if result == "ambiguous":
+            # Delivery may already exist in Telegram. Never try another account
+            # until the reconciliation pass proves it was not delivered.
+            return True
         if result == "error":
             # Soft error: try next account via ensure_claim.
             continue
@@ -221,21 +234,27 @@ def _account_label(account_id: int) -> str:
 
 
 def _notify_first_dm(account_id: int, lead: dict[str, Any], text: str) -> str:
-    """Pretty admin card for a successful first DM."""
+    """Unified admin notification for the only routine event: successful First DM."""
     from_label = _account_label(account_id)
     to_label = _target_label(lead)
-    snippet = (text or "").replace("\n", " ").strip()
-    if len(snippet) > 80:
-        snippet = snippet[:77].rstrip() + "…"
-    lines = [
-        "💌  **First DM**",
-        "━━━━━━━━━━━━",
-        f"📤  **{from_label}**",
-        f"📥  **{to_label}**",
-        "━━━━━━━━━━━━",
-        f"💬  _{snippet}_",
-    ]
-    return "\n".join(lines)
+    source = queue_svc.source_label(lead)
+    now_local = dt.datetime.now(dt.timezone(dt.timedelta(hours=3))).strftime("%H:%M")
+    today = queue_svc.count_first_dm_today()
+    total = queue_svc.count_first_dm_total()
+    return "\n".join(
+        [
+            "📨 **FIRST DM ОТПРАВЛЕН**",
+            "━━━━━━━━━━━━━━━━━━",
+            "",
+            f"👤 Аккаунт: **{from_label}**",
+            f"🎯 Пользователь: **{to_label}**",
+            f"📍 Источник: **{source}**",
+            f"🕒 Время: **{now_local} МСК**",
+            "",
+            f"📬 Сегодня: **{today}**",
+            f"📊 Всего: **{total}**",
+        ]
+    )
 
 
 async def _notify_admins_first_dm(account_id: int, lead: dict[str, Any], text: str) -> None:
@@ -253,6 +272,162 @@ def _remember_text(text: str) -> None:
         del _recent_texts[:-50]
 
 
+async def _resolve_target_entity(client, account_id: int, lead: dict[str, Any]):
+    """Resolve target on the source account first, then by cached entity/username."""
+    target_id = int(lead["target_user_id"])
+    username = (lead.get("username") or "").strip().lstrip("@")
+    access_hash = lead.get("access_hash")
+    source_account_id = lead.get("source_account_user_id")
+
+    if (
+        access_hash is not None
+        and source_account_id is not None
+        and int(source_account_id) == int(account_id)
+    ):
+        return InputPeerUser(target_id, int(access_hash))
+
+    try:
+        return await client.get_input_entity(target_id)
+    except (ValueError, TypeError, LookupError) as exc:
+        logger.debug(
+            "Entity by id unavailable target={} account={}: {}",
+            target_id,
+            account_id,
+            type(exc).__name__,
+        )
+
+    if username:
+        try:
+            return await client.get_input_entity(username)
+        except (ValueError, TypeError, LookupError) as exc:
+            logger.debug(
+                "Entity by username unavailable target={} account={}: {}",
+                target_id,
+                account_id,
+                type(exc).__name__,
+            )
+    return None
+
+
+def _normalize_message_text(value: str | None) -> str:
+    return (value or "").replace("\r\n", "\n").strip()
+
+
+async def recover_ambiguous_first_dms() -> int:
+    """Reconcile prepared First DMs after a crash/network ambiguity.
+
+    The bot checks the real Telegram conversation before any retry. Exact matching
+    outgoing text confirms delivery; absence of evidence safely returns the lead
+    to pending. If Telegram cannot be checked, state remains prepared and no
+    duplicate is sent.
+    """
+    recovered = 0
+    rows = first_dm_delivery.list_stale_prepared(older_than_seconds=90, limit=20)
+    for row in rows:
+        target_id = int(row["target_user_id"])
+        account_id = int(row["account_user_id"])
+        client = monitor_svc.get_client(account_id)
+        if client is None or not client.is_connected():
+            logger.warning(
+                "Prepared First DM awaits reconciliation: no client account={} target={}",
+                account_id,
+                target_id,
+            )
+            continue
+
+        entity = await _resolve_target_entity(client, account_id, row)
+        if entity is None:
+            logger.warning(
+                "Prepared First DM awaits reconciliation: no entity account={} target={}",
+                account_id,
+                target_id,
+            )
+            continue
+
+        try:
+            messages = await client.get_messages(entity, limit=30)
+        except Exception as exc:
+            logger.exception(
+                "Cannot inspect Telegram history account={} target={}: {}",
+                account_id,
+                target_id,
+                exc,
+            )
+            continue
+
+        expected = _normalize_message_text(row.get("text"))
+        prepared_at = pacing._parse_iso(row.get("prepared_at"))
+        lower_bound = (
+            prepared_at - dt.timedelta(minutes=2)
+            if prepared_at is not None
+            else None
+        )
+        found = None
+        for message in messages or []:
+            if not bool(getattr(message, "out", False)):
+                continue
+            if _normalize_message_text(getattr(message, "message", None)) != expected:
+                continue
+            message_date = getattr(message, "date", None)
+            if message_date is not None and message_date.tzinfo is None:
+                message_date = message_date.replace(tzinfo=dt.timezone.utc)
+            if lower_bound is not None and message_date is not None and message_date < lower_bound:
+                continue
+            found = message
+            break
+
+        if found is not None:
+            first_dm_delivery.commit_sent(
+                target_id,
+                telegram_message_id=getattr(found, "id", None),
+                sent_at=(getattr(found, "date", None) or pacing._now()).isoformat(),
+            )
+            try:
+                pacing.record_successful_send(account_id)
+                pacing.mark_global_sent()
+            except Exception as exc:
+                logger.exception(
+                    "Recovered First DM accounting failed account={} target={}: {}",
+                    account_id,
+                    target_id,
+                    exc,
+                )
+            try:
+                from services import audience as audience_svc
+
+                audience_svc.record_first_dm(
+                    target_id,
+                    username=row.get("username"),
+                    first_name=row.get("first_name"),
+                    last_name=row.get("last_name"),
+                    access_hash=row.get("access_hash"),
+                    source_chat_id=row.get("source_chat_id"),
+                    source_account_user_id=account_id,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Recovered First DM audience record failed target={}: {}",
+                    target_id,
+                    exc,
+                )
+            recovered += 1
+            logger.warning(
+                "Recovered delivered First DM from Telegram account={} target={} msg_id={}",
+                account_id,
+                target_id,
+                getattr(found, "id", None),
+            )
+        else:
+            first_dm_delivery.rollback(target_id, "telegram_history_no_match", as_pending=True)
+            recovered += 1
+            logger.warning(
+                "Prepared First DM not found in Telegram; returned to queue account={} target={}",
+                account_id,
+                target_id,
+            )
+    return recovered
+
+
 async def _send_first_dm(
     client,
     account_id: int,
@@ -260,34 +435,43 @@ async def _send_first_dm(
     text: str,
 ) -> str:
     target_id = int(lead["target_user_id"])
-    username = (lead.get("username") or "").strip().lstrip("@")
+    prepared = False
 
     try:
-        entity = None
-        try:
-            entity = await client.get_input_entity(target_id)
-        except Exception:
-            if username:
-                entity = await client.get_input_entity(username)
-            else:
-                attempts = queue_svc.bump_send_attempts(target_id)
-                logger.warning(
-                    "No entity for target={} account={} attempts={}",
-                    target_id,
-                    account_id,
-                    attempts,
-                )
-                if attempts >= queue_svc.MAX_SEND_ATTEMPTS:
-                    queue_svc.cancel_lead(target_id, "no_entity")
-                    return "no_entity"
-                queue_svc.release_claim(target_id, as_pending=True)
-                return "no_entity"
+        entity = await _resolve_target_entity(client, account_id, lead)
+        if entity is None:
+            logger.warning(
+                "No entity for target={} account={} source_account={}",
+                target_id,
+                account_id,
+                lead.get("source_account_user_id"),
+            )
+            return "no_entity"
 
-        # Anti-duplicate: contact before network send.
-        queue_svc.mark_sending(target_id, account_id)
+        prepared = first_dm_delivery.prepare(target_id, account_id, text)
+        if not prepared:
+            logger.error(
+                "First DM prepare rejected account={} target={}; network send blocked",
+                account_id,
+                target_id,
+            )
+            queue_svc.release_claim(target_id, as_pending=True)
+            return "error"
 
-        await client.send_message(entity, text)
-        queue_svc.mark_sent(target_id, account_id)
+        sent_message = await client.send_message(entity, text)
+        committed = first_dm_delivery.commit_sent(
+            target_id,
+            telegram_message_id=getattr(sent_message, "id", None),
+            sent_at=(getattr(sent_message, "date", None) or pacing._now()).isoformat(),
+        )
+        if not committed:
+            logger.critical(
+                "Telegram accepted First DM but SQLite commit is pending account={} target={}",
+                account_id,
+                target_id,
+            )
+            return "ambiguous"
+
         pacing.record_successful_send(account_id)
         try:
             from services import audience as audience_svc
@@ -297,20 +481,17 @@ async def _send_first_dm(
                 username=lead.get("username"),
                 first_name=lead.get("first_name"),
                 last_name=lead.get("last_name"),
+                access_hash=lead.get("access_hash"),
                 source_chat_id=lead.get("source_chat_id"),
+                source_account_user_id=account_id,
             )
-        except Exception as a_exc:
-            logger.exception("audience record after first DM: {}", a_exc)
-        try:
-            from services import dialog_engine
-
-            await dialog_engine.on_first_dm_sent(target_id, account_id, text)
-        except Exception as d_exc:
-            logger.exception("dialog create after first DM: {}", d_exc)
+        except Exception as exc:
+            logger.exception("Audience record after First DM failed: {}", exc)
         logger.info(
-            "First DM sent account={} target={} text={!r}",
+            "First DM sent account={} target={} msg_id={} text={!r}",
             account_id,
             target_id,
+            getattr(sent_message, "id", None),
             text[:40],
         )
         await _notify_admins_first_dm(account_id, lead, text)
@@ -324,41 +505,52 @@ async def _send_first_dm(
             target_id,
             seconds,
         )
+        if prepared:
+            first_dm_delivery.rollback(target_id, f"FloodWait:{seconds}", as_pending=True)
+        else:
+            queue_svc.release_claim(target_id, as_pending=True)
         pacing.apply_floodwait(account_id, seconds)
-        queue_svc.clear_sending_contact(target_id)
-        queue_svc.release_claim(target_id, as_pending=True)
         return "flood"
 
     except PeerFloodError:
         logger.warning("PeerFlood account={} target={}", account_id, target_id)
-        queue_svc.clear_sending_contact(target_id)
-        queue_svc.release_claim(target_id, as_pending=True)
+        if prepared:
+            first_dm_delivery.rollback(target_id, "PeerFlood", as_pending=True)
+        else:
+            queue_svc.release_claim(target_id, as_pending=True)
         try:
             from services import spambot as spambot_svc
 
             await spambot_svc.on_peer_flood(account_id)
-        except Exception as sp_exc:
-            logger.exception("SpamBot on_peer_flood failed: {}", sp_exc)
+        except Exception as exc:
+            logger.exception("SpamBot on_peer_flood failed: {}", exc)
             pacing.set_paused(account_id, "PeerFlood", paused=True)
         return "peerflood"
 
     except (UserPrivacyRestrictedError, UserIsBlockedError, ChatWriteForbiddenError):
         logger.info("Cannot write target={} from account={}", target_id, account_id)
-        queue_svc.clear_sending_contact(target_id)
+        if prepared:
+            first_dm_delivery.rollback(target_id, "privacy_or_blocked", as_pending=False)
         queue_svc.cancel_lead(target_id, "privacy_or_blocked")
         return "privacy"
 
     except (InputUserDeactivatedError, UserBannedInChannelError, ValueError):
         logger.info("Invalid target={} from account={}", target_id, account_id)
-        queue_svc.clear_sending_contact(target_id)
+        if prepared:
+            first_dm_delivery.rollback(target_id, "invalid_target", as_pending=False)
         queue_svc.cancel_lead(target_id, "invalid_target")
         return "invalid"
 
     except Exception as exc:
         logger.exception(
-            "Send failed account={} target={}: {}", account_id, target_id, exc
+            "First DM send became ambiguous account={} target={}: {}",
+            account_id,
+            target_id,
+            exc,
         )
-        queue_svc.clear_sending_contact(target_id)
+        if prepared:
+            # Do not retry through another account: Telegram may have accepted it.
+            return "ambiguous"
         attempts = queue_svc.bump_send_attempts(target_id)
         if attempts >= queue_svc.MAX_SEND_ATTEMPTS:
             queue_svc.cancel_lead(target_id, "max_attempts")

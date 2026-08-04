@@ -16,6 +16,35 @@ def _row_to_dict(row: Any) -> dict[str, Any]:
     return dict(row) if row is not None else {}
 
 
+def _clear_expired_floodwaits(user_id: int | None = None) -> int:
+    """Auto-clear only expired Telegram FloodWait display state.
+
+    PeerFlood/SpamBot pauses are intentionally untouched and remain under the
+    dedicated resume flow.
+    """
+    now = _now_iso()
+    conn = get_connection()
+    where = "" if user_id is None else " AND user_id=?"
+    params: tuple[Any, ...] = (now,) if user_id is None else (now, int(user_id))
+    with db_lock(), conn:
+        cur = conn.execute(
+            f"""
+            UPDATE accounts
+               SET is_paused=0,
+                   cooldown_until=NULL,
+                   pause_reason=NULL,
+                   updated_at=?
+             WHERE is_paused=1
+               AND cooldown_until IS NOT NULL
+               AND cooldown_until <= ?
+               AND LOWER(COALESCE(pause_reason, '')) LIKE 'floodwait%'
+               {where}
+            """,
+            (now, *params),
+        )
+        return int(cur.rowcount or 0)
+
+
 def count_accounts() -> int:
     conn = get_connection()
     row = conn.execute("SELECT COUNT(*) AS c FROM accounts").fetchone()
@@ -31,6 +60,7 @@ def count_participating() -> int:
 
 
 def list_accounts() -> list[dict[str, Any]]:
+    _clear_expired_floodwaits()
     conn = get_connection()
     rows = conn.execute(
         """
@@ -52,6 +82,7 @@ def list_accounts() -> list[dict[str, Any]]:
 
 
 def get_account(user_id: int) -> Optional[dict[str, Any]]:
+    _clear_expired_floodwaits(int(user_id))
     conn = get_connection()
     row = conn.execute(
         """
@@ -148,9 +179,91 @@ def set_participates(user_id: int, value: bool) -> bool:
 
 
 def delete_account(user_id: int) -> bool:
+    """Delete credentials/config while preserving history as inactive records."""
     conn = get_connection()
     uid = int(user_id)
+    now = _now_iso()
     with db_lock(), conn:
+        # If deletion happens during an ambiguous First DM, the session needed for
+        # Telegram reconciliation is about to disappear. Archive it as cancelled
+        # instead of risking a duplicate from another account later.
+        ambiguous_rows = conn.execute(
+            """
+            SELECT target_user_id
+              FROM first_dm_outbox
+             WHERE account_user_id=? AND status='prepared'
+            """,
+            (uid,),
+        ).fetchall()
+        ambiguous_targets = [int(r["target_user_id"]) for r in ambiguous_rows]
+        conn.execute(
+            """
+            UPDATE first_dm_outbox
+               SET status='failed', last_error='account_deleted_before_reconcile',
+                   updated_at=?
+             WHERE account_user_id=? AND status='prepared'
+            """,
+            (now, uid),
+        )
+        if ambiguous_targets:
+            placeholders = ",".join("?" for _ in ambiguous_targets)
+            conn.execute(
+                f"""
+                UPDATE leads
+                   SET status='cancelled', claimed_by_account=NULL, claimed_at=NULL,
+                       updated_at=?
+                 WHERE target_user_id IN ({placeholders})
+                """,
+                (now, *ambiguous_targets),
+            )
+            conn.execute(
+                f"""
+                UPDATE contacts
+                   SET status='completed', updated_at=?
+                 WHERE target_user_id IN ({placeholders})
+                """,
+                (now, *ambiguous_targets),
+            )
+
+        # Existing conversation history stays in DB, but cannot remain scheduled/active.
+        targets = conn.execute(
+            "SELECT target_user_id FROM dialogs WHERE account_user_id=? AND stage<>'closed'",
+            (uid,),
+        ).fetchall()
+        target_ids = [int(r["target_user_id"]) for r in targets]
+        conn.execute(
+            """
+            UPDATE dialogs
+               SET stage='closed', auto_link_at=NULL, updated_at=?
+             WHERE account_user_id=? AND stage<>'closed'
+            """,
+            (now, uid),
+        )
+        if target_ids:
+            placeholders = ",".join("?" for _ in target_ids)
+            conn.execute(
+                f"""
+                UPDATE contacts
+                   SET status='completed', updated_at=?
+                 WHERE target_user_id IN ({placeholders})
+                """,
+                (now, *target_ids),
+            )
+
+        # A pre-send claim is not a historical dialog: release it safely.
+        conn.execute(
+            "DELETE FROM contacts WHERE sender_account_id=? AND status='sending'",
+            (uid,),
+        )
+        conn.execute(
+            """
+            UPDATE leads
+               SET status='pending', claimed_by_account=NULL, claimed_at=NULL, updated_at=?
+             WHERE claimed_by_account=? AND status='claimed'
+            """,
+            (now, uid),
+        )
+
         conn.execute(
             "DELETE FROM account_discovered_chats WHERE account_user_id=?", (uid,)
         )
@@ -162,6 +275,10 @@ def delete_account(user_id: int) -> bool:
         )
         conn.execute(
             "DELETE FROM spambot_state WHERE account_user_id=?", (uid,)
+        )
+        conn.execute(
+            "DELETE FROM dialog_outbox WHERE account_user_id=? AND status='prepared'",
+            (uid,),
         )
         cur = conn.execute("DELETE FROM accounts WHERE user_id=?", (uid,))
         return int(cur.rowcount or 0) == 1
@@ -208,7 +325,7 @@ def format_cooldown_left(acc: dict[str, Any]) -> str | None:
             until = until.replace(tzinfo=dt.timezone.utc)
         now = dt.datetime.now(dt.timezone.utc)
         sec = int((until - now).total_seconds())
-    except Exception:
+    except (TypeError, ValueError, OverflowError):
         return None
     if sec <= 0:
         return "скоро"
@@ -223,40 +340,49 @@ def format_cooldown_left(acc: dict[str, Any]) -> str | None:
 
 
 def dashboard_account_line(acc: dict[str, Any]) -> str:
-    """One compact line for main menu: status + optional pause timer."""
+    """Compact two-line account status block for the main dashboard."""
+    from services import dialog_store as dialog_store_svc
+
     label = format_account_label(acc, include_id=False)
-    if len(label) > 22:
-        label = label[:21] + "…"
+    if len(label) > 24:
+        label = label[:23] + "…"
+    dialogs = dialog_store_svc.count_open_for_account(int(acc["user_id"]))
     participates = bool(acc.get("participates"))
     paused = bool(acc.get("is_paused"))
-    if not participates:
-        return f"⚪ {label}  выкл"
+
     if paused:
         reason = (acc.get("pause_reason") or "пауза").strip()
-        # Short reason for dashboard
-        if "peerflood" in reason.lower() or reason.lower() == "peerflood":
+        if "peerflood" in reason.lower():
             reason_s = "PeerFlood"
         elif "flood" in reason.lower():
             reason_s = "FloodWait"
         else:
-            reason_s = reason[:16]
+            reason_s = reason[:22]
         left = format_cooldown_left(acc)
-        if left:
-            return f"🔴 {label}  {reason_s} · {left}"
-        return f"🔴 {label}  {reason_s}"
-    return f"🟢 {label}"
+        detail = f"{reason_s} · ещё {left.lstrip('~')}" if left else reason_s
+        return f"🔴 **{label}**\n└ {detail} · диалогов {dialogs}"
+
+    if not participates:
+        if dialogs:
+            return (
+                f"🟡 **{label}**\n"
+                f"└ First DM отключены · завершает диалогов {dialogs}"
+            )
+        return f"🟡 **{label}**\n└ First DM отключены · диалогов 0"
+
+    return f"🟢 **{label}**\n└ First DM включены · диалогов {dialogs}"
 
 
 def dashboard_accounts_block(*, limit: int = 8) -> str:
-    """Multi-line block for main menu."""
+    """Multi-line account list for the main menu."""
     rows = list_accounts()
     if not rows:
-        return "нет аккаунтов"
-    lines = [dashboard_account_line(a) for a in rows[:limit]]
+        return "└ Аккаунты ещё не добавлены"
+    blocks = [dashboard_account_line(a) for a in rows[:limit]]
     extra = len(rows) - limit
     if extra > 0:
-        lines.append(f"… ещё {extra} в 👤 Аккаунты")
-    return "\n".join(lines)
+        blocks.append(f"… ещё {extra} в разделе «Аккаунты»")
+    return "\n\n".join(blocks)
 
 
 def set_dm_interval(
@@ -324,7 +450,7 @@ def register_peerflood_hit(user_id: int) -> dict:
             last = dt.datetime.fromisoformat(str(raw_last).replace("Z", "+00:00"))
             if last.tzinfo is None:
                 last = last.replace(tzinfo=dt.timezone.utc)
-        except Exception:
+        except (TypeError, ValueError, OverflowError):
             last = None
 
     # "Too fast" = previous PeerFlood within 10–15 min (random band)
@@ -413,7 +539,7 @@ def maybe_restore_interval_after_success(user_id: int) -> bool:
             until = dt.datetime.fromisoformat(str(raw_until).replace("Z", "+00:00"))
             if until.tzinfo is None:
                 until = until.replace(tzinfo=dt.timezone.utc)
-        except Exception:
+        except (TypeError, ValueError, OverflowError):
             until = None
 
     restored = False

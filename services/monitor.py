@@ -20,6 +20,49 @@ _clients: dict[int, TelegramClient] = {}
 _started = False
 _lock = asyncio.Lock()
 _bg_tasks: set[asyncio.Task] = set()
+_bg_tasks_by_account: dict[int, set[asyncio.Task]] = {}
+
+
+def _track_dialog_task(account_user_id: int, task: asyncio.Task) -> None:
+    uid = int(account_user_id)
+    _bg_tasks.add(task)
+    _bg_tasks_by_account.setdefault(uid, set()).add(task)
+
+    def _done(done_task: asyncio.Task) -> None:
+        _bg_tasks.discard(done_task)
+        bucket = _bg_tasks_by_account.get(uid)
+        if bucket is not None:
+            bucket.discard(done_task)
+            if not bucket:
+                _bg_tasks_by_account.pop(uid, None)
+        if done_task.cancelled():
+            return
+        try:
+            exc = done_task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is not None:
+            logger.opt(exception=exc).error(
+                "Background dialog task crashed account={} task={}",
+                uid,
+                done_task.get_name(),
+            )
+
+    task.add_done_callback(_done)
+
+
+async def _cancel_dialog_tasks(account_user_id: int | None = None) -> int:
+    if account_user_id is None:
+        tasks = list(_bg_tasks)
+    else:
+        tasks = list(_bg_tasks_by_account.get(int(account_user_id), set()))
+    current = asyncio.current_task()
+    tasks = [task for task in tasks if task is not current and not task.done()]
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    return len(tasks)
 
 
 def is_running() -> bool:
@@ -50,6 +93,11 @@ async def start_monitor() -> None:
 
 async def stop_monitor() -> None:
     global _started
+    cancelled = await _cancel_dialog_tasks()
+    if cancelled:
+        logger.info("Cancelled {} background dialog task(s) on monitor stop", cancelled)
+    _bg_tasks.clear()
+    _bg_tasks_by_account.clear()
     async with _lock:
         for uid, client in list(_clients.items()):
             await _safe_disconnect(client)
@@ -79,13 +127,18 @@ async def _sync_clients_unlocked() -> None:
     the dispatcher cannot send first DMs. Group monitoring still filters
     by is_chat_watchable at event time.
     """
+    from services import dialog_store as dialog_store_svc
+
     wanted: set[int] = set()
     for acc in accounts_svc.list_accounts():
-        if not acc.get("participates"):
+        uid = int(acc["user_id"])
+        # Disabled accounts stay connected only while their own existing dialogs are open.
+        needs_dialog_client = dialog_store_svc.has_open_for_account(uid)
+        if not acc.get("participates") and not needs_dialog_client:
             continue
         if not acc.get("session_string"):
             continue
-        wanted.add(int(acc["user_id"]))
+        wanted.add(uid)
 
     for uid in list(_clients.keys()):
         if uid not in wanted:
@@ -147,6 +200,12 @@ async def _handle_group(
     if event.out:
         return
 
+    # An account disabled by the admin may finish existing private dialogs,
+    # but it must not collect new group leads.
+    acc = accounts_svc.get_account(account_user_id)
+    if not acc or not acc.get("participates"):
+        return
+
     chat_id = int(event.chat_id)
     if not chats_svc.is_chat_watchable(account_user_id, chat_id):
         logger.debug(
@@ -174,6 +233,7 @@ async def _handle_group(
         username=getattr(sender, "username", None),
         first_name=getattr(sender, "first_name", None),
         last_name=getattr(sender, "last_name", None),
+        access_hash=getattr(sender, "access_hash", None),
         source_chat_id=chat_id,
         source_account_user_id=account_user_id,
     )
@@ -224,8 +284,39 @@ async def _handle_private(
         dialog_engine.handle_incoming_private(account_user_id, target_id, text),
         name=f"dialog-{account_user_id}-{target_id}",
     )
-    _bg_tasks.add(task)
-    task.add_done_callback(_bg_tasks.discard)
+    _track_dialog_task(account_user_id, task)
+
+
+async def disconnect_account(account_user_id: int, *, cancel_tasks: bool = True) -> None:
+    """Remove one account from active memory immediately."""
+    uid = int(account_user_id)
+    if cancel_tasks:
+        cancelled = await _cancel_dialog_tasks(uid)
+        if cancelled:
+            logger.info("Cancelled {} dialog task(s) for account {}", cancelled, uid)
+    async with _lock:
+        client = _clients.pop(uid, None)
+        await _safe_disconnect(client)
+    logger.info("Monitor: account {} removed from active memory", uid)
+
+
+async def maybe_disconnect_inactive_account(account_user_id: int) -> bool:
+    """Disconnect a disabled account once all of its existing dialogs are closed."""
+    uid = int(account_user_id)
+    acc = accounts_svc.get_account(uid)
+    if not acc or acc.get("participates"):
+        return False
+    from services import dialog_store as dialog_store_svc
+
+    if dialog_store_svc.has_open_for_account(uid):
+        return False
+    async with _lock:
+        client = _clients.pop(uid, None)
+        await _safe_disconnect(client)
+    if client is not None:
+        logger.info("Monitor: disabled account {} finished dialogs and disconnected", uid)
+        return True
+    return False
 
 
 async def _safe_disconnect(client: Optional[TelegramClient]) -> None:

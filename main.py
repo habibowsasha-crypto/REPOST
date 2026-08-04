@@ -1,4 +1,4 @@
-"""Entry point: Channel DM Bot (v1.0.45)."""
+"""Entry point for Channel DM Bot."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import sys
 
 from loguru import logger
 
-from config import ADMIN_ID_LIST, BOT_TOKEN, DB_PATH, LOG_LEVEL, bot
+from config import ADMIN_ID_LIST, BOT_TOKEN, DB_PATH, LOG_LEVEL, app_version, bot
 from db.schema import init_db
 
 # Register Telethon handlers on the shared bot client.
@@ -31,7 +31,7 @@ def configure_logging() -> None:
 
 def run() -> None:
     configure_logging()
-    logger.info("Channel DM Bot - v1.0.45 starting")
+    logger.info("Channel DM Bot - v{} starting", app_version())
     logger.info("DB_PATH={}", DB_PATH)
 
     if not ADMIN_ID_LIST:
@@ -43,6 +43,17 @@ def run() -> None:
 
     init_db()
     logger.info("SQLite schema ready")
+
+    try:
+        from services.ai_dialog import configured_channel_link
+
+        logger.info("Exact CHANNEL_LINK configured: {}", configured_channel_link())
+    except Exception as exc:
+        logger.error(
+            "CHANNEL_LINK is not ready: link messages will not be sent until the "
+            "admin variable is corrected ({})",
+            exc,
+        )
 
     try:
         bot.start(bot_token=BOT_TOKEN)
@@ -65,6 +76,10 @@ def run() -> None:
                 except Exception as exc:
                     logger.exception("spambot due loop: {}", exc)
                 try:
+                    await dialog_engine.recover_ambiguous_scheduled_messages()
+                except Exception as exc:
+                    logger.exception("scheduled delivery recovery loop: {}", exc)
+                try:
                     await dialog_engine.process_due_auto_links()
                 except Exception as exc:
                     logger.exception("auto-link due loop: {}", exc)
@@ -72,6 +87,13 @@ def run() -> None:
                     await dialog_engine.process_due_followups()
                 except Exception as exc:
                     logger.exception("follow-up due loop: {}", exc)
+                try:
+                    from services import retention as retention_svc
+
+                    await retention_svc.process_due_telegram_deletions()
+                    retention_svc.process_due_local_history_purge()
+                except Exception as exc:
+                    logger.exception("dialog retention loop: {}", exc)
                 try:
                     from services import queue as queue_svc
                     n = queue_svc.release_stale_claims(older_than_seconds=900)
@@ -82,7 +104,7 @@ def run() -> None:
                 await asyncio.sleep(20)
 
         bot.loop.create_task(_background_due_loop())
-        logger.info("Monitor + dispatcher + SpamBot + auto-link scheduler ready")
+        logger.info("Monitor + dispatcher + SpamBot + dialog delivery + retention ready")
         bot.run_until_disconnected()
     except KeyboardInterrupt:
         logger.info("Stopped by keyboard interrupt")
@@ -91,18 +113,18 @@ def run() -> None:
             from services import dispatcher as dispatcher_svc
 
             bot.loop.run_until_complete(dispatcher_svc.stop_worker())
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Dispatcher shutdown cleanup failed: {}", exc)
         try:
             from services import monitor as monitor_svc
 
             bot.loop.run_until_complete(monitor_svc.stop_monitor())
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Monitor shutdown cleanup failed: {}", exc)
         try:
             bot.loop.run_until_complete(bot.disconnect())
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Bot disconnect cleanup failed: {}", exc)
         logger.info("Shutdown complete")
 
 

@@ -1,25 +1,65 @@
-# Channel DM Bot v1.0.161.0.15
+# Channel DM Bot v1.0.48
 
-Telegram-бот для мягкой DM-рекламы канала.
+Telegram user-account DM bot: monitors selected groups, builds one shared lead queue, sends First DM, continues active dialogs, handles refusals, sends only the administrator's exact channel link, and stores durable state in SQLite.
 
-**Стек:** Python 3.12 · Telethon · SQLite · OpenAI · Railway (worker + Volume)
+## Changes in v1.0.48
 
-## Что делает
+### New admin interface
 
-1. Админ добавляет user-аккаунты, выбирает группы (вручную / все + исключения)
-2. Аккаунты с тумблером **Участвует** слушают чаты
-3. Активные люди → **одна общая очередь**
-4. **Старт** воркера: random лид × random свободный аккаунт
-5. First DM - короткий вопрос (AI или локальный пул), **без ссылки**
-6. После ответа: explain → при тишине 60–120 сек авто-ссылка на канал
-7. «Не пиши» / агрессия → извинение + **opt-out**
-8. FloodWait cooldown · PeerFlood → @SpamBot → auto-resume
+- Unified visual style for the main menu and all sections.
+- Main menu now shows:
+  - First DM running/paused state;
+  - pending and currently sending leads;
+  - First DM sent today and all time;
+  - colored status for connected accounts;
+  - active dialogs and dialogs completed today;
+  - channel, AI and monitor status.
+- Added a dedicated `Диалоги` section. Dialog continuation is visible there and does not create push-notification spam.
+- Account, queue, audience, opt-out, settings and retention screens use the same compact layout.
 
-## Railway
+### Notification policy
 
-1. Залей репозиторий / ZIP на GitHub → Deploy
-2. **Volume** mount path: `/data`
-3. Variables:
+Routine admin notifications are sent only for a successful First DM. Important system events such as PeerFlood, SpamBot restrictions and recovery still notify the admin. The bot does not send admin notifications for incoming replies, AI responses, links, follow-ups or ordinary dialog completion.
+
+### Telegram cleanup after 30 days
+
+- Each confirmed First DM stores its Telegram message ID and cleanup date.
+- After 30 days the bot deletes private-chat messages starting with that First DM and all newer messages in the same dialog.
+- Deletion uses `revoke=True`, so the selected messages are removed for both sides.
+- Messages older than the tracked First DM are not touched.
+- Temporary failures are retried with a durable retry schedule.
+
+### Local text retention for 180 days
+
+- Dialog texts remain in SQLite for up to 180 days from First DM.
+- After that the bot clears message text from dialog history and delivery outboxes.
+- IDs, account ownership, dates, status, statistics and opt-out information remain.
+
+### Crash-safe automatic link and follow-up
+
+- Automatic link and silence follow-up are persisted before Telegram send.
+- If a crash or ambiguous network error happens, the bot checks the real Telegram history before deciding whether to retry.
+- A message found in Telegram is committed without duplication.
+- A message not found is safely rescheduled.
+
+### Durable counters
+
+- Added a `first_dm_events` journal.
+- `Отправлено всего` survives restarts and account deletion.
+- `Отправлено сегодня` is calculated in administrator time (UTC+3) from confirmed First-DM events.
+
+## Confirmed project rules preserved
+
+- Main-menu pause stops only new First DM from the queue.
+- Existing dialogs continue during the pause.
+- A disabled account finishes its own active dialogs and receives no new leads.
+- Dialogs are not transferred between accounts.
+- Only First DM counts toward First-DM limits and pacing.
+- Explicit import/requeue may intentionally open a new First-DM attempt for a previously contacted user.
+- Aggressive/blocking users are closed for all accounts.
+- No new First-DM limits, filters, quotas, pauses or throttling were added.
+
+## Railway variables
 
 ```text
 API_ID=
@@ -33,70 +73,42 @@ CHANNEL_LINK=https://t.me/+...
 CHANNEL_PITCH=Бесплатный канал: посты из закрытых VIP, платить не нужно
 OPENAI_API_KEY=
 AI_MODEL=gpt-4o-mini
+AI_REQUEST_TIMEOUT_SECONDS=20
 AI_DM_ENABLED=true
+TELEGRAM_DIALOG_DELETE_DAYS=30
+LOCAL_DIALOG_TEXT_RETENTION_DAYS=180
 ```
 
-4. CMD: `python main.py` (Dockerfile)
-5. `/ping` → `pong` · `/start` → меню
+## Retention behavior
 
-## Темп (defaults)
+| Data | Retention |
+|---|---:|
+| Telegram messages from First DM onward | 30 days |
+| Message texts in SQLite | 180 days |
+| IDs, statuses, statistics and opt-out | retained |
 
-| Параметр | Значение |
-|----------|----------|
-| Пауза на аккаунт | 10–15 мин |
-| Глобально между first DM | 90–180 сек |
-| Лимит / аккаунт / сутки | 45 |
-| AI-ответ | 30–90 сек |
-| Авто-ссылка при тишине | 60–120 сек |
-| PeerFlood min cooldown | 30 мин |
+The Telegram user-session must still exist when cleanup becomes due. The account deletion confirmation screen warns when dialogs still depend on that session for future Telegram cleanup.
 
-## Быстрый старт сценарий
+## Quick live test
 
-1. **Аккаунты** → добавить (phone → код → 2FA)
-2. **Чаты** → Обновить группы → выбрать / режим
-3. **Включить участие**
-4. Написать в тестовой группе с другого аккаунта
-5. **Рассылка → Очередь** - pending
-6. **Старт** - first DM уходит
-7. Ответить в ЛС - explain → ссылка
+1. Deploy v1.0.48 over the existing volume/database.
+2. Confirm the new dashboard and all-time First-DM counter.
+3. Send a test First DM and confirm only one routine admin notification.
+4. Continue the dialog and confirm no reply/link/follow-up push notifications appear.
+5. Test direct refusal and opt-out.
+6. Restart during a prepared automatic link/follow-up and verify no duplicate.
+7. Temporarily set short retention values in a test environment only and confirm Telegram deletion starts at the tracked First DM, not before it.
+8. Confirm local text purge keeps metadata and statistics.
 
-## Тесты
+## Tests
 
 ```bash
-pip install -r requirements.txt pytest
+pip install -r requirements.txt
 pytest -q
 ```
 
-## Структура
+The release archive includes the full project plan, patch report and test report under `Аудиты/Мысли/`. Real Telegram delivery and revoke behavior must still be checked by the owner on test accounts.
 
-```text
-main.py              entry
-config.py            env
-db/schema.py         SQLite
-handlers/            admin UI
-services/            queue, monitor, dispatcher, AI, SpamBot, dialog
-texts/first_dm.py    fallback first DM
-tests/               unit tests
-```
+## Security note
 
-## Безопасность
-
-- Не коммить `.env`, `*.session`, `*.db`
-- Сессии аккаунтов в Volume БД - ограничьте доступ к Railway
-- Только `ADMIN_ID_LIST` управляет ботом
-
-## Версии шагов
-
-1–2 каркас/меню · 3 аккаунты · 4 чаты · 5 очередь · 6 dispatcher ·  
-7 SpamBot · 8 AI first DM · 9 диалог · 10 opt-out · **11 релиз**
-
-
-## Bugfix v1.0.2
-
-- Fixed missing `_handle_private` (dialogs were broken)
-- Participating accounts connect even with 0 selected chats (needed for send)
-- Dialog replies scheduled via `create_task` (no blocked Telethon loop)
-- Stale `claimed` leads auto-release after 15 min
-- FloodWait / PeerFlood handling in dialog sends
-- Status shows real first-DM count today
-- Removed unused `apscheduler` dependency
+Do not commit `.env`, SQLite databases or Telegram session files. Restrict access to the Railway volume. Only IDs listed in `ADMIN_ID_LIST` can control the bot.

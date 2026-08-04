@@ -22,6 +22,9 @@ def is_opted_out(user_id: int) -> bool:
 
 
 def add(user_id: int, reason: str | None = None) -> None:
+    """Persist opt-out and immediately deactivate queue/dialog work for this user."""
+    uid = int(user_id)
+    now = _now_iso()
     conn = get_connection()
     with db_lock(), conn:
         conn.execute(
@@ -30,7 +33,35 @@ def add(user_id: int, reason: str | None = None) -> None:
             VALUES (?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET reason=excluded.reason
             """,
-            (int(user_id), reason, _now_iso()),
+            (uid, reason, now),
+        )
+        conn.execute(
+            """
+            UPDATE leads
+               SET status='cancelled', claimed_by_account=NULL, claimed_at=NULL, updated_at=?
+             WHERE target_user_id=? AND status IN ('pending', 'claimed')
+            """,
+            (now, uid),
+        )
+        conn.execute(
+            """
+            UPDATE dialogs
+               SET stage='closed', auto_link_at=NULL, updated_at=?
+             WHERE target_user_id=?
+            """,
+            (now, uid),
+        )
+        conn.execute(
+            """
+            UPDATE contacts
+               SET status='completed', updated_at=?
+             WHERE target_user_id=?
+            """,
+            (now, uid),
+        )
+        conn.execute(
+            "DELETE FROM dialog_outbox WHERE target_user_id=?",
+            (uid,),
         )
 
 

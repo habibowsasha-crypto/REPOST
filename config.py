@@ -55,6 +55,9 @@ CHANNEL_PITCH: str = config(
 # ---------------------------------------------------------------------------
 OPENAI_API_KEY: str = config("OPENAI_API_KEY", default="").strip()
 AI_MODEL: str = config("AI_MODEL", default="gpt-4o-mini").strip() or "gpt-4o-mini"
+AI_REQUEST_TIMEOUT_SECONDS: float = max(
+    5.0, float(config("AI_REQUEST_TIMEOUT_SECONDS", default="20"))
+)
 AI_DM_ENABLED: bool = config("AI_DM_ENABLED", default="true").lower() in {
     "1",
     "true",
@@ -85,6 +88,16 @@ SPAMBOT_AUTO_RESUME: bool = config("SPAMBOT_AUTO_RESUME", default="true").lower(
 }
 FLOODWAIT_EXTRA_SECONDS: int = int(config("FLOODWAIT_EXTRA_SECONDS", default="45"))
 
+# ---------------------------------------------------------------------------
+# Dialog retention
+# ---------------------------------------------------------------------------
+TELEGRAM_DIALOG_DELETE_DAYS: int = max(1, int(
+    config("TELEGRAM_DIALOG_DELETE_DAYS", default="30")
+))
+LOCAL_DIALOG_TEXT_RETENTION_DAYS: int = max(1, int(
+    config("LOCAL_DIALOG_TEXT_RETENTION_DAYS", default="180")
+))
+
 LOG_LEVEL: str = config("LOG_LEVEL", default="INFO").upper()
 
 # Shared Telethon bot client (handlers import this singleton).
@@ -109,6 +122,6 @@ def app_version() -> str:
             v = candidate.read_text(encoding="utf-8").strip()
             if v:
                 return v
-        except Exception:
+        except (OSError, UnicodeError):
             continue
     return "1.0.0"
