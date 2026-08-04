@@ -63,25 +63,27 @@ def _notify_peerflood(
     seconds: int,
     *,
     streak: int = 1,
-    interval_bumped: bool = False,
+    burst_triggered: bool = False,
+    extra_seconds: int = 0,
 ) -> str:
     from services import runtime as runtime_svc
 
     pause = runtime_svc.format_duration(int(seconds))
-    extra = (
-        "\n⏱ Интервал First DM временно увеличен на 30 минут."
-        if interval_bumped
-        else ""
-    )
+    if burst_triggered:
+        burst = (
+            "\n🔥 Серия: **5 PeerFlood за 10 минут**"
+            f"\n➕ Дополнительная пауза: **{runtime_svc.format_duration(int(extra_seconds))}**"
+        )
+    else:
+        burst = f"\n🔁 Серия за 10 минут: **{streak}/5**"
     return (
         "🚨 **ОБНАРУЖЕН PEERFLOOD**\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
         f"👤 Аккаунт: **{label}**\n"
         "⏸ First DM: **остановлены**\n"
-        f"⏳ Пауза: **{pause}**\n"
-        f"🔁 Срабатываний подряд: **{streak}**\n"
+        f"⏳ Общая пауза: **{pause}**"
+        f"{burst}\n"
         "🤖 SpamBot: **проверка запущена**"
-        f"{extra}"
     )
 
 
@@ -235,7 +237,9 @@ async def on_peer_flood(account_user_id: int) -> None:
     PeerFlood from Telegram on DM send.
 
     Important: @SpamBot "free" != no PeerFlood. PeerFlood is a cold-DM rate limit.
-    Debounce: if already paused with active cooldown, do not re-notify or re-/start SpamBot.
+    Every real exception is counted. Repeated events during an active ordinary
+    cooldown are debounced, except the fifth event extends that cooldown by the
+    separately configured extra time.
     """
     account_user_id = int(account_user_id)
     from services import runtime as runtime_svc
@@ -244,38 +248,83 @@ async def on_peer_flood(account_user_id: int) -> None:
     st = get_state(account_user_id) or {}
     st_status = str(st.get("status") or "")
 
+    # Count every real PeerFlood exception, including concurrent dialog sends
+    # received while the account is already inside its ordinary cooldown.
+    info = accounts_svc.register_peerflood_hit(account_user_id)
+    streak = int(info.get("streak") or 1)
+    burst_triggered = bool(info.get("burst_triggered"))
+    extra_seconds = int(info.get("extra_pause_seconds") or 0)
+
     if acc and acc.get("is_paused"):
         cd = _parse_iso(acc.get("cooldown_until"))
         if cd and cd > _now():
-            logger.info(
-                "PeerFlood debounced (cooldown until {}) account={}",
-                cd.isoformat(),
-                account_user_id,
-            )
+            if burst_triggered and extra_seconds > 0:
+                extended_until = cd + dt.timedelta(seconds=extra_seconds)
+                conn = get_connection()
+                with db_lock(), conn:
+                    conn.execute(
+                        """
+                        UPDATE accounts
+                           SET cooldown_until=?,
+                               next_send_at=CASE
+                                   WHEN next_send_at IS NULL OR next_send_at<? THEN ?
+                                   ELSE next_send_at
+                               END,
+                               updated_at=?
+                         WHERE user_id=?
+                        """,
+                        (
+                            extended_until.isoformat(),
+                            extended_until.isoformat(),
+                            extended_until.isoformat(),
+                            _now_iso(),
+                            account_user_id,
+                        ),
+                    )
+                label = _account_label(account_user_id)
+                await notify_admins(
+                    _notify_peerflood(
+                        label,
+                        max(1, int((extended_until - _now()).total_seconds())),
+                        streak=streak,
+                        burst_triggered=True,
+                        extra_seconds=extra_seconds,
+                    )
+                )
+                logger.warning(
+                    "PeerFlood burst extra cooldown added account={} extra_sec={} until={}",
+                    account_user_id,
+                    extra_seconds,
+                    extended_until.isoformat(),
+                )
+            else:
+                logger.info(
+                    "PeerFlood counted and debounced account={} series={}/5 cooldown_until={}",
+                    account_user_id,
+                    streak,
+                    cd.isoformat(),
+                )
             return
         # Cooldown already over: only debounce if SpamBot still mid-check/limited.
         if st_status == STATUS_LIMITED:
             logger.info(
-                "PeerFlood debounced (still limited) account={}",
+                "PeerFlood counted and debounced (still limited) account={} series={}/5",
                 account_user_id,
+                streak,
             )
             return
         if st_status == STATUS_CHECKING:
-            # Allow re-entry if check is older than 10 min (stuck)
+            # Allow re-entry if check is older than 10 min (stuck).
             pass
 
-    info = accounts_svc.register_peerflood_hit(account_user_id)
-    streak = int(info.get("streak") or 1)
-    interval_bumped = bool(info.get("interval_bumped"))
-    rapid = bool(info.get("rapid"))
     if info.get("pause_seconds") is not None:
         seconds = int(info["pause_seconds"])
     else:
         seconds = int(runtime_svc.pick_peer_flood_seconds())
     min_until = _now() + dt.timedelta(seconds=seconds)
     pacing.set_paused(account_user_id, "PeerFlood", paused=True)
-    # Push next_send_at past cooldown so this account is not the only
-    # "ready" sender the moment pause lifts (others may still be in 10–15m window).
+    # Preserve the existing v1.0.60 behavior: after an ordinary PeerFlood
+    # cooldown, the account also keeps its configured First DM interval.
     acc_row = accounts_svc.get_account(account_user_id) or {}
     lo = acc_row.get("dm_interval_min_sec")
     hi = acc_row.get("dm_interval_max_sec")
@@ -317,7 +366,15 @@ async def on_peer_flood(account_user_id: int) -> None:
         limited_until=None,
     )
     label = _account_label(account_user_id)
-    await notify_admins(_notify_peerflood(label, seconds, streak=streak, interval_bumped=interval_bumped))
+    await notify_admins(
+        _notify_peerflood(
+            label,
+            seconds,
+            streak=streak,
+            burst_triggered=burst_triggered,
+            extra_seconds=extra_seconds,
+        )
+    )
     await check_account(account_user_id, force=True)
 
 

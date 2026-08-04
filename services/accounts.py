@@ -8,8 +8,12 @@ from typing import Any, Optional
 from db.schema import db_lock, get_connection
 
 
+def _now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
 def _now_iso() -> str:
-    return dt.datetime.now(dt.timezone.utc).isoformat()
+    return _now().isoformat()
 
 
 def _row_to_dict(row: Any) -> dict[str, Any]:
@@ -107,7 +111,7 @@ def list_accounts() -> list[dict[str, Any]]:
                daily_sent_date,
                dm_interval_min_sec, dm_interval_max_sec,
                COALESCE(peerflood_streak, 0) AS peerflood_streak,
-               peerflood_last_at,
+               peerflood_last_at, peerflood_window_started_at,
                interval_backup_min, interval_backup_max, interval_backoff_until,
                COALESCE(auth_status, 'unknown') AS auth_status,
                auth_error, auth_lost_at, auth_notified_at,
@@ -131,7 +135,7 @@ def get_account(user_id: int) -> Optional[dict[str, Any]]:
                daily_sent_date,
                dm_interval_min_sec, dm_interval_max_sec,
                COALESCE(peerflood_streak, 0) AS peerflood_streak,
-               peerflood_last_at,
+               peerflood_last_at, peerflood_window_started_at,
                interval_backup_min, interval_backup_max, interval_backoff_until,
                COALESCE(auth_status, 'unknown') AS auth_status,
                auth_error, auth_lost_at, auth_notified_at,
@@ -575,162 +579,123 @@ def format_dm_interval(acc: dict) -> str:
 
 
 def register_peerflood_hit(user_id: int) -> dict:
-    """
-    If PeerFlood repeats sooner than 10–15 min on this account → force ~30 min pause
-    and temporarily slow first-DM interval; restore later via maybe_restore_*.
+    """Register one PeerFlood and apply the exact rolling 5-in-10 rule.
 
-    Returns: streak, pause_seconds (absolute), interval_bumped.
+    The ordinary admin-configured pause is always preserved. Only the fifth
+    event for the same account inside the preceding ten minutes adds the
+    separately configurable extra cooldown. After a trigger, that five-event
+    group is consumed and a new group starts from the next PeerFlood.
     """
-    import datetime as dt
-    import random
-
     user_id = int(user_id)
-    now = dt.datetime.now(dt.timezone.utc)
+    now = _now()
     now_iso = now.isoformat()
-    acc = get_account(user_id) or {}
+    cutoff_iso = (now - dt.timedelta(minutes=10)).isoformat()
+    threshold = 5
 
-    last = None
-    raw_last = acc.get("peerflood_last_at")
-    if raw_last:
-        try:
-            last = dt.datetime.fromisoformat(str(raw_last).replace("Z", "+00:00"))
-            if last.tzinfo is None:
-                last = last.replace(tzinfo=dt.timezone.utc)
-        except (TypeError, ValueError, OverflowError):
-            last = None
-
-    # "Too fast" = previous PeerFlood within 10–15 min (random band)
-    window_sec = random.randint(10 * 60, 15 * 60)
-    rapid = bool(last and (now - last).total_seconds() <= window_sec)
-
-    streak = int(acc.get("peerflood_streak") or 0)
-    if rapid:
-        streak = min(streak + 1, 10)
-    else:
-        streak = 1
-
-    # Base pause from global PeerFlood settings
     from services import runtime as runtime_svc
-    base = int(runtime_svc.pick_peer_flood_seconds())
 
-    interval_bumped = False
-    # Rapid loop → fixed ~30 min pause (not escalating forever)
-    if rapid:
-        pause_seconds = 30 * 60
-        lo = acc.get("dm_interval_min_sec")
-        hi = acc.get("dm_interval_max_sec")
-        backup_min = acc.get("interval_backup_min")
-        backup_max = acc.get("interval_backup_max")
-
-        sets = {
-            "peerflood_streak": streak,
-            "peerflood_last_at": now_iso,
-            "updated_at": now_iso,
-        }
-        if backup_min is None and backup_max is None:
-            sets["interval_backup_min"] = -1 if lo is None else int(lo)
-            sets["interval_backup_max"] = -1 if hi is None else int(hi)
-        # Milder DM pace while cooling: 20–40 min between first DMs
-        sets["dm_interval_min_sec"] = 20 * 60
-        sets["dm_interval_max_sec"] = 40 * 60
-        sets["interval_backoff_until"] = (now + dt.timedelta(minutes=30)).isoformat()
-        interval_bumped = True
-
-        cols = ", ".join(f"{k}=?" for k in sets)
-        vals = list(sets.values()) + [user_id]
-        conn = get_connection()
-        with db_lock(), conn:
-            conn.execute(f"UPDATE accounts SET {cols} WHERE user_id=?", vals)
-    else:
-        pause_seconds = base
-        conn = get_connection()
-        with db_lock(), conn:
+    base_seconds = int(runtime_svc.pick_peer_flood_seconds())
+    conn = get_connection()
+    with db_lock(), conn:
+        conn.execute(
+            "DELETE FROM peerflood_hits WHERE account_user_id=? AND occurred_at<?",
+            (user_id, cutoff_iso),
+        )
+        conn.execute(
+            "INSERT INTO peerflood_hits(account_user_id, occurred_at) VALUES (?, ?)",
+            (user_id, now_iso),
+        )
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS c, MIN(occurred_at) AS first_at
+              FROM peerflood_hits
+             WHERE account_user_id=? AND occurred_at>=?
+            """,
+            (user_id, cutoff_iso),
+        ).fetchone()
+        hit_number = int(row["c"] if row else 1)
+        window_started = str(row["first_at"]) if row and row["first_at"] else now_iso
+        burst_triggered = hit_number >= threshold
+        if burst_triggered:
             conn.execute(
-                """
-                UPDATE accounts
-                   SET peerflood_streak=?,
-                       peerflood_last_at=?,
-                       updated_at=?
-                 WHERE user_id=?
-                """,
-                (streak, now_iso, now_iso, user_id),
+                "DELETE FROM peerflood_hits WHERE account_user_id=?",
+                (user_id,),
             )
+            persisted_count = 0
+            persisted_window = None
+        else:
+            persisted_count = hit_number
+            persisted_window = window_started
+        conn.execute(
+            """
+            UPDATE accounts
+               SET peerflood_streak=?,
+                   peerflood_last_at=?,
+                   peerflood_window_started_at=?,
+                   updated_at=?
+             WHERE user_id=?
+            """,
+            (persisted_count, now_iso, persisted_window, now_iso, user_id),
+        )
+
+    extra_seconds = (
+        int(runtime_svc.get_peer_flood_burst_extra_seconds())
+        if burst_triggered
+        else 0
+    )
+    pause_seconds = base_seconds + extra_seconds
 
     return {
-        "streak": streak,
+        "streak": hit_number,
         "pause_seconds": int(pause_seconds),
-        "pause_multiplier": 1,
-        "interval_bumped": interval_bumped,
-        "rapid": rapid,
+        "base_pause_seconds": int(base_seconds),
+        "extra_pause_seconds": int(extra_seconds),
+        "burst_triggered": bool(burst_triggered),
+        "window_seconds": 10 * 60,
+        "threshold": threshold,
+        "interval_bumped": False,
+        "rapid": bool(hit_number > 1),
     }
 
-
 def maybe_restore_interval_after_success(user_id: int) -> bool:
-    """Decay streak after successful DM; restore interval when safe."""
-    import datetime as dt
-
+    """Restore only a legacy interval backup; do not alter the 5-in-10 counter."""
     user_id = int(user_id)
     acc = get_account(user_id)
     if not acc:
         return False
-    now = dt.datetime.now(dt.timezone.utc)
-    now_iso = now.isoformat()
-    streak = max(0, int(acc.get("peerflood_streak") or 0) - 1)
     backup_min = acc.get("interval_backup_min")
     backup_max = acc.get("interval_backup_max")
-    until = None
-    raw_until = acc.get("interval_backoff_until")
-    if raw_until:
-        try:
-            until = dt.datetime.fromisoformat(str(raw_until).replace("Z", "+00:00"))
-            if until.tzinfo is None:
-                until = until.replace(tzinfo=dt.timezone.utc)
-        except (TypeError, ValueError, OverflowError):
-            until = None
+    if backup_min is None and backup_max is None:
+        return False
 
-    restored = False
+    try:
+        bmin = int(backup_min) if backup_min is not None else -1
+    except (TypeError, ValueError):
+        bmin = -1
+    try:
+        bmax = int(backup_max) if backup_max is not None else bmin
+    except (TypeError, ValueError):
+        bmax = bmin
+    if bmin == -1 or bmax == -1:
+        new_lo, new_hi = None, None
+    else:
+        new_lo, new_hi = sorted((bmin, bmax))
+
+    now_iso = _now_iso()
     conn = get_connection()
     with db_lock(), conn:
-        if backup_min is not None and (
-            streak <= 0 or (until is not None and until <= now)
-        ):
-            try:
-                bmin = int(backup_min)
-            except (TypeError, ValueError):
-                bmin = -1
-            try:
-                bmax = int(backup_max) if backup_max is not None else bmin
-            except (TypeError, ValueError):
-                bmax = bmin
-            if bmin == -1 or bmax == -1:
-                new_lo, new_hi = None, None
-            else:
-                new_lo, new_hi = bmin, bmax
-                if new_lo > new_hi:
-                    new_lo, new_hi = new_hi, new_lo
-            conn.execute(
-                """
-                UPDATE accounts
-                   SET peerflood_streak=?,
-                       dm_interval_min_sec=?,
-                       dm_interval_max_sec=?,
-                       interval_backup_min=NULL,
-                       interval_backup_max=NULL,
-                       interval_backoff_until=NULL,
-                       updated_at=?
-                 WHERE user_id=?
-                """,
-                (streak, new_lo, new_hi, now_iso, user_id),
-            )
-            restored = True
-        else:
-            conn.execute(
-                """
-                UPDATE accounts
-                   SET peerflood_streak=?,
-                       updated_at=?
-                 WHERE user_id=?
-                """,
-                (streak, now_iso, user_id),
-            )
-    return restored
+        conn.execute(
+            """
+            UPDATE accounts
+               SET dm_interval_min_sec=?,
+                   dm_interval_max_sec=?,
+                   interval_backup_min=NULL,
+                   interval_backup_max=NULL,
+                   interval_backoff_until=NULL,
+                   updated_at=?
+             WHERE user_id=?
+            """,
+            (new_lo, new_hi, now_iso, user_id),
+        )
+    return True
+

@@ -12,9 +12,13 @@ KEY_PEER_FLOOD_SEC = "peer_flood_min_cooldown_seconds"  # legacy single value
 KEY_PEER_FLOOD_MIN = "peer_flood_min_cooldown_minutes"  # legacy minutes
 KEY_PEER_FLOOD_LO = "peer_flood_cooldown_lo_seconds"
 KEY_PEER_FLOOD_HI = "peer_flood_cooldown_hi_seconds"
+KEY_PEER_FLOOD_BURST_EXTRA = "peer_flood_burst_extra_cooldown_seconds"
 
 PEER_FLOOD_MIN_ALLOWED_SEC = 60         # 1 minute
 PEER_FLOOD_MAX_ALLOWED_SEC = 24 * 3600  # 24 hours
+PEER_FLOOD_BURST_EXTRA_DEFAULT_SEC = 10 * 60
+PEER_FLOOD_BURST_EXTRA_MIN_SEC = 60
+PEER_FLOOD_BURST_EXTRA_MAX_SEC = 24 * 3600
 
 
 def _now_iso() -> str:
@@ -121,6 +125,34 @@ def pick_peer_flood_seconds() -> int:
     if lo >= hi:
         return lo
     return random.randint(lo, hi)
+
+
+def get_peer_flood_burst_extra_seconds() -> int:
+    """Extra pause added only on the fifth PeerFlood inside ten minutes."""
+    raw = _get(KEY_PEER_FLOOD_BURST_EXTRA)
+    if raw is None or str(raw).strip() == "":
+        return PEER_FLOOD_BURST_EXTRA_DEFAULT_SEC
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        return PEER_FLOOD_BURST_EXTRA_DEFAULT_SEC
+    return max(
+        PEER_FLOOD_BURST_EXTRA_MIN_SEC,
+        min(PEER_FLOOD_BURST_EXTRA_MAX_SEC, value),
+    )
+
+
+def set_peer_flood_burst_extra_seconds(seconds: int) -> int:
+    value = max(
+        PEER_FLOOD_BURST_EXTRA_MIN_SEC,
+        min(PEER_FLOOD_BURST_EXTRA_MAX_SEC, int(seconds)),
+    )
+    _set(KEY_PEER_FLOOD_BURST_EXTRA, str(value))
+    return value
+
+
+def format_peer_flood_burst_extra() -> str:
+    return format_duration(get_peer_flood_burst_extra_seconds())
 
 
 def format_duration(seconds: int) -> str:

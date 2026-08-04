@@ -48,6 +48,7 @@ def test_import_reopens_sent(app_env):
 
 
 def test_import_clears_dialog(app_env):
+    from db.schema import get_connection
     from services import audience as a
     from services import queue as q
     from services import dialog_store as d
@@ -63,3 +64,9 @@ def test_import_clears_dialog(app_env):
     a.import_user_ids([777])
     assert d.get_dialog(777) is None
     assert q.count_by_status(q.STATUS_PENDING) == 1
+    archive = get_connection().execute(
+        "SELECT stage, history_json FROM dialog_archives WHERE target_user_id=777"
+    ).fetchone()
+    assert archive is not None
+    assert archive["stage"] == d.STAGE_EXPLAINED
+    assert "hi?" in archive["history_json"]

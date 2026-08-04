@@ -121,6 +121,10 @@ def init_db() -> None:
             conn, "accounts", "peerflood_last_at", "peerflood_last_at TEXT"
         )
         _ensure_column(
+            conn, "accounts", "peerflood_window_started_at",
+            "peerflood_window_started_at TEXT"
+        )
+        _ensure_column(
             conn, "accounts", "interval_backup_min", "interval_backup_min INTEGER"
         )
         _ensure_column(
@@ -136,6 +140,80 @@ def init_db() -> None:
         _ensure_column(conn, "accounts", "auth_error", "auth_error TEXT")
         _ensure_column(conn, "accounts", "auth_lost_at", "auth_lost_at TEXT")
         _ensure_column(conn, "accounts", "auth_notified_at", "auth_notified_at TEXT")
+
+        # v1.0.62 removes the old "second rapid PeerFlood" interval backoff.
+        # Restore any backed-up per-account interval once, but do not touch the
+        # ordinary PeerFlood range, pacing settings, limits or active dialogs.
+        migration_name = "v1_0_62_peerflood_five_in_ten"
+        applied = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE name=?",
+            (migration_name,),
+        ).fetchone()
+        if not applied:
+            rejected_v1061 = conn.execute(
+                """
+                SELECT 1 FROM schema_migrations
+                 WHERE name='v1_0_61_peerflood_four_in_ten_base_10m'
+                """
+            ).fetchone()
+            if rejected_v1061:
+                # The rejected v1.0.61 migration forcibly overwrote the
+                # administrator's ordinary PeerFlood range with 600-600.
+                # Restore the approved 60-90 second range only when that exact
+                # migration marker proves the overwrite occurred.
+                now_sql = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+                for key, value in (
+                    ("peer_flood_cooldown_lo_seconds", "60"),
+                    ("peer_flood_cooldown_hi_seconds", "90"),
+                    ("peer_flood_min_cooldown_seconds", "75"),
+                ):
+                    conn.execute(
+                        f"""
+                        INSERT INTO runtime_meta(key, value, updated_at)
+                        VALUES (?, ?, {now_sql})
+                        ON CONFLICT(key) DO UPDATE SET
+                            value=excluded.value,
+                            updated_at=excluded.updated_at
+                        """,
+                        (key, value),
+                    )
+
+            conn.execute(
+                """
+                UPDATE accounts
+                   SET dm_interval_min_sec=CASE
+                           WHEN COALESCE(interval_backup_min, interval_backup_max, -1)=-1
+                           THEN NULL
+                           ELSE COALESCE(interval_backup_min, interval_backup_max)
+                       END,
+                       dm_interval_max_sec=CASE
+                           WHEN COALESCE(interval_backup_max, interval_backup_min, -1)=-1
+                           THEN NULL
+                           ELSE COALESCE(interval_backup_max, interval_backup_min)
+                       END,
+                       interval_backup_min=NULL,
+                       interval_backup_max=NULL,
+                       interval_backoff_until=NULL,
+                       peerflood_streak=0,
+                       peerflood_window_started_at=NULL
+                 WHERE interval_backup_min IS NOT NULL
+                    OR interval_backup_max IS NOT NULL
+                    OR interval_backoff_until IS NOT NULL
+                """
+            )
+            conn.execute(
+                "UPDATE accounts SET peerflood_streak=0, peerflood_window_started_at=NULL"
+            )
+            # The table is created later in this transaction on clean installs;
+            # legacy databases cannot contain it yet, so no event rows exist.
+            conn.execute(
+                """
+                INSERT INTO schema_migrations(name, applied_at)
+                VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                """,
+                (migration_name,),
+            )
+
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_accounts_participates
@@ -146,6 +224,21 @@ def init_db() -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_accounts_auth_status
             ON accounts(auth_status)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS peerflood_hits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_user_id INTEGER NOT NULL,
+                occurred_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_peerflood_hits_account_time
+            ON peerflood_hits(account_user_id, occurred_at)
             """
         )
         conn.execute(

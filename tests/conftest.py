@@ -9,6 +9,18 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+STUB_ROOT = ROOT / "test_support" / "stubs"
+
+# The production runtime still requires the real packages from requirements.txt.
+# Tests can run in a clean/offline audit environment by using minimal local
+# adapters only when Telethon/python-decouple are unavailable.
+try:
+    import decouple  # noqa: F401
+    import telethon  # noqa: F401
+except ModuleNotFoundError:
+    if str(STUB_ROOT) not in sys.path:
+        sys.path.insert(0, str(STUB_ROOT))
+
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -46,8 +58,8 @@ def app_env(tmp_path, monkeypatch):
     from db import schema as schema_mod
 
     # Ensure no stale connection from a previous DB_PATH.
-    schema_mod._conn = None
+    schema_mod.close_connection()
     schema_mod.init_db()
     yield {"db": str(db)}
-    schema_mod._conn = None
+    schema_mod.close_connection()
     _purge_app_modules()

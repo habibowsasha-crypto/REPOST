@@ -567,6 +567,7 @@ def _peerflood_screen() -> str:
     from services import runtime as runtime_svc
 
     pf = runtime_svc.format_peer_flood_range()
+    burst_extra = runtime_svc.format_peer_flood_burst_extra()
     return screen(
         "⚠️",
         "После PeerFlood",
@@ -578,6 +579,7 @@ def _peerflood_screen() -> str:
             "• ждём случайное время из диапазона ниже",
         ),
         f"Сейчас: **{pf}** (рандом каждый раз)",
+        f"После **5 PeerFlood за 10 минут**: +**{burst_extra}**",
         "Пресет или свой `min max` в **секундах**:",
     )
 
@@ -596,6 +598,7 @@ def _peerflood_buttons():
             btn("10–30 мин", b"pf_rng_600_1800"),
         ],
         [btn("✏️ Свой min max (сек)", b"pf_custom")],
+        [btn("🔥 Доп. пауза после 5/10", b"pf_burst")],
         back_row(b"menu_settings"),
         back_home_row(),
     ]
@@ -668,6 +671,89 @@ async def cb_pf_custom(event: events.CallbackQuery.Event) -> None:
     await event.answer()
 
 
+def _peerflood_burst_screen() -> str:
+    from services import runtime as runtime_svc
+
+    extra = runtime_svc.format_peer_flood_burst_extra()
+    return screen(
+        "🔥",
+        "Дополнительная пауза 5/10",
+        "Срабатывает только если **один аккаунт** получает",
+        "**5 PeerFlood за скользящие 10 минут**.",
+        "",
+        f"Сейчас добавляется: **{extra}**",
+        "",
+        "Обычный PeerFlood и все остальные настройки не меняются.",
+    )
+
+
+def _peerflood_burst_buttons():
+    return [
+        [
+            btn("5 мин", b"pf_burst_set_300"),
+            btn("10 мин", b"pf_burst_set_600"),
+        ],
+        [
+            btn("15 мин", b"pf_burst_set_900"),
+            btn("30 мин", b"pf_burst_set_1800"),
+        ],
+        [btn("✏️ Свое время (сек)", b"pf_burst_custom")],
+        back_row(b"bc_peerflood"),
+        back_home_row(),
+    ]
+
+
+@bot.on(events.CallbackQuery(data=b"pf_burst"))
+async def cb_pf_burst(event: events.CallbackQuery.Event) -> None:
+    if not is_admin(event.sender_id):
+        await event.answer(DENIED, alert=True)
+        return
+    await render_menu(event, _peerflood_burst_screen(), _peerflood_burst_buttons())
+    await event.answer()
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^pf_burst_set_(\d+)$"))
+async def cb_pf_burst_set(event: events.CallbackQuery.Event) -> None:
+    if not is_admin(event.sender_id):
+        await event.answer(DENIED, alert=True)
+        return
+    from services import runtime as runtime_svc
+
+    seconds = int(event.pattern_match.group(1))
+    value = runtime_svc.set_peer_flood_burst_extra_seconds(seconds)
+    await render_menu(event, _peerflood_burst_screen(), _peerflood_burst_buttons())
+    await event.answer(
+        f"Доп. пауза: {runtime_svc.format_duration(value)}"
+    )
+
+
+@bot.on(events.CallbackQuery(data=b"pf_burst_custom"))
+async def cb_pf_burst_custom(event: events.CallbackQuery.Event) -> None:
+    if not is_admin(event.sender_id):
+        await event.answer(DENIED, alert=True)
+        return
+    from services.admin_state import set_state
+    from services import runtime as runtime_svc
+
+    set_state(event.sender_id, flow="peerflood", step="burst_extra")
+    text = screen(
+        "✏️",
+        "Своя дополнительная пауза",
+        f"Сейчас: **{runtime_svc.format_peer_flood_burst_extra()}**",
+        "Пришли **одно число в секундах**.",
+        f"Допустимо: **{runtime_svc.PEER_FLOOD_BURST_EXTRA_MIN_SEC}-"
+        f"{runtime_svc.PEER_FLOOD_BURST_EXTRA_MAX_SEC}** сек.",
+        "Пример: `600` (=10 минут)",
+        "Отмена: /cancel",
+    )
+    await render_menu(
+        event,
+        text,
+        [back_row(b"pf_burst"), back_home_row()],
+    )
+    await event.answer()
+
+
 def _is_peerflood_flow(event) -> bool:
     if not event.is_private:
         return False
@@ -685,15 +771,33 @@ async def on_peerflood_custom(event: events.NewMessage.Event) -> None:
     from services import runtime as runtime_svc
 
     st = get_state(event.sender_id) or {}
-    if st.get("step") != "custom_range":
-        return
+    step = st.get("step")
     raw = (event.raw_text or "").strip()
     if raw.startswith("/"):
         return
+
+    if step == "burst_extra":
+        if not raw.isdigit():
+            await event.respond("Формат: одно число в секундах, например `600`.")
+            return
+        value = runtime_svc.set_peer_flood_burst_extra_seconds(int(raw))
+        clear_state(event.sender_id)
+        await event.respond(
+            screen(
+                "🔥",
+                "Дополнительная пауза 5/10",
+                f"Сохранено: **{runtime_svc.format_duration(value)}**",
+                "Она добавится только после 5 PeerFlood одного аккаунта за 10 минут.",
+            ),
+            buttons=[back_home_row()],
+        )
+        return
+
+    if step != "custom_range":
+        return
     parts = raw.replace(",", " ").split()
     if len(parts) == 1 and parts[0].isdigit():
-        n = int(parts[0])
-        a, b = runtime_svc.set_peer_flood_range_seconds(n, n)
+        a, b = runtime_svc.set_peer_flood_range_seconds(int(parts[0]), int(parts[0]))
     elif len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
         a, b = runtime_svc.set_peer_flood_range_seconds(int(parts[0]), int(parts[1]))
     else:
@@ -706,7 +810,7 @@ async def on_peerflood_custom(event: events.NewMessage.Event) -> None:
             "⚠️",
             "Пауза PeerFlood",
             f"Сохранено: **{label}**",
-            f"`{a}`–`{b}` сек · рандом при каждом PeerFlood",
+            f"`{a}`-`{b}` сек · рандом при каждом PeerFlood",
         ),
         buttons=[back_home_row()],
     )

@@ -1,6 +1,20 @@
-# Channel DM Bot v1.0.60
+# Channel DM Bot v1.0.62
 
 Telegram user-account DM bot: monitors selected groups, builds one shared lead queue, sends First DM, continues active dialogs, handles refusals, sends only the administrator's exact channel link, and stores durable state in SQLite.
+
+
+## Changes in v1.0.62 - exact PeerFlood 5-in-10 escalation
+
+- Built strictly from the confirmed v1.0.60 release. The rejected v1.0.61 behavior is not used.
+- Ordinary PeerFlood behavior remains unchanged and continues to use the administrator's current random range.
+- A separate rolling ten-minute event window is maintained for each Telegram account.
+- The first four PeerFlood events inside that window do not change pacing and use only the ordinary configured pause.
+- On the fifth PeerFlood inside the preceding ten minutes, a separate extra cooldown is added to the ordinary pause.
+- The extra cooldown defaults to 600 seconds and is independently editable by the administrator.
+- After the fifth event triggers the extra pause, that five-event group is consumed and the next PeerFlood begins a new group.
+- No account interval, global spacing, daily quota, AI delay, apology delay, filter, source-account priority or account order changed.
+- Migration restores any legacy temporary 20-40 minute per-account interval backup created by the old rapid-PeerFlood rule, without changing current runtime pacing settings.
+- Added 7 dedicated v1.0.62 regression tests.
 
 
 ## Changes in v1.0.60 - dashboard First DM countdowns
@@ -370,7 +384,7 @@ The Telegram user-session must still exist when cleanup becomes due. The account
 
 ## Quick live test
 
-1. Deploy v1.0.60 over the existing volume/database.
+1. Deploy v1.0.62 over the existing volume/database.
 2. Confirm the new dashboard and all-time First-DM counter.
 3. Send a test First DM and confirm only one routine admin notification.
 4. Continue the dialog and confirm no reply/link/follow-up push notifications appear.

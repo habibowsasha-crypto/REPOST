@@ -112,27 +112,46 @@ def test_scheduled_followup_recovery_checks_telegram(app_env, monkeypatch):
 
 
 def test_local_history_purge_keeps_metadata(app_env):
+    import json
+
     from db.schema import db_lock, get_connection
     from services import dialog_delivery, dialog_store, retention
 
     _seed_sent_dialog(10, 204)
     conn = get_connection()
-    past = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)).isoformat()
+    old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=181)).isoformat()
+    due = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)).isoformat()
     with db_lock(), conn:
         conn.execute(
-            "UPDATE dialogs SET history_purge_at=? WHERE target_user_id=?",
-            (past, 204),
+            """
+            UPDATE dialogs
+               SET first_dm_at=?, history_purge_at=?, history_json=?,
+                   stage=?, auto_link_at=?
+             WHERE target_user_id=?
+            """,
+            (
+                old,
+                due,
+                json.dumps([{"role": "assistant", "text": "Можно спросить?", "at": old}]),
+                dialog_store.STAGE_EXPLAINED,
+                due,
+                204,
+            ),
         )
         conn.execute(
-            "UPDATE dialogs SET stage=?, auto_link_at=? WHERE target_user_id=?",
-            (dialog_store.STAGE_EXPLAINED, past, 204),
+            """
+            UPDATE first_dm_outbox SET prepared_at=?, sent_at=?
+             WHERE target_user_id=?
+            """,
+            (old, old, 204),
         )
     assert dialog_delivery.prepare(204, 10, dialog_delivery.KIND_AUTO_LINK, "Текст ссылки")
 
     assert retention.process_due_local_history_purge() == 1
     dialog = dialog_store.get_dialog(204)
     assert dialog["history"] == []
-    assert dialog["history_purged_at"] is not None
+    assert dialog["history_purged_at"] is None
+    assert dialog["history_purge_at"] is not None
     assert int(dialog["account_user_id"]) == 10
     assert dialog["first_dm_at"] is not None
     first_text = conn.execute(
@@ -142,8 +161,7 @@ def test_local_history_purge_keeps_metadata(app_env):
         "SELECT text FROM dialog_outbox WHERE target_user_id=204"
     ).fetchone()["text"]
     assert first_text == ""
-    assert auto_text == ""
-
+    assert auto_text == "Текст ссылки"
 
 def test_telegram_retention_deletes_from_first_dm_for_both_sides(app_env, monkeypatch):
     from db.schema import db_lock, get_connection
