@@ -559,10 +559,34 @@ def init_db() -> None:
             )
             """
         )
+        _ensure_column(
+            conn,
+            "first_dm_outbox",
+            "recovery_attempts",
+            "recovery_attempts INTEGER NOT NULL DEFAULT 0",
+        )
+        _ensure_column(
+            conn,
+            "first_dm_outbox",
+            "recovery_next_at",
+            "recovery_next_at TEXT",
+        )
+        _ensure_column(
+            conn,
+            "first_dm_outbox",
+            "recovery_last_error",
+            "recovery_last_error TEXT",
+        )
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_first_dm_outbox_status_prepared
             ON first_dm_outbox(status, prepared_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_first_dm_outbox_recovery_due
+            ON first_dm_outbox(status, recovery_next_at, prepared_at)
             """
         )
 

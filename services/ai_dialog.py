@@ -350,74 +350,92 @@ def is_too_similar(text: str, recent: list[str], *, threshold: float = 0.80) -> 
     return False
 
 
-def _promo_instruction(category: str, pitch: str, *, retry: int) -> str:
+def _promo_opening_instruction(
+    category: str,
+    *,
+    retry: int,
+    pitch: str = "",
+) -> str:
     category_guidance = {
-        CATEGORY_NORMAL: "Коротко отреагируй на ответ пользователя и естественно перейди к каналу.",
-        CATEGORY_UNCLEAR: "Скажи, что не совсем понял, и без выдумок объясни, зачем написал.",
-        CATEGORY_LINK_REQUEST: "Пользователь просит ссылку. Начни прямо: 'да, держи' или похоже.",
-        CATEGORY_SOFT_REFUSAL: "Пользователь спокойно отказался. Не спорь. Сделай одну спокойную последнюю попытку.",
-    }.get(category, "Коротко и естественно перейди к предложению.")
-    retry_note = ""
-    if retry:
-        retry_note = (
-            f"Это повторная генерация номер {retry}. Сильно измени начало, порядок фраз и "
-            "формулировку пользы, но не меняй факты.\n"
-        )
+        CATEGORY_NORMAL: "Коротко и естественно отреагируй на ответ пользователя.",
+        CATEGORY_UNCLEAR: "Скажи, что не совсем понял реакцию, без выдумок.",
+        CATEGORY_LINK_REQUEST: "Пользователь просит ссылку. Начни прямо и дружелюбно.",
+        CATEGORY_SOFT_REFUSAL: "Пользователь спокойно отказался. Ответь без давления.",
+    }.get(category, "Коротко отреагируй на сообщение пользователя.")
+    retry_note = (
+        "Сформулируй совсем иначе, чем в прошлой попытке. " if retry else ""
+    )
     return (
-        "Напиши одно цельное сообщение как обычный пользователь Telegram, который интересуется криптой.\n"
-        "Не пиши как менеджер, рекламный бот или официальный представитель.\n"
-        "Обращайся на 'ты'. Пиши просто, обычно 1-3 коротких предложения.\n"
-        f"Ситуация: {category}. {category_guidance}\n"
-        f"Смысл канала: {pitch}\n"
-        "Обязательные факты:\n"
-        "- канал бесплатный\n"
-        "- программа или софт автоматически копирует новые посты из закрытых VIP-каналов\n"
-        "- посты появляются почти сразу после выхода\n"
-        "- отдельные VIP-доступы покупать не нужно\n"
-        "- скажи о возможной пользе: идея, сетап, анализ, разбор или сравнение со своим мнением\n"
-        "Ссылку добавит система. Не пиши URL, t.me или @username.\n"
-        "Не выдумывай свою биографию, сделки, прибыль, депозит, опыт или знакомых.\n"
-        "Не обещай прибыль и не называй сигналы прибыльными.\n"
-        "Не задавай новый вопрос. Не используй длинное тире. Только обычный дефис '-'.\n"
-        f"{retry_note}"
-        "Верни только готовое сообщение."
+        "Напиши только короткое начало сообщения для обычного Telegram-диалога. "
+        "Длина 2-10 слов, без вопроса, ссылки и рекламного описания. "
+        "Обращайся на 'ты', пиши просто и по-человечески. "
+        f"{category_guidance} {retry_note}"
+        f"Контекст предложения: {(pitch or 'бесплатный крипто-канал')[:240]}. "
+        "Не пересказывай контекст, он нужен только для понимания ситуации. "
+        "Примеры формата: 'понял тебя', 'ага, ясно', 'да, держи', "
+        "'не совсем понял реакцию'. Верни только начало."
     )
 
 
-def _promo_ok(text: str) -> bool:
+def _promo_opening_ok(text: str) -> bool:
     value = _strip_bad_dashes(text)
-    if not 45 <= len(value) <= 420:
+    if not 2 <= len(value) <= 90:
+        return False
+    if "?" in value or "\n" in value:
         return False
     if _URL_RE.search(value) or _TELEGRAM_HANDLE_RE.search(value):
         return False
     if _FORBIDDEN_CLAIMS_RE.search(value):
         return False
-    checks = (
-        _REQUIRED_SOFTWARE_RE,
-        _REQUIRED_COPY_RE,
-        _REQUIRED_VIP_RE,
-        _REQUIRED_FREE_RE,
-        _REQUIRED_SPEED_RE,
-        _REQUIRED_BENEFIT_RE,
-    )
-    return all(pattern.search(value) for pattern in checks)
+    return True
 
 
-def _build_local_promo(category: str) -> str:
-    reactions = _PROMO_REACTIONS.get(category) or _PROMO_REACTIONS[CATEGORY_NORMAL]
-    reaction = random.choice(reactions)
+def _build_promo_with_opening(opening: str, category: str) -> str:
+    safe_opening = _strip_bad_dashes(opening).strip(" .,!?:;-")
+    if not safe_opening:
+        reactions = _PROMO_REACTIONS.get(category) or _PROMO_REACTIONS[CATEGORY_NORMAL]
+        safe_opening = random.choice(reactions)
     transition = random.choice(_PROMO_TRANSITIONS)
     mechanics = random.choice(_PROMO_MECHANICS)
     access = random.choice(_PROMO_ACCESS)
     benefit = random.choice(_PROMO_BENEFITS)
-
     shapes = [
-        f"{reaction}. {transition}, {mechanics}. {access}, {benefit}",
-        f"{reaction}. {transition} - {mechanics}. {benefit}, {access}",
-        f"{reaction}, {transition}. {mechanics}, {access}. {benefit}",
-        f"{reaction}. {mechanics}, а {access}. {benefit}",
+        f"{safe_opening}. {transition}, {mechanics}. {access}, {benefit}",
+        f"{safe_opening}. {transition} - {mechanics}. {benefit}, {access}",
+        f"{safe_opening}, {transition}. {mechanics}, {access}. {benefit}",
+        f"{safe_opening}. {transition}: {mechanics}. {access}, {benefit}",
     ]
     return _strip_bad_dashes(random.choice(shapes))
+
+
+def _promo_validation_errors(text: str) -> list[str]:
+    value = _strip_bad_dashes(text)
+    errors: list[str] = []
+    if not 45 <= len(value) <= 420:
+        errors.append("length")
+    if _URL_RE.search(value) or _TELEGRAM_HANDLE_RE.search(value):
+        errors.append("foreign_link")
+    if _FORBIDDEN_CLAIMS_RE.search(value):
+        errors.append("forbidden_claim")
+    checks = (
+        ("software", _REQUIRED_SOFTWARE_RE),
+        ("copy", _REQUIRED_COPY_RE),
+        ("vip", _REQUIRED_VIP_RE),
+        ("free", _REQUIRED_FREE_RE),
+        ("speed", _REQUIRED_SPEED_RE),
+        ("benefit", _REQUIRED_BENEFIT_RE),
+    )
+    errors.extend(name for name, pattern in checks if not pattern.search(value))
+    return errors
+
+
+def _promo_ok(text: str) -> bool:
+    return not _promo_validation_errors(text)
+
+
+def _build_local_promo(category: str) -> str:
+    reactions = _PROMO_REACTIONS.get(category) or _PROMO_REACTIONS[CATEGORY_NORMAL]
+    return _build_promo_with_opening(random.choice(reactions), category)
 
 
 async def generate_promo(
@@ -438,25 +456,45 @@ async def generate_promo(
         category = CATEGORY_NORMAL
 
     recent = phrases_svc.recent_texts(phrases_svc.KIND_PROMO, limit=30)
-    pitch = CHANNEL_PITCH or (
-        "бесплатный канал, где софт почти сразу копирует новые посты из закрытых "
-        "VIP-каналов, без покупки отдельных доступов"
-    )
-
     if AI_DM_ENABLED and OPENAI_API_KEY:
         for retry in range(3):
             try:
-                text = await _openai_reply(
+                opening = await _openai_reply(
                     history,
-                    instruction=_promo_instruction(category, pitch, retry=retry),
-                    temperature=0.82 if retry == 0 else 0.95,
+                    instruction=_promo_opening_instruction(
+                        category,
+                        retry=retry,
+                        pitch=CHANNEL_PITCH,
+                    ),
+                    temperature=0.72 if retry == 0 else 0.9,
                 )
-                text = _enforce_admin_link(text or "", include_link=False)
-                if not _promo_ok(text):
-                    logger.warning("Promo rejected by validator retry={} text={!r}", retry, text[:100])
+                opening = _enforce_admin_link(opening or "", include_link=False)
+                if not _promo_opening_ok(opening):
+                    logger.warning(
+                        "Promo opening rejected category={} retry={} text={!r}",
+                        category,
+                        retry,
+                        opening[:100],
+                    )
+                    continue
+                text = _build_promo_with_opening(opening, category)
+                validation_errors = _promo_validation_errors(text)
+                if validation_errors:
+                    logger.warning(
+                        "Promo assembly rejected category={} retry={} reasons={} text={!r}",
+                        category,
+                        retry,
+                        ",".join(validation_errors),
+                        text[:120],
+                    )
                     continue
                 if is_too_similar(text, recent):
-                    logger.warning("Promo rejected as duplicate retry={} text={!r}", retry, text[:100])
+                    logger.warning(
+                        "Promo rejected as duplicate category={} retry={} text={!r}",
+                        category,
+                        retry,
+                        text[:120],
+                    )
                     continue
                 return _enforce_admin_link(text, include_link=True)
             except ChannelLinkNotConfiguredError:

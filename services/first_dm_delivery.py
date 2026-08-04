@@ -70,8 +70,9 @@ def prepare(
             """
             INSERT INTO first_dm_outbox (
                 target_user_id, account_user_id, text, status,
-                prepared_at, telegram_message_id, sent_at, last_error, updated_at
-            ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?)
+                prepared_at, telegram_message_id, sent_at, last_error, updated_at,
+                recovery_attempts, recovery_next_at, recovery_last_error
+            ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?, 0, NULL, NULL)
             ON CONFLICT(target_user_id) DO UPDATE SET
                 account_user_id=excluded.account_user_id,
                 text=excluded.text,
@@ -80,7 +81,10 @@ def prepare(
                 telegram_message_id=NULL,
                 sent_at=NULL,
                 last_error=NULL,
-                updated_at=excluded.updated_at
+                updated_at=excluded.updated_at,
+                recovery_attempts=0,
+                recovery_next_at=NULL,
+                recovery_last_error=NULL
             """,
             (target, account, str(text), STATUS_PREPARED, now, now),
         )
@@ -191,7 +195,9 @@ def commit_sent(
             """
             UPDATE first_dm_outbox
                SET status=?, telegram_message_id=COALESCE(?, telegram_message_id),
-                   sent_at=COALESCE(sent_at, ?), last_error=NULL, updated_at=?
+                   sent_at=COALESCE(sent_at, ?), last_error=NULL, updated_at=?,
+                   recovery_attempts=0, recovery_next_at=NULL,
+                   recovery_last_error=NULL
              WHERE target_user_id=?
             """,
             (STATUS_SENT, telegram_message_id, sent, now, target),
@@ -319,7 +325,8 @@ def get_prepared(target_user_id: int) -> dict[str, Any] | None:
     row = conn.execute(
         """
         SELECT target_user_id, account_user_id, text, status, prepared_at,
-               telegram_message_id, sent_at, last_error, updated_at
+               telegram_message_id, sent_at, last_error, updated_at,
+               recovery_attempts, recovery_next_at, recovery_last_error
           FROM first_dm_outbox
          WHERE target_user_id=? AND status=?
         """,
@@ -328,21 +335,51 @@ def get_prepared(target_user_id: int) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
-def list_stale_prepared(*, older_than_seconds: int = 45, limit: int = 20) -> list[dict[str, Any]]:
-    cutoff = (_now() - dt.timedelta(seconds=max(1, int(older_than_seconds)))).isoformat()
+def defer_recovery(
+    target_user_id: int,
+    error: str,
+    *,
+    delay_seconds: int,
+) -> int:
+    """Keep an ambiguous First DM safe while backing off the next history check."""
+    target = int(target_user_id)
+    now = _now()
+    next_at = (now + dt.timedelta(seconds=max(1, int(delay_seconds)))).isoformat()
     conn = get_connection()
-    rows = conn.execute(
+    with db_lock(), conn:
+        conn.execute(
+            """
+            UPDATE first_dm_outbox
+               SET recovery_attempts=COALESCE(recovery_attempts, 0) + 1,
+                   recovery_next_at=?, recovery_last_error=?, updated_at=?
+             WHERE target_user_id=? AND status=?
+            """,
+            (next_at, str(error)[:500], now.isoformat(), target, STATUS_PREPARED),
+        )
+        row = conn.execute(
+            "SELECT recovery_attempts FROM first_dm_outbox WHERE target_user_id=?",
+            (target,),
+        ).fetchone()
+    return int(row["recovery_attempts"] or 0) if row else 0
+
+
+def list_stale_prepared(*, older_than_seconds: int = 45, limit: int = 20) -> list[dict[str, Any]]:
+    now = _now()
+    cutoff = (now - dt.timedelta(seconds=max(1, int(older_than_seconds)))).isoformat()
+    rows = get_connection().execute(
         """
         SELECT o.target_user_id, o.account_user_id, o.text, o.prepared_at,
+               o.recovery_attempts, o.recovery_next_at, o.recovery_last_error,
                l.username, l.first_name, l.last_name, l.access_hash,
                l.source_chat_id, l.source_account_user_id
           FROM first_dm_outbox o
           LEFT JOIN leads l ON l.target_user_id=o.target_user_id
          WHERE o.status=? AND o.prepared_at <= ?
+           AND (o.recovery_next_at IS NULL OR o.recovery_next_at <= ?)
          ORDER BY o.prepared_at ASC
          LIMIT ?
         """,
-        (STATUS_PREPARED, cutoff, int(limit)),
+        (STATUS_PREPARED, cutoff, now.isoformat(), int(limit)),
     ).fetchall()
     return [dict(r) for r in rows]
 

@@ -413,19 +413,33 @@ async def recover_ambiguous_first_dms() -> int:
         account_id = int(row["account_user_id"])
         client = monitor_svc.get_client(account_id)
         if client is None or not client.is_connected():
+            attempts = first_dm_delivery.defer_recovery(
+                target_id,
+                "client_unavailable",
+                delay_seconds=300,
+            )
             logger.warning(
-                "Prepared First DM awaits reconciliation: no client account={} target={}",
+                "Prepared First DM recovery deferred account={} target={} reason=no_client "
+                "attempt={} retry_sec=300",
                 account_id,
                 target_id,
+                attempts,
             )
             continue
 
         entity = await _resolve_target_entity(client, account_id, row)
         if entity is None:
+            attempts = first_dm_delivery.defer_recovery(
+                target_id,
+                "entity_unavailable",
+                delay_seconds=1800,
+            )
             logger.warning(
-                "Prepared First DM awaits reconciliation: no entity account={} target={}",
+                "Prepared First DM recovery deferred account={} target={} reason=no_entity "
+                "attempt={} retry_sec=1800",
                 account_id,
                 target_id,
+                attempts,
             )
             continue
 
@@ -443,11 +457,27 @@ async def recover_ambiguous_first_dms() -> int:
                 since=lower_bound,
             )
         except Exception as exc:
-            logger.exception(
-                "Cannot inspect Telegram history account={} target={}: {}",
+            peer_invalid = type(exc).__name__ == "PeerIdInvalidError"
+            retry_sec = 21600 if peer_invalid else 900
+            reason = "peer_id_invalid" if peer_invalid else type(exc).__name__
+            attempts = first_dm_delivery.defer_recovery(
+                target_id,
+                f"{reason}: {exc}",
+                delay_seconds=retry_sec,
+            )
+            logger.warning(
+                "Prepared First DM recovery deferred account={} target={} reason={} "
+                "attempt={} retry_sec={}",
                 account_id,
                 target_id,
-                exc,
+                reason,
+                attempts,
+                retry_sec,
+            )
+            logger.opt(exception=exc).debug(
+                "Prepared First DM recovery diagnostic account={} target={}",
+                account_id,
+                target_id,
             )
             continue
 

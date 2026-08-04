@@ -1,6 +1,17 @@
-# Channel DM Bot v1.0.55
+# Channel DM Bot v1.0.56
 
 Telegram user-account DM bot: monitors selected groups, builds one shared lead queue, sends First DM, continues active dialogs, handles refusals, sends only the administrator's exact channel link, and stores durable state in SQLite.
+
+
+## Changes in v1.0.56 - production log stability hotfix
+
+- First-DM ambiguity recovery now uses durable backoff instead of repeating invalid peer history checks every 15 seconds.
+- `PeerIdInvalidError` is logged once per retry window without production traceback spam.
+- AI generates a contextual opening while code assembles every mandatory channel fact, so validator failures no longer consume three full promo generations.
+- Scheduled promo/apology processing checks durable outbox state before any AI request.
+- Existing prepared actions wait for reconciliation and no longer regenerate text every background tick.
+- Rejected scheduled prepares now log target, account, stage, action and outbox status, then receive a bounded retry deadline.
+- No First-DM limits, intervals, pauses, filters, quotas or account-selection rules were changed.
 
 ## Changes in v1.0.55 - AI personality and completed dialog funnel
 
@@ -308,7 +319,7 @@ The Telegram user-session must still exist when cleanup becomes due. The account
 
 ## Quick live test
 
-1. Deploy v1.0.55 over the existing volume/database.
+1. Deploy v1.0.56 over the existing volume/database.
 2. Confirm the new dashboard and all-time First-DM counter.
 3. Send a test First DM and confirm only one routine admin notification.
 4. Continue the dialog and confirm no reply/link/follow-up push notifications appear.

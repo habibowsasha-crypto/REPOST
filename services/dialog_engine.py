@@ -773,8 +773,55 @@ async def process_due_auto_links() -> int:
                 stage = str(current.get("stage") or "")
                 history = current.get("history") or []
                 if stage == store.STAGE_PROMO_SENT and int(current.get("link_sent") or 0):
-                    text = await ai_dialog.generate_smoothing_apology(history)
                     action_kind = dialog_delivery.KIND_SMOOTH_APOLOGY
+                elif stage == store.STAGE_EXPLAINED and not int(current.get("link_sent") or 0):
+                    action_kind = dialog_delivery.KIND_AUTO_LINK
+                else:
+                    continue
+
+                # Check the durable outbox before calling AI. A PREPARED action is owned
+                # by the reconciliation loop and must never trigger fresh generation.
+                existing = dialog_delivery.get(target, action_kind)
+                existing_status = str((existing or {}).get("status") or "")
+                if existing_status == dialog_delivery.STATUS_PREPARED:
+                    logger.debug(
+                        "Scheduled action awaits reconciliation target={} account={} "
+                        "stage={} action={}",
+                        target,
+                        account,
+                        stage,
+                        action_kind,
+                    )
+                    continue
+                if existing_status == dialog_delivery.STATUS_SENT:
+                    if action_kind == dialog_delivery.KIND_SMOOTH_APOLOGY:
+                        store.set_stage(
+                            target,
+                            store.STAGE_APOLOGY_SENT,
+                            link_sent=True,
+                            clear_auto_link=True,
+                        )
+                    else:
+                        store.set_stage(
+                            target,
+                            store.STAGE_PROMO_SENT,
+                            link_sent=True,
+                            auto_link_at=(
+                                _now() + dt.timedelta(seconds=_auto_link_delay())
+                            ).isoformat(),
+                        )
+                    logger.warning(
+                        "Repaired stale dialog state from sent outbox target={} account={} "
+                        "old_stage={} action={}",
+                        target,
+                        account,
+                        stage,
+                        action_kind,
+                    )
+                    continue
+
+                if action_kind == dialog_delivery.KIND_SMOOTH_APOLOGY:
+                    text = await ai_dialog.generate_smoothing_apology(history)
                     transition = {
                         "stage": store.STAGE_APOLOGY_SENT,
                         "bump_outgoing": True,
@@ -782,14 +829,13 @@ async def process_due_auto_links() -> int:
                         "clear_auto_link": True,
                         "append_history": True,
                     }
-                elif stage == store.STAGE_EXPLAINED and not int(current.get("link_sent") or 0):
+                else:
                     # Upgrade compatibility: complete an old explain-only dialog by sending
                     # the new full promo with the exact link, then schedule its apology.
                     text = await ai_dialog.generate_promo(
                         history,
                         category=ai_dialog.CATEGORY_NORMAL,
                     )
-                    action_kind = dialog_delivery.KIND_AUTO_LINK
                     transition = {
                         "stage": store.STAGE_PROMO_SENT,
                         "bump_outgoing": True,
@@ -799,8 +845,6 @@ async def process_due_auto_links() -> int:
                         ).isoformat(),
                         "append_history": True,
                     }
-                else:
-                    continue
 
                 if not dialog_delivery.prepare(
                     target,
@@ -814,6 +858,29 @@ async def process_due_auto_links() -> int:
                     ),
                     transition=transition,
                 ):
+                    latest_outbox = dialog_delivery.get(target, action_kind) or {}
+                    retry_sec = (
+                        60
+                        if action_kind == dialog_delivery.KIND_SMOOTH_APOLOGY
+                        else 300
+                    )
+                    store.set_stage(
+                        target,
+                        stage,
+                        auto_link_at=(
+                            _now() + dt.timedelta(seconds=retry_sec)
+                        ).isoformat(),
+                    )
+                    logger.warning(
+                        "Scheduled prepare rejected target={} account={} stage={} action={} "
+                        "outbox_status={} retry_sec={}",
+                        target,
+                        account,
+                        stage,
+                        action_kind,
+                        latest_outbox.get("status") or "missing",
+                        retry_sec,
+                    )
                     continue
                 result = await _send_prepared_action(account, target, action_kind, text)
                 if result == "sent":
