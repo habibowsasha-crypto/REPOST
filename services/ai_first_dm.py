@@ -28,6 +28,7 @@ from texts.first_dm import (
 _BAD_DASHES = ("\u2014", "\u2013", "\u2212")
 _LINK_RE = re.compile(r"(https?://|t\.me/|telegram\.me/|www\.|\.com/|\.ru/)", re.IGNORECASE)
 _WORD_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9]+")
+_LEADING_LIST_MARKER_RE = re.compile(r"^\s*(?:(?:[-*•]+)|(?:\d+[.)]))\s+")
 
 _MAGNET_TOPIC_RE = re.compile(
     r"(сигнал|вход|движен|цен|уведомлен|сделк|спот|фьюч|торг|скальп|"
@@ -135,9 +136,23 @@ def sanitize_dashes(text: str) -> str:
     return out.strip()
 
 
+def sanitize_ai_output(text: str | None) -> str:
+    """Remove presentation wrappers that AI must never send to Telegram."""
+    out = sanitize_dashes(text or "")
+    if len(out) >= 2 and out[0] in "\"'«" and out[-1] in "\"'»":
+        out = out[1:-1].strip()
+    # Models sometimes return a Markdown list item despite a plain-text prompt.
+    # Strip the marker before validation so it cannot be logged or sent.
+    out = _LEADING_LIST_MARKER_RE.sub("", out, count=1).strip()
+    return out
+
+
 def validate_first_dm(text: str, *, style: str | None = None) -> tuple[bool, str]:
     selected = (style or FIRST_DM_STYLE).strip().lower()
-    raw = sanitize_dashes(text)
+    original = str(text or "")
+    if _LEADING_LIST_MARKER_RE.match(original):
+        return False, "leading_list_marker"
+    raw = sanitize_dashes(original)
     if not raw:
         return False, "empty"
     if len(raw) > 120:
@@ -248,6 +263,10 @@ async def generate_first_dm() -> str:
     """Generate a First DM using the configured style."""
     selected = FIRST_DM_STYLE
     recent = phrases_svc.recent_texts(phrases_svc.KIND_FIRST_DM, limit=ANTI_REPEAT_WINDOW)
+    # short_hook is a reviewed closed pool. Calling AI here adds cost, latency and
+    # malformed list markers without creating any allowed new wording.
+    if selected == "short_hook":
+        return _local_first_dm(recent, style=selected)
     if AI_DM_ENABLED and OPENAI_API_KEY:
         for attempt in range(MAX_AI_FIRST_DM_ATTEMPTS):
             try:
@@ -255,7 +274,7 @@ async def generate_first_dm() -> str:
             except Exception as exc:
                 logger.warning("AI first DM attempt {} failed: {}", attempt + 1, exc)
                 continue
-            clean = sanitize_dashes(text or "")
+            clean = sanitize_ai_output(text)
             ok, reason = validate_first_dm(clean, style=selected)
             if not ok:
                 logger.warning("AI first DM rejected style={} reason={} text={!r}", selected, reason, clean[:120])
@@ -306,7 +325,5 @@ async def _openai_first_dm(recent: list[str], *, retry: int = 0, style: str = "m
         ),
         timeout=AI_REQUEST_TIMEOUT_SECONDS + 2.0,
     )
-    content = (response.choices[0].message.content or "").strip()
-    if len(content) >= 2 and content[0] in "\"'«" and content[-1] in "\"'»":
-        content = content[1:-1].strip()
+    content = sanitize_ai_output(response.choices[0].message.content)
     return content or None

@@ -200,6 +200,33 @@ def _participating_sender_ids() -> set[int]:
     }
 
 
+def _owned_possible_sender_ids(lead: dict[str, Any]) -> set[int]:
+    """Active accounts that own exact entity evidence for this target."""
+    participating = _participating_sender_ids()
+    known = queue_svc.known_entity_account_ids(int(lead["target_user_id"]))
+    possible = participating & known
+    if possible:
+        return possible
+
+    # Compatibility for migrated rows created before per-account evidence existed.
+    source = lead.get("source_account_user_id")
+    if source is not None and lead.get("access_hash") is not None:
+        source_id = int(source)
+        if source_id in participating:
+            return {source_id}
+    return set()
+
+
+def _owned_ready_accounts_for_lead(
+    lead: dict[str, Any], ready: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    possible = _owned_possible_sender_ids(lead)
+    if not possible:
+        return []
+    filtered = [acc for acc in ready if int(acc["user_id"]) in possible]
+    return _order_accounts_for_lead(lead, filtered)
+
+
 def _peerflood_lead_retry_seconds(acc: dict[str, Any] | None = None) -> int:
     """Back off the lead after PeerFlood instead of probing other accounts.
 
@@ -222,8 +249,13 @@ def _untried_ready_accounts(
     ]
 
 
-def _finish_or_defer_unresolvable(target_id: int, lead: dict[str, Any]) -> bool:
-    """Finish only after every participating account proved it cannot resolve target."""
+def _finish_or_defer_unresolvable(
+    target_id: int,
+    lead: dict[str, Any],
+    *,
+    possible_account_ids: set[int] | None = None,
+) -> bool:
+    """Finish only after every eligible entity-owning account was checked."""
     if queue_svc.identity_snapshot_changed(target_id, lead):
         queue_svc.clear_account_failures(target_id)
         queue_svc.defer_claim(
@@ -231,9 +263,26 @@ def _finish_or_defer_unresolvable(target_id: int, lead: dict[str, Any]) -> bool:
         )
         logger.info("Lead entity evidence refreshed during attempt target={}", target_id)
         return False
-    attempted = queue_svc.failed_account_ids(target_id, "no_entity")
-    possible = _participating_sender_ids()
-    if possible and possible.issubset(attempted):
+    attempted_all = queue_svc.failed_account_ids(target_id, "no_entity")
+    possible = (
+        set(possible_account_ids)
+        if possible_account_ids is not None
+        else _participating_sender_ids()
+    )
+    attempted = attempted_all & possible if possible else set()
+    if not possible:
+        queue_svc.mark_terminal_failure(
+            target_id,
+            "no_active_entity_evidence",
+            "no active account owns Telegram entity evidence",
+        )
+        logger.warning(
+            "Lead terminal: no active entity evidence target={} source_account={}",
+            target_id,
+            lead.get("source_account_user_id"),
+        )
+        return True
+    if possible.issubset(attempted):
         reason = f"no_entity_all_accounts:{','.join(map(str, sorted(attempted)))}"
         queue_svc.mark_terminal_failure(
             target_id, "no_entity_all_accounts", reason
@@ -263,6 +312,7 @@ async def _attempt_lead_across_accounts(
     text: str | None = None,
     *,
     enforce_global_pause: bool = False,
+    possible_account_ids: set[int] | None = None,
 ) -> bool:
     """Try ready accounts in the existing order.
 
@@ -300,7 +350,22 @@ async def _attempt_lead_across_accounts(
         entity = None
         if lazy_generation:
             try:
-                entity = await _resolve_target_entity(client, account_id, lead)
+                allow_remote_lookup = not (
+                    enforce_global_pause or possible_account_ids is not None
+                )
+                try:
+                    entity = await _resolve_target_entity(
+                        client,
+                        account_id,
+                        lead,
+                        allow_remote_username_lookup=allow_remote_lookup,
+                    )
+                except TypeError as exc:
+                    # Compatibility for test/extension resolvers that still expose
+                    # the old three-argument signature. Do not swallow real TypeError.
+                    if "unexpected keyword argument" not in str(exc):
+                        raise
+                    entity = await _resolve_target_entity(client, account_id, lead)
             except FloodWaitError as exc:
                 seconds = int(getattr(exc, "seconds", 60) or 60)
                 queue_svc.release_claim(target_id, as_pending=True)
@@ -521,7 +586,11 @@ async def _attempt_lead_across_accounts(
             target_id, seconds=60, reason="sender_account_cooldown"
         )
         return False
-    return _finish_or_defer_unresolvable(target_id, lead)
+    return _finish_or_defer_unresolvable(
+        target_id,
+        lead,
+        possible_account_ids=possible_account_ids,
+    )
 
 
 async def _tick() -> bool:
@@ -551,14 +620,41 @@ async def _tick() -> bool:
         queue_svc.cancel_lead(target_id, "opt_out")
         return True
 
-    ordered = _untried_ready_accounts(lead, ready)
-    if not ordered:
-        return _finish_or_defer_unresolvable(target_id, lead)
+    possible_account_ids = _owned_possible_sender_ids(lead)
+    if not possible_account_ids:
+        return _finish_or_defer_unresolvable(
+            target_id,
+            lead,
+            possible_account_ids=set(),
+        )
 
-    # Entity resolution is performed inside the account round. AI is called only
-    # after at least one ready account has a real Telegram entity.
+    attempted = queue_svc.failed_account_ids(target_id, "no_entity")
+    ordered = [
+        acc
+        for acc in _owned_ready_accounts_for_lead(lead, ready)
+        if int(acc["user_id"]) not in attempted
+    ]
+    if not ordered:
+        if possible_account_ids.issubset(attempted):
+            return _finish_or_defer_unresolvable(
+                target_id,
+                lead,
+                possible_account_ids=possible_account_ids,
+            )
+        queue_svc.defer_claim(
+            target_id,
+            seconds=60,
+            reason="waiting_entity_owner_account_ready",
+        )
+        return False
+
+    # Automatic dispatch uses only entity evidence captured by the same account
+    # in a source chat. No remote username search is performed here.
     return await _attempt_lead_across_accounts(
-        lead, ordered, enforce_global_pause=True
+        lead,
+        ordered,
+        enforce_global_pause=True,
+        possible_account_ids=possible_account_ids,
     )
 
 
@@ -641,17 +737,80 @@ def _is_entity_lookup_miss(exc: BaseException) -> bool:
     )
 
 
-async def _resolve_target_entity(client, account_id: int, lead: dict[str, Any]):
-    """Resolve by username first, then account cache, then source access hash.
+async def _resolve_target_entity(
+    client,
+    account_id: int,
+    lead: dict[str, Any],
+    *,
+    allow_remote_username_lookup: bool = True,
+):
+    """Resolve a target while keeping account-owned entity evidence isolated.
 
-    A username result is accepted only when Telegram returns the same numeric user id.
-    This prevents a changed or recycled username from routing a First DM to another user.
+    Automatic dispatch sets ``allow_remote_username_lookup=False``. It then uses
+    only access hashes captured by this exact account or the account's local
+    Telegram cache. This prevents repeated network username searches and their
+    multi-hour FloodWaits. The default keeps the older verified username path for
+    explicit diagnostics and compatibility helpers.
     """
     target_id = int(lead["target_user_id"])
+    account_id = int(account_id)
     username = (lead.get("username") or "").strip().lstrip("@")
-    access_hash = lead.get("access_hash")
+    source_access_hash = lead.get("access_hash")
     source_account_id = lead.get("source_account_user_id")
+    owned = queue_svc.get_account_entity(target_id, account_id) or {}
+    owned_access_hash = owned.get("access_hash")
 
+    def remember(entity) -> None:
+        resolved_id = _entity_user_id(entity)
+        if resolved_id != target_id:
+            return
+        value = getattr(entity, "access_hash", None)
+        if value is None:
+            value = owned_access_hash
+        if value is None and source_account_id is not None and int(source_account_id) == account_id:
+            value = source_access_hash
+        queue_svc.record_account_entity(
+            target_user_id=target_id,
+            account_user_id=account_id,
+            access_hash=(int(value) if value is not None else None),
+            username=username or None,
+            source_chat_id=owned.get("source_chat_id") or lead.get("source_chat_id"),
+        )
+
+    if not allow_remote_username_lookup:
+        if owned_access_hash is not None:
+            return InputPeerUser(target_id, int(owned_access_hash))
+        if (
+            source_access_hash is not None
+            and source_account_id is not None
+            and int(source_account_id) == account_id
+        ):
+            queue_svc.record_account_entity(
+                target_user_id=target_id,
+                account_user_id=account_id,
+                access_hash=int(source_access_hash),
+                username=username or None,
+                source_chat_id=lead.get("source_chat_id"),
+            )
+            return InputPeerUser(target_id, int(source_access_hash))
+        try:
+            entity = await client.get_input_entity(target_id)
+        except Exception as exc:
+            if not _is_entity_lookup_miss(exc):
+                raise
+            logger.debug(
+                "Cached entity unavailable target={} account={} error_type={}",
+                target_id,
+                account_id,
+                type(exc).__name__,
+            )
+            return None
+        remember(entity)
+        return entity
+
+    # Compatibility path: verified username first, then numeric cache, then the
+    # source account's exact access hash. Username results are accepted only when
+    # Telegram returns the same numeric user id.
     if username:
         try:
             entity = await client.get_input_entity(username)
@@ -667,6 +826,7 @@ async def _resolve_target_entity(client, account_id: int, lead: dict[str, Any]):
         else:
             resolved_user_id = _entity_user_id(entity)
             if resolved_user_id == target_id:
+                remember(entity)
                 return entity
             logger.warning(
                 "Username entity mismatch target={} resolved_target={} account={}",
@@ -676,7 +836,7 @@ async def _resolve_target_entity(client, account_id: int, lead: dict[str, Any]):
             )
 
     try:
-        return await client.get_input_entity(target_id)
+        entity = await client.get_input_entity(target_id)
     except Exception as exc:
         if not _is_entity_lookup_miss(exc):
             raise
@@ -686,13 +846,23 @@ async def _resolve_target_entity(client, account_id: int, lead: dict[str, Any]):
             account_id,
             type(exc).__name__,
         )
+    else:
+        remember(entity)
+        return entity
 
     if (
-        access_hash is not None
+        source_access_hash is not None
         and source_account_id is not None
-        and int(source_account_id) == int(account_id)
+        and int(source_account_id) == account_id
     ):
-        return InputPeerUser(target_id, int(access_hash))
+        queue_svc.record_account_entity(
+            target_user_id=target_id,
+            account_user_id=account_id,
+            access_hash=int(source_access_hash),
+            username=username or None,
+            source_chat_id=lead.get("source_chat_id"),
+        )
+        return InputPeerUser(target_id, int(source_access_hash))
 
     return None
 

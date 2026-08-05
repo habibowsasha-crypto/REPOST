@@ -8,6 +8,7 @@ from typing import Any, Optional
 
 from loguru import logger
 from telethon import TelegramClient, events
+from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 from telethon.tl.types import User
 
@@ -23,8 +24,12 @@ _started = False
 _lock = asyncio.Lock()
 _bg_tasks: set[asyncio.Task] = set()
 _bg_tasks_by_account: dict[int, set[asyncio.Task]] = {}
+_entity_sync_tasks: dict[int, asyncio.Task] = {}
 _last_auth_health_check = 0.0
 _AUTH_HEALTH_INTERVAL_SECONDS = 60.0
+_ENTITY_SYNC_HISTORY_LIMIT = 100
+_ENTITY_SYNC_MIN_INTERVAL_SECONDS = 86400
+_ENTITY_SYNC_CHAT_DELAY_SECONDS = 1.0
 
 
 def _track_dialog_task(account_user_id: int, task: asyncio.Task) -> None:
@@ -93,6 +98,7 @@ async def start_monitor() -> None:
             len(_clients),
             list(_clients.keys()),
         )
+    _schedule_all_entity_syncs()
     pending_alerts = await account_auth.notify_pending_reauth_required()
     if pending_alerts:
         logger.warning(
@@ -107,6 +113,7 @@ async def stop_monitor() -> None:
         logger.info("Cancelled {} background dialog task(s) on monitor stop", cancelled)
     _bg_tasks.clear()
     _bg_tasks_by_account.clear()
+    _entity_sync_tasks.clear()
     async with _lock:
         for uid, client in list(_clients.items()):
             await _safe_disconnect(client)
@@ -126,6 +133,139 @@ async def refresh_monitor() -> None:
             list(_clients.keys()),
             list(_clients.keys()),
         )
+    _schedule_all_entity_syncs()
+
+
+def _schedule_all_entity_syncs() -> None:
+    for uid, client in list(_clients.items()):
+        _schedule_entity_sync(uid, client)
+
+
+def _schedule_entity_sync(account_user_id: int, client: TelegramClient) -> None:
+    uid = int(account_user_id)
+    existing = _entity_sync_tasks.get(uid)
+    if existing is not None and not existing.done():
+        return
+    if not chats_svc.list_watchable_ids(uid):
+        return
+    if not queue_svc.targets_missing_account_entity(uid, limit=1):
+        return
+    task = asyncio.create_task(
+        _sync_recent_entity_evidence(uid, client),
+        name=f"entity-sync-{uid}",
+    )
+    _entity_sync_tasks[uid] = task
+    _track_dialog_task(uid, task)
+
+    def _clear(done_task: asyncio.Task) -> None:
+        if _entity_sync_tasks.get(uid) is done_task:
+            _entity_sync_tasks.pop(uid, None)
+
+    task.add_done_callback(_clear)
+
+
+async def _sync_recent_entity_evidence(
+    account_user_id: int,
+    client: TelegramClient,
+) -> int:
+    """Backfill entity evidence only for leads already present in the queue.
+
+    The scan is bounded, persisted per account/chat and never creates new leads
+    from old history. This makes a newly added sender useful without repeatedly
+    searching usernames through Telegram.
+    """
+    uid = int(account_user_id)
+    targets = queue_svc.targets_missing_account_entity(uid)
+    if not targets:
+        return 0
+    matched = 0
+    scanned_chats = 0
+    for chat_id in sorted(chats_svc.list_watchable_ids(uid)):
+        if not targets:
+            break
+        if not chats_svc.entity_sync_due(
+            uid,
+            chat_id,
+            min_interval_seconds=_ENTITY_SYNC_MIN_INTERVAL_SECONDS,
+        ):
+            continue
+        try:
+            async for message in client.iter_messages(
+                int(chat_id),
+                limit=_ENTITY_SYNC_HISTORY_LIMIT,
+            ):
+                sender = getattr(message, "sender", None)
+                if sender is None:
+                    sender = await message.get_sender()
+                if sender is None or not isinstance(sender, User):
+                    continue
+                if getattr(sender, "bot", False) or getattr(sender, "is_self", False):
+                    continue
+                target_id = int(sender.id)
+                if target_id not in targets:
+                    continue
+                access_hash = getattr(sender, "access_hash", None)
+                if access_hash is None:
+                    continue
+                queue_svc.record_account_entity(
+                    target_user_id=target_id,
+                    account_user_id=uid,
+                    access_hash=int(access_hash),
+                    username=getattr(sender, "username", None),
+                    source_chat_id=int(chat_id),
+                    reopen_no_entity=True,
+                )
+                targets.discard(target_id)
+                matched += 1
+            chats_svc.mark_entity_sync(uid, chat_id, success=True)
+            scanned_chats += 1
+        except FloodWaitError as exc:
+            seconds = int(getattr(exc, "seconds", 60) or 60)
+            chats_svc.mark_entity_sync(
+                uid,
+                chat_id,
+                success=False,
+                error=f"FloodWait:{seconds}",
+                retry_seconds=seconds,
+            )
+            from services import pacing
+
+            pacing.apply_floodwait(uid, seconds)
+            logger.warning(
+                "Entity history sync FloodWait account={} chat={} seconds={}",
+                uid,
+                chat_id,
+                seconds,
+            )
+            break
+        except Exception as exc:
+            if account_auth.is_auth_loss_error(exc):
+                await account_auth.register_auth_loss(uid, exc, notify=True)
+                await disconnect_account(uid, cancel_tasks=True)
+                break
+            chats_svc.mark_entity_sync(
+                uid,
+                chat_id,
+                success=False,
+                error=type(exc).__name__,
+                retry_seconds=3600,
+            )
+            logger.warning(
+                "Entity history sync failed account={} chat={} error_type={}",
+                uid,
+                chat_id,
+                type(exc).__name__,
+            )
+        if _ENTITY_SYNC_CHAT_DELAY_SECONDS > 0:
+            await asyncio.sleep(_ENTITY_SYNC_CHAT_DELAY_SECONDS)
+    if scanned_chats or matched:
+        logger.info(
+            "Entity history sync complete account={} chats={} matched_leads={}",
+            uid,
+            scanned_chats,
+            matched,
+        )
+    return matched
 
 
 async def _sync_clients_unlocked() -> None:

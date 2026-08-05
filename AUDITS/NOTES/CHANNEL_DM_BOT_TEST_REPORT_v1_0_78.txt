@@ -1,0 +1,37 @@
+CHANNEL DM BOT TEST REPORT v1.0.78
+
+AUTOMATED TESTS
+- Full project suite: 271 passed.
+- Dedicated v1.0.78 suite: 6 passed.
+
+DEDICATED V1.0.78 COVERAGE
+- A hashless observing account remains a valid automatic candidate.
+- Hashless ownership uses only the numeric local Telegram cache.
+- No remote username lookup occurs in the automatic path.
+- A successful local-cache result persists the recovered access_hash.
+- Identical hashless activity does not reopen a terminal no-entity lead.
+- Alternating identical activity from multiple known hashless accounts does not reopen it.
+- A newly available access_hash correctly reopens the lead.
+- Identical record_account_entity data does not reopen the lead.
+
+PRESERVED V1.0.77 COVERAGE
+- short_hook never calls AI.
+- Entity failure occurs before First DM generation.
+- Different sender accounts retain separate access hashes.
+- Reauthorization-required accounts are excluded.
+- Recent-history sync backfills only existing leads.
+- Leading list markers cannot be sent.
+
+RELEASE GATE RESULTS
+- Python AST and compile check: PASS
+- Production import check: PASS, 42 modules
+- Full pytest from source tree: PASS, 271 tests
+- Full pytest from clean ZIP extraction: PASS, 271 tests
+- SQLite migration and integrity checks: PASS
+- ASCII-only path check: PASS
+- Forbidden dash scan: PASS
+- Secret and private artifact scan: PASS
+- ZIP traversal and symlink scan: PASS
+
+LIMITATION
+- Real Telegram sending and live FloodWait behavior were not executed locally.

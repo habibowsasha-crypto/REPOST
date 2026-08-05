@@ -87,6 +87,85 @@ def list_excluded_ids(account_user_id: int) -> set[int]:
     return {int(r[0]) for r in rows}
 
 
+def entity_sync_due(
+    account_user_id: int,
+    chat_id: int,
+    *,
+    min_interval_seconds: int = 86400,
+) -> bool:
+    """Return True when bounded recent-history entity sync may run for a chat."""
+    conn = get_connection()
+    row = conn.execute(
+        """
+        SELECT last_sync_at, next_sync_at
+          FROM account_chat_entity_sync
+         WHERE account_user_id=? AND chat_id=?
+        """,
+        (int(account_user_id), int(chat_id)),
+    ).fetchone()
+    if row is None:
+        return True
+    now = dt.datetime.now(dt.timezone.utc)
+    next_sync_at = row["next_sync_at"]
+    if next_sync_at:
+        try:
+            if dt.datetime.fromisoformat(str(next_sync_at)) > now:
+                return False
+        except ValueError:
+            pass
+    last_sync_at = row["last_sync_at"]
+    if not last_sync_at:
+        return True
+    try:
+        last = dt.datetime.fromisoformat(str(last_sync_at))
+    except ValueError:
+        return True
+    return (now - last).total_seconds() >= max(60, int(min_interval_seconds))
+
+
+def mark_entity_sync(
+    account_user_id: int,
+    chat_id: int,
+    *,
+    success: bool,
+    error: str | None = None,
+    retry_seconds: int = 3600,
+) -> None:
+    now_dt = dt.datetime.now(dt.timezone.utc)
+    now = now_dt.isoformat()
+    next_sync_at = None
+    if not success:
+        next_sync_at = (
+            now_dt + dt.timedelta(seconds=max(60, int(retry_seconds)))
+        ).isoformat()
+    conn = get_connection()
+    with db_lock(), conn:
+        conn.execute(
+            """
+            INSERT INTO account_chat_entity_sync (
+                account_user_id, chat_id, last_sync_at, next_sync_at,
+                last_error, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(account_user_id, chat_id) DO UPDATE SET
+                last_sync_at=CASE
+                    WHEN excluded.last_error IS NULL THEN excluded.last_sync_at
+                    ELSE last_sync_at
+                END,
+                next_sync_at=excluded.next_sync_at,
+                last_error=excluded.last_error,
+                updated_at=excluded.updated_at
+            """,
+            (
+                int(account_user_id),
+                int(chat_id),
+                (now if success else None),
+                next_sync_at,
+                (None if success else str(error or "entity_sync_failed")[:500]),
+                now,
+            ),
+        )
+
+
 def toggle_selected(account_user_id: int, chat_id: int) -> bool:
     """Toggle manual selection. Returns True if now selected."""
     account_user_id = int(account_user_id)
@@ -263,7 +342,11 @@ async def refresh_discovered_chats(account_user_id: int) -> int:
         )
         # Drop selections/exclusions that no longer exist.
         valid_ids = {chat_id for chat_id, _, _, _ in found}
-        for table in ("account_selected_chats", "account_excluded_chats"):
+        for table in (
+            "account_selected_chats",
+            "account_excluded_chats",
+            "account_chat_entity_sync",
+        ):
             rows = conn.execute(
                 f"SELECT chat_id FROM {table} WHERE account_user_id=?",
                 (int(account_user_id),),

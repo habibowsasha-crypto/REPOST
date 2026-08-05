@@ -376,10 +376,19 @@ def delete_account(user_id: int) -> bool:
             "DELETE FROM account_excluded_chats WHERE account_user_id=?", (uid,)
         )
         conn.execute(
+            "DELETE FROM account_chat_entity_sync WHERE account_user_id=?", (uid,)
+        )
+        conn.execute(
             "DELETE FROM spambot_state WHERE account_user_id=?", (uid,)
         )
         conn.execute(
             "DELETE FROM peerflood_hits WHERE account_user_id=?", (uid,)
+        )
+        conn.execute(
+            "DELETE FROM lead_account_entities WHERE account_user_id=?", (uid,)
+        )
+        conn.execute(
+            "DELETE FROM lead_account_failures WHERE account_user_id=?", (uid,)
         )
         conn.execute(
             "DELETE FROM dialog_outbox WHERE account_user_id=? AND status='prepared'",

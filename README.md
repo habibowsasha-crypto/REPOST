@@ -1,4 +1,24 @@
-# Channel DM Bot v1.0.76
+# Channel DM Bot v1.0.78
+
+## Changes in v1.0.78 - hashless local-cache owner and stable no-entity terminal
+
+- Accounts that observed a target without a stored access hash now receive one safe local-cache lookup.
+- Automatic dispatch still never performs a remote username search.
+- Identical hashless activity no longer reopens a terminal no-entity lead.
+- A lead reopens only when account-owned entity evidence genuinely improves.
+
+- Automatic First DM dispatch now resolves Telegram entity access before generating any First DM text.
+- Each sender account stores its own access hash for each target it actually saw in a monitored chat.
+- Automatic dispatch tries only active authorized accounts that own entity evidence for that exact target.
+- The source account that saw the user remains first priority.
+- Automatic username search is disabled in the production First DM path, preventing repeated cross-account lookups and reducing Telegram FloodWait risk.
+- A bounded recent-history sync scans at most 100 messages per selected chat and only backfills entity evidence for leads already in the queue.
+- Each account and chat is synced at most once per 24 hours unless a recorded retry becomes due.
+- New evidence may reopen only leads previously closed for missing entity access. Repeated identical activity cannot create a reopen and fail loop.
+- `short_hook` now uses only the reviewed local pool and never calls AI.
+- AI output in other modes is normalized before validation, and leading list markers such as `-`, `*`, `•` or `1.` are rejected as raw output and cannot be sent.
+- Accounts marked for reauthorization are excluded from automatic entity ownership and sending attempts.
+- Magnet, legacy, promo, apology, link help, dialog ownership, pacing, PeerFlood and SpamBot behavior remain unchanged.
 
 ## Changes in v1.0.76 - selectable short_hook First DM mode
 

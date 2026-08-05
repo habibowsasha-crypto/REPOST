@@ -281,6 +281,25 @@ def init_db() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS account_chat_entity_sync (
+                account_user_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                last_sync_at TEXT,
+                next_sync_at TEXT,
+                last_error TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (account_user_id, chat_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_account_chat_entity_sync_due
+            ON account_chat_entity_sync(account_user_id, next_sync_at, last_sync_at)
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS account_selected_chats (
                 account_user_id INTEGER NOT NULL,
                 chat_id INTEGER NOT NULL,
@@ -372,6 +391,57 @@ def init_db() -> None:
             ON lead_account_failures(target_user_id, failure_kind, account_user_id)
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS lead_account_entities (
+                target_user_id INTEGER NOT NULL,
+                account_user_id INTEGER NOT NULL,
+                access_hash INTEGER,
+                username TEXT,
+                source_chat_id INTEGER,
+                last_seen_at TEXT NOT NULL,
+                PRIMARY KEY (target_user_id, account_user_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_lead_account_entities_target
+            ON lead_account_entities(target_user_id, last_seen_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_lead_account_entities_account
+            ON lead_account_entities(account_user_id, last_seen_at)
+            """
+        )
+
+        migration_name = "v1_0_77_account_owned_entity_evidence"
+        applied = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE name=?",
+            (migration_name,),
+        ).fetchone()
+        if not applied:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO lead_account_entities (
+                    target_user_id, account_user_id, access_hash, username,
+                    source_chat_id, last_seen_at
+                )
+                SELECT target_user_id, source_account_user_id, access_hash, username,
+                       source_chat_id, COALESCE(last_seen_at, updated_at, created_at)
+                  FROM leads
+                 WHERE source_account_user_id IS NOT NULL
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO schema_migrations(name, applied_at)
+                VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                """,
+                (migration_name,),
+            )
 
         conn.execute(
             """

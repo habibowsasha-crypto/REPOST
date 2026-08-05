@@ -1,0 +1,96 @@
+CHANNEL DM BOT FULL PROJECT PLAN v1.0.78
+
+CURRENT CANDIDATE
+- Version: 1.0.78
+- Base: 1.0.77
+- Status: deep verification corrections complete
+
+CORE PRODUCT RULES
+- Monitor selected Telegram chats through authorized user accounts.
+- Build one shared lead queue.
+- Prefer the account that actually saw the user.
+- Never transfer an active dialog to another account.
+- Send First DM only when global and account pacing allow it.
+- After an allowed response, send the exact configured channel link in promo.
+- Send apology after 60 seconds.
+- Send separate link-opening help after another 60 seconds.
+- Only rude text, aggression, threats, insults or explicit requests not to write create terminal stop and global opt-out.
+- Calm refusal may continue the promo branch.
+- Any non-text response is neutral or positive and continues the approved branch.
+- Standard outgoing budget is 4, absolute maximum is 5.
+- At most one optional Q&A may be used without displacing mandatory steps.
+- Only First DM may contain a greeting.
+- Use only the short ASCII hyphen in project text.
+
+FIRST DM MODES
+- magnet: reviewed concrete trader questions.
+- short_hook: reviewed short questions and requests for help with a question. No AI call.
+- legacy: previous neutral pool for rollback.
+- Invalid FIRST_DM_STYLE fails closed.
+- All modes use the global last-20 uniqueness rule.
+- Maximum AI regeneration attempts remain 2 where AI is enabled.
+
+ENTITY ACCESS PLAN
+[COMPLETE] Save entity evidence separately per target and sender account.
+[COMPLETE] Keep source account priority.
+[COMPLETE] Resolve entity before generating First DM.
+[COMPLETE] Disable remote username search in automatic production dispatch.
+[COMPLETE] Use saved account-owned access_hash when available.
+[COMPLETE] Give a hashless observing account one local numeric-cache attempt.
+[COMPLETE] Cache no_entity failure per account.
+[COMPLETE] Do not clear no_entity cache on identical repeated activity.
+[COMPLETE] Reopen a terminal no-entity lead only after genuinely improved account-owned evidence.
+[COMPLETE] Prevent alternating hashless account activity from reopening a terminal lead.
+[COMPLETE] Add bounded recent-history sync for existing leads.
+[COMPLETE] Limit sync to 100 messages per selected chat.
+[COMPLETE] Persist one sync per account and chat per 24 hours.
+[COMPLETE] Stop and defer sync on Telegram FloodWait.
+[COMPLETE] Exclude reauthorization-required accounts.
+[FUTURE OPTIONAL] Add an administrator screen showing entity coverage per source chat and sender account.
+[FUTURE OPTIONAL] Add a manual safe sync button with progress and cooldown display.
+
+SHORT_HOOK PLAN
+[COMPLETE] Add FIRST_DM_STYLE=short_hook.
+[COMPLETE] Use a closed reviewed local pool.
+[COMPLETE] Require help wording to refer explicitly to a question.
+[COMPLETE] Remove all AI calls from short_hook.
+[COMPLETE] Preserve last-20 uniqueness without weakening threshold.
+[COMPLETE] Display active style in the dashboard.
+
+AI OUTPUT SAFETY
+[COMPLETE] Normalize quotes and bad dash characters.
+[COMPLETE] Remove Markdown list wrappers before evaluation.
+[COMPLETE] Reject raw leading list markers.
+[COMPLETE] Prevent leading marker text from reaching Telegram.
+[COMPLETE] Keep magnet closed to reviewed structures.
+
+AUTHORIZATION
+[COMPLETE] Detect session_not_authorized and related auth loss.
+[COMPLETE] Mark account reauth_required.
+[COMPLETE] Exclude it from automatic sender selection and entity ownership.
+[COMPLETE] Disconnect its monitor and background sync.
+[FUTURE OPERATIONAL] Administrator may delete permanently lost accounts from the existing account menu.
+
+DATABASE AND DURABILITY
+[COMPLETE] SQLite migrations are idempotent.
+[COMPLETE] lead_account_entities introduced in v1.0.77.
+[COMPLETE] account_chat_entity_sync introduced in v1.0.77.
+[COMPLETE] Existing source hashes backfilled.
+[COMPLETE] Successful First DM notification occurs only after Telegram success and SQLite commit.
+[COMPLETE] Exact sent text is stored consistently.
+
+RELEASE HYGIENE
+[COMPLETE] Only ASCII file and folder names in ZIP.
+[COMPLETE] Only current plan, patch report and test report retained under AUDITS/NOTES.
+[COMPLETE] Exclude databases, sessions, logs, caches, .env and secrets.
+[COMPLETE] Source release gate passed.
+[COMPLETE] Deterministic ZIP and SHA-256 sidecar built.
+[COMPLETE] Clean ZIP extraction passed the full 271-test suite.
+[COMPLETE] Final ZIP paths and private artifacts inspected.
+
+NEXT SAFE DEVELOPMENT PRIORITIES
+1. Observe v1.0.78 production logs after sender accounts are added to the same selected source chats.
+2. Compare successful First DM count, no_entity count and FloodWait count.
+3. Confirm history sync remains bounded and runs once per day per chat.
+4. Add administrator visibility for per-chat account coverage only if logs show operational need.
+5. Do not change promo, refusal, pacing or PeerFlood rules without explicit approval.

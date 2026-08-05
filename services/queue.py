@@ -29,6 +29,230 @@ def _contact_status(target_user_id: int) -> Optional[str]:
     return str(row["status"]) if row else None
 
 
+def _upsert_account_entity_conn(
+    conn,
+    *,
+    target_user_id: int,
+    account_user_id: int | None,
+    access_hash: int | None = None,
+    username: str | None = None,
+    source_chat_id: int | None = None,
+    seen_at: str | None = None,
+) -> bool:
+    """Store Telegram entity evidence owned by one exact sender account."""
+    if account_user_id is None:
+        return False
+    now = seen_at or _now_iso()
+    previous = conn.execute(
+        """
+        SELECT access_hash, username, source_chat_id
+          FROM lead_account_entities
+         WHERE target_user_id=? AND account_user_id=?
+        """,
+        (int(target_user_id), int(account_user_id)),
+    ).fetchone()
+    evidence_improved = bool(
+        previous is None
+        or (access_hash is not None and int(access_hash) != previous["access_hash"])
+        or (username is not None and username != previous["username"])
+        or (source_chat_id is not None and int(source_chat_id) != previous["source_chat_id"])
+    )
+    conn.execute(
+        """
+        INSERT INTO lead_account_entities (
+            target_user_id, account_user_id, access_hash, username,
+            source_chat_id, last_seen_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(target_user_id, account_user_id) DO UPDATE SET
+            access_hash=COALESCE(excluded.access_hash, access_hash),
+            username=COALESCE(excluded.username, username),
+            source_chat_id=COALESCE(excluded.source_chat_id, source_chat_id),
+            last_seen_at=excluded.last_seen_at
+        """,
+        (
+            int(target_user_id),
+            int(account_user_id),
+            (int(access_hash) if access_hash is not None else None),
+            username,
+            (int(source_chat_id) if source_chat_id is not None else None),
+            now,
+        ),
+    )
+    # Clear only when the account gained new or changed entity evidence. Repeated
+    # identical chat events must not create an endless resolve-fail-reopen loop.
+    if evidence_improved:
+        conn.execute(
+            """
+            DELETE FROM lead_account_failures
+             WHERE target_user_id=? AND account_user_id=? AND failure_kind='no_entity'
+            """,
+            (int(target_user_id), int(account_user_id)),
+        )
+    return evidence_improved
+
+
+def record_account_entity(
+    *,
+    target_user_id: int,
+    account_user_id: int,
+    access_hash: int | None = None,
+    username: str | None = None,
+    source_chat_id: int | None = None,
+    reopen_no_entity: bool = False,
+) -> None:
+    conn = get_connection()
+    now = _now_iso()
+    target_id = int(target_user_id)
+    account_id = int(account_user_id)
+    with db_lock(), conn:
+        entity_evidence_improved = _upsert_account_entity_conn(
+            conn,
+            target_user_id=target_id,
+            account_user_id=account_id,
+            access_hash=access_hash,
+            username=username,
+            source_chat_id=source_chat_id,
+            seen_at=now,
+        )
+        row = conn.execute(
+            "SELECT status, failure_reason FROM leads WHERE target_user_id=?",
+            (target_id,),
+        ).fetchone()
+        if row is None:
+            return
+        should_reopen = bool(
+            reopen_no_entity
+            and entity_evidence_improved
+            and str(row["status"]) == STATUS_CANCELLED
+            and str(row["failure_reason"] or "")
+            in {"no_entity_all_accounts", "no_active_entity_evidence"}
+        )
+        if should_reopen:
+            conn.execute(
+                """
+                UPDATE leads
+                   SET username=COALESCE(?, username),
+                       access_hash=COALESCE(?, access_hash),
+                       source_chat_id=COALESCE(?, source_chat_id),
+                       source_account_user_id=?,
+                       status=?, eligible_at=?,
+                       claimed_by_account=NULL, claimed_at=NULL,
+                       send_attempts=0, last_error=NULL,
+                       failure_reason=NULL, failure_at=NULL,
+                       last_seen_at=?, updated_at=?
+                 WHERE target_user_id=?
+                """,
+                (
+                    username,
+                    (int(access_hash) if access_hash is not None else None),
+                    (int(source_chat_id) if source_chat_id is not None else None),
+                    account_id,
+                    STATUS_PENDING,
+                    now,
+                    now,
+                    now,
+                    target_id,
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE leads
+                   SET username=COALESCE(?, username),
+                       access_hash=COALESCE(?, access_hash),
+                       source_chat_id=COALESCE(?, source_chat_id),
+                       source_account_user_id=?,
+                       last_seen_at=?, updated_at=?
+                 WHERE target_user_id=?
+                """,
+                (
+                    username,
+                    (int(access_hash) if access_hash is not None else None),
+                    (int(source_chat_id) if source_chat_id is not None else None),
+                    account_id,
+                    now,
+                    now,
+                    target_id,
+                ),
+            )
+
+
+def get_account_entity(target_user_id: int, account_user_id: int) -> dict[str, Any] | None:
+    conn = get_connection()
+    row = conn.execute(
+        """
+        SELECT target_user_id, account_user_id, access_hash, username,
+               source_chat_id, last_seen_at
+          FROM lead_account_entities
+         WHERE target_user_id=? AND account_user_id=?
+        """,
+        (int(target_user_id), int(account_user_id)),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def known_entity_account_ids(target_user_id: int) -> set[int]:
+    """Accounts that observed this target, with or without a stored access hash.
+
+    A hashless owner still deserves one local-cache lookup. Automatic dispatch
+    never performs a remote username search for it. If the local cache misses,
+    the existing per-account negative cache prevents repeated attempts until
+    genuinely improved evidence arrives.
+    """
+    conn = get_connection()
+    rows = conn.execute(
+        """
+        SELECT account_user_id
+          FROM lead_account_entities
+         WHERE target_user_id=?
+        """,
+        (int(target_user_id),),
+    ).fetchall()
+    return {int(row["account_user_id"]) for row in rows}
+
+
+def targets_missing_account_entity(
+    account_user_id: int,
+    *,
+    limit: int = 5000,
+) -> set[int]:
+    """Targets still waiting for entity evidence owned by this exact account."""
+    conn = get_connection()
+    rows = conn.execute(
+        """
+        SELECT l.target_user_id
+          FROM leads l
+         WHERE (
+                l.status IN (?, ?)
+                OR (
+                    l.status=?
+                    AND l.failure_reason IN (
+                        'no_entity_all_accounts',
+                        'no_active_entity_evidence'
+                    )
+                )
+               )
+           AND NOT EXISTS (
+                SELECT 1
+                  FROM lead_account_entities e
+                 WHERE e.target_user_id=l.target_user_id
+                   AND e.account_user_id=?
+                   AND e.access_hash IS NOT NULL
+           )
+         ORDER BY COALESCE(l.last_seen_at, l.created_at) DESC
+         LIMIT ?
+        """,
+        (
+            STATUS_PENDING,
+            STATUS_CLAIMED,
+            STATUS_CANCELLED,
+            int(account_user_id),
+            max(1, int(limit)),
+        ),
+    ).fetchall()
+    return {int(row["target_user_id"]) for row in rows}
+
+
 def upsert_from_activity(
     *,
     target_user_id: int,
@@ -55,6 +279,15 @@ def upsert_from_activity(
     now = _now_iso()
     conn = get_connection()
     with db_lock(), conn:
+        entity_evidence_improved = _upsert_account_entity_conn(
+            conn,
+            target_user_id=target_user_id,
+            account_user_id=source_account_user_id,
+            access_hash=access_hash,
+            username=username,
+            source_chat_id=source_chat_id,
+            seen_at=now,
+        )
         existing = conn.execute(
             """
             SELECT status, username, access_hash, source_account_user_id, failure_reason
@@ -72,9 +305,20 @@ def upsert_from_activity(
                     and source_account_user_id != existing["source_account_user_id"]
                 )
             )
-            reopen_no_entity_terminal = bool(
+            no_entity_terminal = bool(
                 status == STATUS_CANCELLED
-                and existing["failure_reason"] == "no_entity_all_accounts"
+                and existing["failure_reason"]
+                in {"no_entity_all_accounts", "no_active_entity_evidence"}
+            )
+            reopen_no_entity_terminal = bool(
+                no_entity_terminal and entity_evidence_improved
+            )
+            reopen_cancelled = bool(
+                status == STATUS_CANCELLED
+                and (
+                    reopen_no_entity_terminal
+                    or (identity_improved and not no_entity_terminal)
+                )
             )
             if status == STATUS_SENT:
                 conn.execute(
@@ -130,9 +374,7 @@ def upsert_from_activity(
                     )
                 return f"skipped_status_{status}"
 
-            if status == STATUS_CANCELLED and not (
-                identity_improved or reopen_no_entity_terminal
-            ):
+            if status == STATUS_CANCELLED and not reopen_cancelled:
                 conn.execute(
                     """
                     UPDATE leads
@@ -150,7 +392,9 @@ def upsert_from_activity(
 
             # Pending technical retries keep counters/evidence unless Telegram
             # identity improved. Cancelled technical failures reopen on activity.
-            if identity_improved or reopen_no_entity_terminal:
+            if (status == STATUS_CANCELLED and reopen_cancelled) or (
+                status != STATUS_CANCELLED and identity_improved
+            ):
                 conn.execute(
                     """
                     UPDATE leads
@@ -284,6 +528,13 @@ def clear_pending() -> int:
         conn.execute(
             """
             DELETE FROM lead_account_failures
+             WHERE target_user_id IN (SELECT target_user_id FROM leads WHERE status=?)
+            """,
+            (STATUS_PENDING,),
+        )
+        conn.execute(
+            """
+            DELETE FROM lead_account_entities
              WHERE target_user_id IN (SELECT target_user_id FROM leads WHERE status=?)
             """,
             (STATUS_PENDING,),
@@ -952,6 +1203,15 @@ def force_requeue(
     now = _now_iso()
     conn = get_connection()
     with db_lock(), conn:
+        _upsert_account_entity_conn(
+            conn,
+            target_user_id=target_user_id,
+            account_user_id=source_account_user_id,
+            access_hash=access_hash,
+            username=username,
+            source_chat_id=source_chat_id,
+            seen_at=now,
+        )
         # Preserve the previous attempt before opening a new campaign cycle.
         # The archive keeps its own 30/180-day retention schedule and statistics.
         from services import dialog_archive
