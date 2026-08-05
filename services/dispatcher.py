@@ -520,6 +520,9 @@ def _notify_first_dm(account_id: int, lead: dict[str, Any], text: str) -> str:
             f"📍 Источник: **{source}**",
             f"🕒 Время: **{now_local} МСК**",
             "",
+            "💬 **Отправленный First DM:**",
+            text,
+            "",
             f"📬 Сегодня: **{today}**",
             f"📊 Всего: **{total}**",
         ]

@@ -1,6 +1,16 @@
-# Channel DM Bot v1.0.68
+# Channel DM Bot v1.0.69
 
 Telegram user-account DM bot: monitors selected groups, builds one shared lead queue, sends First DM, continues active dialogs, handles refusals, sends only the administrator's exact channel link, and stores durable state in SQLite.
+
+
+## Changes in v1.0.69 - exact First DM text in admin notification
+
+- The successful `FIRST DM ОТПРАВЛЕН` administrator notification now includes the exact First DM text actually accepted by Telegram.
+- The displayed wording is taken from the same immutable delivery text passed to `client.send_message`, not regenerated from a template.
+- The notification is still emitted only after Telegram delivery and the durable SQLite sent commit both succeed.
+- Failed, ambiguous or rolled-back First DM attempts do not produce the successful notification.
+- Promo, apology, link-help and all later dialog messages still do not create routine administrator notifications.
+- Queue behavior, dialog funnel, five-message limit, phrase uniqueness, pacing and PeerFlood protections are unchanged.
 
 
 ## Changes in v1.0.68 - PeerFlood cooldown anti-stacking
@@ -469,7 +479,7 @@ The Telegram user-session must still exist when cleanup becomes due. The account
 
 ## Quick live test
 
-1. Deploy v1.0.68 over the existing volume/database.
+1. Deploy v1.0.69 over the existing volume/database.
 2. Confirm the new dashboard and all-time First-DM counter.
 3. Send a test First DM and confirm only one routine admin notification.
 4. Continue the dialog and confirm no reply/link/follow-up push notifications appear.
