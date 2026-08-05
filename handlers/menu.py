@@ -260,6 +260,7 @@ async def cb_settings(event: events.CallbackQuery.Event) -> None:
             kv("Темп (акк.)", f"{a_lo // 60}-{a_hi // 60} мин", icon="⏱"),
             kv("После PeerFlood", pf, icon="⚠️"),
             kv("AI", ai, icon="🤖"),
+            kv("First DM", FIRST_DM_STYLE, icon="🧲"),
             f"🔗 `{link_short}`",
             f"🗑 Telegram {TELEGRAM_DIALOG_DELETE_DAYS}д · база {LOCAL_DIALOG_TEXT_RETENTION_DAYS}д",
         ),

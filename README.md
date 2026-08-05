@@ -1,4 +1,14 @@
-# Channel DM Bot v1.0.75
+# Channel DM Bot v1.0.76
+
+## Changes in v1.0.76 - selectable short_hook First DM mode
+
+- Added `FIRST_DM_STYLE=short_hook`.
+- Added a closed reviewed pool of 40 short First DM hooks.
+- Help wording is allowed only when it explicitly refers to help with a question.
+- Vague requests such as `Можешь помочь?` and `Выручишь?` are rejected.
+- `magnet` and `legacy` remain fully available.
+- The active mode is visible in the dashboard and settings screen.
+- Pacing, queue, dialogs, PeerFlood, SpamBot and the post-First-DM greeting guard are unchanged.
 
 Telegram user-account DM bot: monitors selected groups, builds one shared lead queue, sends First DM, continues active dialogs, handles refusals, sends only the administrator's exact channel link, and stores durable state in SQLite.
 
@@ -560,7 +570,7 @@ To return to the new system, set:
 FIRST_DM_STYLE=magnet
 ```
 
-Both modes keep the global last-20 uniqueness check and allow only the short ASCII hyphen `-`.
+All modes keep the global last-20 uniqueness check and allow only the short ASCII hyphen `-`.
 
 
 ## v1.0.74 First DM structural hardening
@@ -572,3 +582,30 @@ Both modes keep the global last-20 uniqueness check and allow only the short ASC
 - Invalid FIRST_DM_STYLE values fail closed instead of silently enabling magnet.
 - The dashboard shows the active First DM mode.
 - Legacy rollback remains available with FIRST_DM_STYLE=legacy.
+
+
+## v1.0.76 - Selectable short_hook First DM mode
+
+A third First DM mode is available:
+
+```env
+FIRST_DM_STYLE=short_hook
+```
+
+The mode uses a closed reviewed pool of short answer-provoking hooks. Help wording is allowed only when it explicitly says that help is needed with a question, for example:
+
+- `Привет, можешь помочь с вопросом?`
+- `Слушай, поможешь с одним вопросом?`
+- `Салам, можешь подсказать по одному вопросу?`
+
+Vague requests such as `Можешь помочь?`, `Нужна помощь` or `Выручишь?` are rejected. AI cannot invent an unreviewed short hook.
+
+Available values are now:
+
+```env
+FIRST_DM_STYLE=magnet
+FIRST_DM_STYLE=short_hook
+FIRST_DM_STYLE=legacy
+```
+
+Change the Railway variable and restart the deployment to activate the selected mode. The dashboard and settings screen show the active value.

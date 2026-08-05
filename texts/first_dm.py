@@ -1,4 +1,4 @@
-"""Approved local First DM pools for magnet and legacy modes."""
+"""Approved local First DM pools for magnet, short_hook and legacy modes."""
 
 from __future__ import annotations
 
@@ -37,6 +37,53 @@ MAGNET_FIRST_DM_TEMPLATES: list[str] = [
     "Привет, ты больше пропускаешь дневные сигналы или ночные?",
     "Привет, бывало, что увидел сигнал и уже поздно заходить?",
     "Привет, ты успеваешь проверять все торговые уведомления?",
+]
+
+
+# v1.0.76 short hook mode. Help wording is allowed only when it explicitly
+# says that help is needed with a question. The pool is closed-world and
+# reviewed so vague requests such as "можешь помочь?" cannot be sent.
+SHORT_HOOK_FIRST_DM_TEMPLATES: list[str] = [
+    "Привет, можешь помочь с вопросом?",
+    "Слушай, поможешь с одним вопросом?",
+    "Салам, можешь подсказать по одному вопросу?",
+    "Привет, выручишь с одним вопросом?",
+    "Здарова, поможешь разобраться с вопросом?",
+    "Слушай, можно попросить помощи с вопросом?",
+    "Привет, подскажешь по одному вопросу?",
+    "Салам, поможешь с вопросом по крипте?",
+    "Привет, можешь помочь с небольшим вопросом?",
+    "Слушай, выручишь с вопросом?",
+    "Привет, поможешь с коротким вопросом?",
+    "Здарова, можешь подсказать по вопросу?",
+    "Салам, выручишь с одним вопросом?",
+    "Слушай, поможешь разобраться с вопросом?",
+    "Привет, можно попросить помощи с вопросом?",
+    "Здарова, поможешь с вопросом по крипте?",
+    "Салам, можешь помочь с коротким вопросом?",
+    "Привет, выручишь с небольшим вопросом?",
+    "Слушай, подскажешь по одному вопросу?",
+    "Здарова, можешь помочь с одним вопросом?",
+    "Привет, можно к тебе с вопросом?",
+    "Здарова, можно короткий вопрос?",
+    "Слушай, можно кое-что спросить?",
+    "Салам, не занят? Хотел спросить по крипте",
+    "Привет, можно узнать твоё мнение?",
+    "Слушай, можно один вопрос?",
+    "Здарова, можно спросить по крипте?",
+    "Салам, можно коротко спросить?",
+    "Привет, не занят? Есть вопрос",
+    "Слушай, можно уточнить один момент?",
+    "Привет, есть вопрос по крипте",
+    "Здарова, можно узнать твоё мнение?",
+    "Салам, хотел один вопрос задать",
+    "Привет, можно спросить одну вещь?",
+    "Слушай, не занят на минуту? Есть вопрос",
+    "Здарова, есть короткий вопрос",
+    "Салам, можно кое-что уточнить?",
+    "Привет, хотел спросить по крипте",
+    "Слушай, можно один момент уточнить?",
+    "Здарова, можно к тебе с вопросом?",
 ]
 
 # Previous approved behavior is deliberately preserved for instant rollback.
@@ -108,7 +155,12 @@ FIRST_DM_TEMPLATES = MAGNET_FIRST_DM_TEMPLATES
 
 
 def templates_for_style(style: str) -> list[str]:
-    return LEGACY_FIRST_DM_TEMPLATES if str(style).strip().lower() == "legacy" else MAGNET_FIRST_DM_TEMPLATES
+    selected = str(style).strip().lower()
+    if selected == "legacy":
+        return LEGACY_FIRST_DM_TEMPLATES
+    if selected == "short_hook":
+        return SHORT_HOOK_FIRST_DM_TEMPLATES
+    return MAGNET_FIRST_DM_TEMPLATES
 
 
 def pick_first_dm(*, recent: list[str] | None = None, style: str = "magnet") -> str:

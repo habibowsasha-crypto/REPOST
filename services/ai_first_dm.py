@@ -1,4 +1,4 @@
-"""AI-generated First DM with selectable magnet and legacy modes."""
+"""AI-generated First DM with magnet, short_hook and legacy modes."""
 
 from __future__ import annotations
 
@@ -18,7 +18,12 @@ from config import (
     OPENAI_API_KEY,
 )
 from services import phrases as phrases_svc
-from texts.first_dm import MAGNET_FIRST_DM_TEMPLATES, pick_first_dm, templates_for_style
+from texts.first_dm import (
+    MAGNET_FIRST_DM_TEMPLATES,
+    SHORT_HOOK_FIRST_DM_TEMPLATES,
+    pick_first_dm,
+    templates_for_style,
+)
 
 _BAD_DASHES = ("\u2014", "\u2013", "\u2212")
 _LINK_RE = re.compile(r"(https?://|t\.me/|telegram\.me/|www\.|\.com/|\.ru/)", re.IGNORECASE)
@@ -53,6 +58,16 @@ _LEGACY_HOOK_RE = re.compile(
     re.IGNORECASE,
 )
 
+_SHORT_HOOK_HELP_RE = re.compile(
+    r"(помощ|помог|помож|помоч|выруч|подскаж)",
+    re.IGNORECASE,
+)
+_SHORT_HOOK_QUESTION_RE = re.compile(r"вопрос", re.IGNORECASE)
+_SHORT_HOOK_GREETING_RE = re.compile(
+    r"^(привет|слушай|салам|здарова)\b",
+    re.IGNORECASE,
+)
+
 _MAGNET_SYSTEM_PROMPT = """Ты пишешь незнакомому человеку первый короткий DM в Telegram.
 
 Цель - получить естественный короткий ответ от человека, который интересуется криптой или трейдингом.
@@ -83,6 +98,20 @@ _LEGACY_SYSTEM_PROMPT = """Ты пишешь незнакомому челове
 Строго: 2-7 слов, одна фраза, без ссылки, эмодзи и длинного тире. Верни только сообщение.
 """
 
+_SHORT_HOOK_SYSTEM_PROMPT = """Ты выбираешь первое короткое сообщение незнакомому человеку в Telegram.
+
+Верни ровно одну готовую фразу из утверждённого списка ниже, без изменений:
+{approved}
+
+Строго:
+- не придумывай новые формулировки
+- если используется помощь, она всегда нужна именно с вопросом
+- нельзя писать просто «можешь помочь?» или «выручишь?»
+- без ссылки, рекламы и эмодзи
+- только короткий дефис -
+- верни только одну фразу из списка
+"""
+
 MAX_AI_FIRST_DM_ATTEMPTS = 3
 ANTI_REPEAT_WINDOW = 20
 
@@ -93,6 +122,10 @@ class FirstDMUnavailableError(RuntimeError):
 
 def _approved_magnet_norms() -> set[str]:
     return {_normalize(item) for item in MAGNET_FIRST_DM_TEMPLATES}
+
+
+def _approved_short_hook_norms() -> set[str]:
+    return {_normalize(item) for item in SHORT_HOOK_FIRST_DM_TEMPLATES}
 
 
 def sanitize_dashes(text: str) -> str:
@@ -124,6 +157,18 @@ def validate_first_dm(text: str, *, style: str | None = None) -> tuple[bool, str
             return False, "has_topic"
         if not _LEGACY_HOOK_RE.search(raw):
             return False, "not_simple_hook"
+        return True, "ok"
+
+
+    if selected == "short_hook":
+        if not 3 <= len(words) <= 10:
+            return False, "word_count"
+        if not _SHORT_HOOK_GREETING_RE.search(raw):
+            return False, "no_approved_greeting"
+        if _SHORT_HOOK_HELP_RE.search(raw) and not _SHORT_HOOK_QUESTION_RE.search(raw):
+            return False, "help_without_question"
+        if _normalize(raw) not in _approved_short_hook_norms():
+            return False, "not_approved_short_hook"
         return True, "ok"
 
     if not 5 <= len(words) <= 12:
@@ -200,7 +245,7 @@ def _local_first_dm(recent: list[str], *, style: str | None = None) -> str:
 
 
 async def generate_first_dm() -> str:
-    """Generate a First DM using the configured magnet or legacy mode."""
+    """Generate a First DM using the configured style."""
     selected = FIRST_DM_STYLE
     recent = phrases_svc.recent_texts(phrases_svc.KIND_FIRST_DM, limit=ANTI_REPEAT_WINDOW)
     if AI_DM_ENABLED and OPENAI_API_KEY:
@@ -236,7 +281,22 @@ async def _openai_first_dm(recent: list[str], *, retry: int = 0, style: str = "m
         client.chat.completions.create(
             model=AI_MODEL,
             messages=[
-                {"role": "system", "content": _LEGACY_SYSTEM_PROMPT if style == "legacy" else _MAGNET_SYSTEM_PROMPT},
+                {
+                    "role": "system",
+                    "content": (
+                        _LEGACY_SYSTEM_PROMPT
+                        if style == "legacy"
+                        else (
+                            _SHORT_HOOK_SYSTEM_PROMPT.format(
+                                approved="\n".join(
+                                    f"- {item}" for item in SHORT_HOOK_FIRST_DM_TEMPLATES
+                                )
+                            )
+                            if style == "short_hook"
+                            else _MAGNET_SYSTEM_PROMPT
+                        )
+                    ),
+                },
                 {"role": "user", "content": "Сформулируй новый First DM." + avoid + retry_note},
             ],
             temperature=1.0 if retry == 0 else 1.15,
