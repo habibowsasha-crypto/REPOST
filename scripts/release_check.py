@@ -98,6 +98,10 @@ def check_tree() -> list[str]:
     errors: list[str] = []
     for path in ROOT.rglob("*"):
         rel = path.relative_to(ROOT)
+        try:
+            rel.as_posix().encode("ascii")
+        except UnicodeEncodeError:
+            errors.append(f"non-ASCII path forbidden: {rel}")
         if path.is_symlink():
             errors.append(f"symlink forbidden: {rel}")
             continue
@@ -131,6 +135,10 @@ def check_zip(path: Path) -> list[str]:
             for info in zf.infolist():
                 name = info.filename.replace("\\", "/")
                 parts = Path(name).parts
+                try:
+                    name.encode("ascii")
+                except UnicodeEncodeError:
+                    errors.append(f"ZIP non-ASCII path forbidden: {name}")
                 if name.startswith("/") or ".." in parts:
                     errors.append(f"unsafe ZIP path: {name}")
                 mode = (info.external_attr >> 16) & 0xFFFF

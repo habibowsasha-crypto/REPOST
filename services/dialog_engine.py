@@ -672,6 +672,40 @@ async def _send_prepared_action(
 ) -> str:
     """Return sent | failed | ambiguous after a durable prepare."""
     prepared_row = dialog_delivery.get(target_user_id, action_kind) or {}
+    original_text = str(prepared_row.get("text") or text or "")
+    clean_text = ai_dialog.sanitize_post_first_dm_text(original_text)
+    if not clean_text:
+        dialog_delivery.mark_failed(
+            target_user_id, action_kind, "empty_after_repeated_greeting_guard"
+        )
+        logger.error(
+            "Post-First-DM message blocked because only a greeting remained "
+            "kind={} account={} target={}",
+            prepared_row.get("message_kind") or action_kind,
+            account_user_id,
+            target_user_id,
+        )
+        return "failed"
+    if clean_text != original_text:
+        if not dialog_delivery.replace_prepared_text(
+            target_user_id, action_kind, clean_text
+        ):
+            logger.error(
+                "Cannot persist repeated-greeting cleanup before send "
+                "kind={} account={} target={}",
+                prepared_row.get("message_kind") or action_kind,
+                account_user_id,
+                target_user_id,
+            )
+            return "retry"
+        logger.warning(
+            "Removed repeated greeting before post-First-DM delivery "
+            "kind={} account={} target={}",
+            prepared_row.get("message_kind") or action_kind,
+            account_user_id,
+            target_user_id,
+        )
+    text = clean_text
     allow_opt_out = bool(int(prepared_row.get("allow_opt_out") or 0))
     if opt_out_svc.is_opted_out(target_user_id) and not allow_opt_out:
         dialog_delivery.mark_failed(target_user_id, action_kind, "target_opted_out")

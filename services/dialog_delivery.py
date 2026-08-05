@@ -217,6 +217,54 @@ def prepare(
     return True
 
 
+def replace_prepared_text(
+    target_user_id: int,
+    action_kind: str,
+    text: str,
+) -> bool:
+    """Replace text of a PREPARED row before Telegram delivery.
+
+    Used by final safety guards when an older prepared message contains a repeated
+    greeting. The outbox, dialog history source and phrase journal stay consistent.
+    """
+    target = int(target_user_id)
+    action_key = str(action_kind)
+    value = str(text or "").strip()
+    if not value:
+        return False
+    now = _now_iso()
+    conn = get_connection()
+    with db_lock(), conn:
+        row = conn.execute(
+            """
+            SELECT status, message_kind FROM dialog_outbox
+             WHERE target_user_id=? AND action_kind=?
+            """,
+            (target, action_key),
+        ).fetchone()
+        if not row or str(row["status"]) != STATUS_PREPARED:
+            return False
+        conn.execute(
+            """
+            UPDATE dialog_outbox
+               SET text=?, updated_at=?
+             WHERE target_user_id=? AND action_kind=? AND status=?
+            """,
+            (value, now, target, action_key, STATUS_PREPARED),
+        )
+        kind = str(row["message_kind"] or _base_kind(action_key, None))
+        phrase_kind = _phrase_kind_for_message(kind)
+        if phrase_kind:
+            phrases_svc.remember(
+                phrase_kind,
+                value,
+                delivery_key=f"dialog:{target}:{action_key}",
+                conn=conn,
+                created_at=now,
+            )
+    return True
+
+
 def _load_history(raw: str | None) -> list[dict[str, Any]]:
     try:
         history = json.loads(raw or "[]")

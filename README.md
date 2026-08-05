@@ -1,7 +1,19 @@
-# Channel DM Bot v1.0.69
+# Channel DM Bot v1.0.75
 
 Telegram user-account DM bot: monitors selected groups, builds one shared lead queue, sends First DM, continues active dialogs, handles refusals, sends only the administrator's exact channel link, and stores durable state in SQLite.
 
+
+## Changes in v1.0.75 - no repeated greeting after First DM
+
+- Only the First DM may start with a greeting.
+- Promo, smoothing apology, link-opening help, Q&A, terminal replies and silence follow-up must continue the existing conversation without saying hello again.
+- AI prompts now explicitly forbid a new greeting after First DM.
+- Promo, apology, link-help and Q&A validators reject texts starting with `Привет`, `Здравствуйте`, `Добрый день`, `Хай`, `Здарова`, `Салют`, `Hello`, `Hi` and related forms.
+- The final delivery boundary removes an accidental leading greeting before Telegram send, including old PREPARED outbox rows created by an earlier version.
+- When a legacy prepared text is repaired, the durable outbox, phrase uniqueness journal and dialog history are updated to the exact cleaned text.
+- A post-First-DM message containing only a greeting is blocked instead of being sent empty.
+- First DM magnet and legacy modes, queue behavior, pacing, PeerFlood, SpamBot, active dialogs and the five-message budget are unchanged.
+- Release archives now require ASCII-only file and directory names. Historical documentation is stored under `AUDITS/NOTES/`.
 
 ## Changes in v1.0.69 - exact First DM text in admin notification
 

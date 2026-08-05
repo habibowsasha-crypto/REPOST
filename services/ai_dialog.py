@@ -59,6 +59,50 @@ _URL_RE = re.compile(
 )
 _TELEGRAM_HANDLE_RE = re.compile(r"(?<![\w@])@[A-Za-z][A-Za-z0-9_]{4,31}")
 
+# A greeting is allowed only in the First DM. Every later funnel message must
+# continue the existing conversation instead of greeting the same person again.
+_POST_FIRST_DM_GREETING_RE = re.compile(
+    r"^\s*(?:(?:привет(?:ик|ики)?|приветствую|здравствуй(?:те)?|"
+    r"добрый\s+(?:день|вечер|утро)|доброго\s+(?:дня|вечера|утра)|"
+    r"хай|здарова|салют|hello|hi)\b[\s,!.:;?_-]*)+",
+    re.IGNORECASE,
+)
+
+
+def starts_with_post_first_dm_greeting(text: str) -> bool:
+    """Return True when a post-First-DM message starts with a new greeting."""
+    return bool(_POST_FIRST_DM_GREETING_RE.match(str(text or "")))
+
+
+def _capitalize_first_letter(text: str) -> str:
+    chars = list(str(text or ""))
+    for index, char in enumerate(chars):
+        if char.isalpha():
+            chars[index] = char.upper()
+            break
+    return "".join(chars)
+
+
+def sanitize_post_first_dm_text(text: str) -> str:
+    """Remove an accidental repeated greeting from a later dialog message.
+
+    Generators reject such output and retry. This sanitizer is the final delivery
+    guard for legacy prepared outbox rows and external integrations. Text without
+    a greeting keeps its original letter case.
+    """
+    value = _strip_bad_dashes(str(text or ""))
+    greeting_removed = False
+    previous = None
+    while value and value != previous:
+        previous = value
+        updated = _POST_FIRST_DM_GREETING_RE.sub("", value, count=1)
+        if updated == value:
+            break
+        greeting_removed = True
+        value = updated.lstrip(" ,.!:;?-_")
+    value = re.sub(r"[ \t]+", " ", value).strip()
+    return _capitalize_first_letter(value) if greeting_removed else value
+
 # Local rules are only a safety fallback. The main semantic classification is done by AI.
 _STOP_REQUEST_RE = re.compile(
     r"(\bне\s+пиши(?:те)?(?:\s+мне)?\b|\bбольше\s+не\s+пиши(?:те)?\b|"
@@ -510,6 +554,8 @@ def _build_local_promo_candidates(category: str, count: int = 100) -> list[str]:
 
 def _promo_opening_ok(text: str) -> bool:
     value = _strip_bad_dashes(text)
+    if starts_with_post_first_dm_greeting(value):
+        return False
     if not 2 <= len(value) <= 90:
         return False
     if "?" in value or "\n" in value:
@@ -547,6 +593,8 @@ def _build_promo_with_opening(opening: str, category: str) -> str:
 def _promo_validation_errors(text: str) -> list[str]:
     value = _strip_bad_dashes(text)
     errors: list[str] = []
+    if starts_with_post_first_dm_greeting(value):
+        errors.append("repeated_greeting")
     if not 70 <= len(value) <= 520:
         errors.append("length")
     if _URL_RE.search(value) or _TELEGRAM_HANDLE_RE.search(value):
@@ -598,6 +646,7 @@ async def generate_promo(
         "- не нужно платить за каждую випку отдельно\n"
         "- человеку может пригодиться идея, разбор или материал для его сделок\n"
         "Пиши разговорно, без давления, одним сообщением до 420 символов.\n"
+        "Диалог уже начат. Не начинай с приветствия и не здоровайся повторно.\n"
         "Не задавай вопрос, не обещай прибыль, не выдумывай личный опыт.\n"
         "Не вставляй URL или @username - системная ссылка добавится автоматически.\n"
         "Используй только обычный дефис '-'. Верни только готовый текст.\n"
@@ -646,6 +695,8 @@ async def generate_promo(
 
 def _apology_ok(text: str) -> bool:
     value = _strip_bad_dashes(text)
+    if starts_with_post_first_dm_greeting(value):
+        return False
     if not 15 <= len(value) <= 180:
         return False
     if "?" in value or _URL_RE.search(value) or _TELEGRAM_HANDLE_RE.search(value):
@@ -664,6 +715,7 @@ async def generate_smoothing_apology(history: list[dict]) -> str:
         "Напиши одно короткое человеческое сообщение после рекламы в Telegram.\n"
         "Смысл: слегка извиниться за внезапное личное сообщение, сказать, что не хотел навязываться и просто поделился, вдруг пригодится.\n"
         "Каждый раз передавай этот смысл по-разному. Не упоминай канал, VIP, софт или ссылку.\n"
+        "Диалог уже идёт. Не начинай с приветствия и не здоровайся повторно.\n"
         "Не задавай вопрос. До 140 символов. Разговорный русский.\n"
         "Только обычный дефис '-'. Верни только сообщение."
         + _recent_block(recent)
@@ -692,6 +744,8 @@ async def generate_smoothing_apology(history: list[dict]) -> str:
 
 def _link_help_ok(text: str) -> bool:
     value = _strip_bad_dashes(text)
+    if starts_with_post_first_dm_greeting(value):
+        return False
     if not 90 <= len(value) <= 360:
         return False
     if _URL_RE.search(value) or _TELEGRAM_HANDLE_RE.search(value):
@@ -720,6 +774,7 @@ async def generate_link_open_help(history: list[dict]) -> str:
         "2. Нажать ссылку ещё раз.\n"
         "3. Если Telegram всё равно не пускает - скопировать ссылку вручную.\n"
         "Передай этот смысл другими словами, но не потеряй ни один шаг.\n"
+        "Диалог уже идёт. Не начинай с приветствия и не здоровайся повторно.\n"
         "Не вставляй сам URL. Не задавай вопрос. До 300 символов.\n"
         "Только обычный дефис '-'. Верни только готовую инструкцию."
         + _recent_block(recent)
@@ -745,6 +800,17 @@ async def generate_link_open_help(history: list[dict]) -> str:
                 logger.warning("Link help AI attempt {} failed: {}", attempt + 1, exc)
     valid = [item for item in _LINK_HELP_FALLBACKS if _link_help_ok(item)]
     return _pick_unique_fallback(valid, recent, threshold=0.88)
+
+def _qna_ok(text: str) -> bool:
+    value = _strip_bad_dashes(text)
+    if not 2 <= len(value) <= 350:
+        return False
+    if starts_with_post_first_dm_greeting(value):
+        return False
+    if _FORBIDDEN_CLAIMS_RE.search(value):
+        return False
+    return True
+
 
 async def generate_qna_reply(
     history: list[dict],
@@ -775,6 +841,7 @@ async def generate_qna_reply(
         "Если точного ответа нет, честно скажи, что точно не подскажешь.\n"
         "Не выдумывай список каналов, свою биографию, сделки, прибыль, результаты или личный опыт.\n"
         "Не обещай прибыль. Не начинай новую рекламную воронку.\n"
+        "Диалог уже идёт. Не начинай с приветствия и не здоровайся повторно.\n"
         f"Категория сообщения: {category}.\n"
         "Системная ссылка уже была отправлена выше. Сам не пиши URL или @username.\n"
         "Только обычный дефис '-'. Верни только готовый ответ."
@@ -783,8 +850,9 @@ async def generate_qna_reply(
         try:
             text = await _openai_reply(history, instruction=instruction, temperature=0.65)
             text = _enforce_admin_link(text or "", include_link=False)
-            if 2 <= len(text) <= 350 and not _FORBIDDEN_CLAIMS_RE.search(text):
+            if _qna_ok(text):
                 return _enforce_admin_link(text, include_link=include_link)
+            logger.warning("QNA rejected repeated greeting or invalid text={!r}", text[:140])
         except ChannelLinkNotConfiguredError:
             raise
         except Exception as exc:
@@ -799,24 +867,24 @@ async def generate_terminal_reply(
 ) -> str:
     """Generate the single terminal message for stop or aggressive refusal."""
     if category == CATEGORY_AGGRESSIVE_REFUSAL:
-        return random.choice(_AGGRESSIVE_CLOSE_FALLBACKS)
+        return sanitize_post_first_dm_text(random.choice(_AGGRESSIVE_CLOSE_FALLBACKS))
     if category == CATEGORY_STOP_REQUEST:
-        return random.choice(_STOP_CLOSE_FALLBACKS)
-    return random.choice(_SOFT_CLOSE_FALLBACKS)
+        return sanitize_post_first_dm_text(random.choice(_STOP_CLOSE_FALLBACKS))
+    return sanitize_post_first_dm_text(random.choice(_SOFT_CLOSE_FALLBACKS))
 
 
 def apology_text() -> str:
     """Compatibility helper for an aggressive terminal apology."""
-    return random.choice(_AGGRESSIVE_CLOSE_FALLBACKS)
+    return sanitize_post_first_dm_text(random.choice(_AGGRESSIVE_CLOSE_FALLBACKS))
 
 
 def soft_close_text() -> str:
-    return random.choice(_SOFT_CLOSE_FALLBACKS)
+    return sanitize_post_first_dm_text(random.choice(_SOFT_CLOSE_FALLBACKS))
 
 
 def followup_silence_text() -> str:
     """Existing 24-hour no-reply close after First DM. No promo and no link."""
-    return random.choice(_FIRST_DM_SILENCE_FALLBACKS)
+    return sanitize_post_first_dm_text(random.choice(_FIRST_DM_SILENCE_FALLBACKS))
 
 
 # Compatibility helpers retained for existing integrations and historical tests.
@@ -898,6 +966,7 @@ async def _openai_reply(
             "role": "system",
             "content": (
                 "Ты обычный пользователь Telegram, который интересуется криптой. "
+                "Диалог уже начат, поэтому не здоровайся повторно после First DM. "
                 "Пиши коротко, просто и по-человечески. Не изображай продавца, "
                 "эксперта или официального представителя. Не выдумывай личную "
                 "биографию, сделки, прибыль, депозит, опыт или знакомства. "
