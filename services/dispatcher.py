@@ -367,7 +367,18 @@ async def _attempt_lead_across_accounts(
 
             if generated_text is None:
                 try:
-                    generated_text = await generate_first_dm()
+                    # Keep generation and durable prepare inside one process-local
+                    # critical section. Otherwise two concurrent dispatch calls could
+                    # read the same last-20 window and choose the same fresh wording.
+                    async with phrases_svc.generation_lock(phrases_svc.KIND_FIRST_DM):
+                        generated_text = await generate_first_dm()
+                        result = await _send_first_dm(
+                            client,
+                            account_id,
+                            lead,
+                            generated_text,
+                            entity=entity,
+                        )
                 except Exception as exc:
                     detail = f"{_safe_error_name(exc)} during First DM generation"
                     queue_svc.set_last_error(target_id, detail)
@@ -379,18 +390,25 @@ async def _attempt_lead_across_accounts(
                     )
                     had_retryable_error = True
                     break
-
-        if generated_text is None:
-            continue
-        result = await _send_first_dm(
-            client,
-            account_id,
-            lead,
-            generated_text,
-            entity=entity,
-        )
+            else:
+                result = await _send_first_dm(
+                    client,
+                    account_id,
+                    lead,
+                    generated_text,
+                    entity=entity,
+                )
+        else:
+            if generated_text is None:
+                continue
+            result = await _send_first_dm(
+                client,
+                account_id,
+                lead,
+                generated_text,
+                entity=entity,
+            )
         if result == "sent":
-            phrases_svc.remember(phrases_svc.KIND_FIRST_DM, generated_text)
             _remember_text(generated_text)
             pacing.mark_global_sent()
             return True

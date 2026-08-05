@@ -175,10 +175,10 @@ def test_floodwait_is_visible_and_auto_clears_after_expiry(app_env):
     assert resumed["cooldown_until"] is None
 
 
-def test_peerflood_env_value_is_not_rewritten(app_env):
+def test_peerflood_default_range_matches_approved_values(app_env):
     from services import runtime
 
-    assert runtime.get_peer_flood_range_seconds() == (1800, 1800)
+    assert runtime.get_peer_flood_range_seconds() == (60, 90)
 
 
 def test_spambot_moscow_time_is_normalized_to_utc(app_env):

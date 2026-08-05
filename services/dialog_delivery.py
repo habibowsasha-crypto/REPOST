@@ -8,6 +8,7 @@ from typing import Any
 
 from config import LOCAL_DIALOG_TEXT_RETENTION_DAYS
 from db.schema import db_lock, get_connection
+from services import phrases as phrases_svc
 
 KIND_AUTO_LINK = "auto_link"
 KIND_FOLLOWUP = "followup"
@@ -79,6 +80,17 @@ def _base_kind(action_kind: str, message_kind: str | None) -> str:
     return str(action_kind).split(":", 1)[0]
 
 
+def _phrase_kind_for_message(message_kind: str) -> str | None:
+    kind = str(message_kind or "")
+    if kind in {KIND_PROMO, KIND_AUTO_LINK}:
+        return phrases_svc.KIND_PROMO
+    if kind == KIND_SMOOTH_APOLOGY:
+        return phrases_svc.KIND_APOLOGY
+    if kind == KIND_LINK_HELP:
+        return phrases_svc.KIND_LINK_HELP
+    return None
+
+
 def prepare(
     target_user_id: int,
     account_user_id: int,
@@ -120,7 +132,11 @@ def prepare(
             if stage != "promo_sent" or not int(dialog["link_sent"] or 0):
                 return False
         elif action_key == KIND_LINK_HELP:
-            if stage != "apology_sent" or not int(dialog["link_sent"] or 0):
+            allow_legacy_skip = bool(transition_data.get("allow_skip_apology", False))
+            valid_stage = stage == "apology_sent" or (
+                allow_legacy_skip and stage == "promo_sent"
+            )
+            if not valid_stage or not int(dialog["link_sent"] or 0):
                 return False
         elif action_key == KIND_FOLLOWUP and stage != "waiting_reply":
             return False
@@ -185,6 +201,15 @@ def prepare(
             """,
             (purge_due, purge_due, target),
         )
+        phrase_kind = _phrase_kind_for_message(kind)
+        if phrase_kind:
+            phrases_svc.remember(
+                phrase_kind,
+                str(text),
+                delivery_key=f"dialog:{target}:{action_key}",
+                conn=conn,
+                created_at=now,
+            )
     return True
 
 
@@ -226,7 +251,7 @@ def commit_sent(
         row = conn.execute(
             """
             SELECT account_user_id, text, status, message_kind, transition_json,
-                   allow_opt_out, source_inbox_id
+                   allow_opt_out, source_inbox_id, prepared_at
               FROM dialog_outbox
              WHERE target_user_id=? AND action_kind=?
             """,
@@ -332,6 +357,16 @@ def commit_sent(
                  WHERE id=? AND status IN ('pending', 'processing')
                 """,
                 (now, now, int(source_inbox_id)),
+            )
+        # Idempotent recovery backfill for messages prepared by older versions.
+        phrase_kind = _phrase_kind_for_message(kind)
+        if phrase_kind:
+            phrases_svc.remember(
+                phrase_kind,
+                text,
+                delivery_key=f"dialog:{target}:{action_key}",
+                conn=conn,
+                created_at=sent,
             )
     return True
 

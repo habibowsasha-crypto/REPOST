@@ -77,6 +77,28 @@ def seconds_until_global_ready() -> float:
     return max(0.0, delta)
 
 
+def seconds_until_account_cooldown(acc: dict[str, Any] | None) -> float:
+    """Return only the active Telegram cooldown wait for an account.
+
+    Existing dialogs ignore the normal First-DM interval and daily limit, but they
+    must never send while Telegram has placed the account in PeerFlood/FloodWait.
+    """
+    if not acc:
+        return 0.0
+    cooldown = _parse_iso(acc.get("cooldown_until"))
+    if cooldown is None:
+        return 0.0
+    return max(0.0, (cooldown - _now()).total_seconds())
+
+
+def account_cooldown_seconds(account_user_id: int) -> float:
+    from services import accounts as accounts_svc
+
+    return seconds_until_account_cooldown(
+        accounts_svc.get_account(int(account_user_id))
+    )
+
+
 def seconds_until_account_ready(acc: dict[str, Any]) -> float:
     """Return the persisted account/cooldown wait without changing pacing.
 
@@ -129,7 +151,7 @@ def account_is_send_ready(acc: dict[str, Any]) -> tuple[bool, str]:
     # is_paused without active cooldown is treated as stale and ignored
     # (PeerFlood path always sets cooldown_until together with pause).
 
-    # Random 10-15 min window stored as next_send_at after each success.
+    # Random 2-7 min window stored as next_send_at after each success.
     next_send = _parse_iso(acc.get("next_send_at"))
     if next_send and next_send > _now():
         return False, "account_interval"

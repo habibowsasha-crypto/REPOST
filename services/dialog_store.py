@@ -231,7 +231,7 @@ def set_stage(
             ),
         )
 
-def list_due_auto_links() -> list[dict[str, Any]]:
+def list_due_auto_links(limit: int = 50) -> list[dict[str, Any]]:
     """Return due legacy links, apologies and link-opening instructions.
 
     The historical function name is retained for the main loop. New dialogs use
@@ -258,8 +258,16 @@ def list_due_auto_links() -> list[dict[str, Any]]:
                 OR
                 (stage=? AND link_sent=1)
            )
+         ORDER BY auto_link_at ASC, target_user_id ASC
+         LIMIT ?
         """,
-        (now, STAGE_EXPLAINED, STAGE_PROMO_SENT, STAGE_APOLOGY_SENT),
+        (
+            now,
+            STAGE_EXPLAINED,
+            STAGE_PROMO_SENT,
+            STAGE_APOLOGY_SENT,
+            max(1, int(limit)),
+        ),
     ).fetchall()
     result = []
     for r in rows:
@@ -272,7 +280,7 @@ def list_due_auto_links() -> list[dict[str, Any]]:
     return result
 
 
-def list_due_followups() -> list[dict[str, Any]]:
+def list_due_followups(limit: int = 50) -> list[dict[str, Any]]:
     """waiting_reply dialogs past follow-up deadline (stored in auto_link_at)."""
     now = _now_iso()
     conn = get_connection()
@@ -288,8 +296,10 @@ def list_due_followups() -> list[dict[str, Any]]:
          WHERE stage=?
            AND auto_link_at IS NOT NULL
            AND auto_link_at <= ?
+         ORDER BY auto_link_at ASC, target_user_id ASC
+         LIMIT ?
         """,
-        (STAGE_WAITING_REPLY, now),
+        (STAGE_WAITING_REPLY, now, max(1, int(limit))),
     ).fetchall()
     result = []
     for r in rows:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import inspect
+import math
 import random
 import weakref
 from typing import Set, Tuple
@@ -60,6 +61,15 @@ def _auto_link_delay() -> int:
     return random.randint(lo, hi)
 
 
+def _reserved_automatic_slots(stage: str) -> int:
+    """Reserve the mandatory apology and link-help slots inside the five-message cap."""
+    if stage == store.STAGE_PROMO_SENT:
+        return 2
+    if stage == store.STAGE_APOLOGY_SENT:
+        return 1
+    return 0
+
+
 async def _cleanup_disabled_account(account_user_id: int) -> None:
     try:
         await monitor_svc.maybe_disconnect_inactive_account(account_user_id)
@@ -69,6 +79,17 @@ async def _cleanup_disabled_account(account_user_id: int) -> None:
 
 def _link_retry_at() -> str:
     return (_now() + dt.timedelta(minutes=15)).isoformat()
+
+
+def _account_cooldown_seconds(account_user_id: int) -> float:
+    """Existing dialogs continue normally, except during Telegram cooldowns."""
+    return pacing.account_cooldown_seconds(int(account_user_id))
+
+
+def _retry_at_for_account(account_user_id: int, fallback_seconds: int) -> str:
+    remaining = _account_cooldown_seconds(account_user_id)
+    delay = max(1, math.ceil(remaining) + 1) if remaining > 0 else max(1, int(fallback_seconds))
+    return (_now() + dt.timedelta(seconds=delay)).isoformat()
 
 
 async def on_first_dm_sent(target_user_id: int, account_user_id: int, text: str) -> None:
@@ -145,6 +166,15 @@ async def handle_incoming_private(
 async def _drain_dialog_inbox(account_user_id: int, target_user_id: int) -> None:
     """Drain all saved messages for one dialog in deterministic order."""
     while True:
+        cooldown = _account_cooldown_seconds(account_user_id)
+        if cooldown > 0:
+            logger.info(
+                "Incoming dialog deferred by Telegram cooldown account={} target={} wait_sec={}",
+                account_user_id,
+                target_user_id,
+                math.ceil(cooldown),
+            )
+            return
         row = dialog_inbox.claim_next(account_user_id, target_user_id)
         if row is None:
             return
@@ -195,6 +225,16 @@ async def _drain_dialog_inbox(account_user_id: int, target_user_id: int) -> None
                 **body_kwargs,
             )
             dialog_inbox.mark_done(row_id)
+        except DeliveryPendingError as exc:
+            dialog_inbox.requeue(row_id, str(exc))
+            logger.info(
+                "Incoming dialog delivery deferred account={} target={} inbox_id={} reason={}",
+                account_user_id,
+                target_user_id,
+                row_id,
+                exc,
+            )
+            return
         except asyncio.CancelledError:
             if is_hard_stop:
                 dialog_inbox.requeue(row_id, "hard_stop_worker_cancelled")
@@ -261,7 +301,6 @@ async def _process_hard_stop(
         transition={
             "stage": store.STAGE_CLOSED,
             "bump_outgoing": True,
-            "link_sent": category == ai_dialog.CATEGORY_STOP_REQUEST,
             "clear_auto_link": True,
             "append_history": True,
             "mark_contact_completed": True,
@@ -399,34 +438,37 @@ async def _handle_incoming_private_body(
     }
 
     if stage in first_reply_stages:
-        # The approved funnel always moves directly from First DM response to one
-        # complete promo with the exact link. No extra engage question is inserted.
-        await asyncio.sleep(_delay_reply())
-        history = (store.get_dialog(target_user_id) or {}).get("history") or []
-        promo = await ai_dialog.generate_promo(
-            history,
-            category=category,
-            content_kind=content_kind,
-        )
-        apology_at = (
-            _now() + dt.timedelta(seconds=_auto_link_delay())
-        ).isoformat()
-        result = await _deliver_inbox_message(
-            account_user_id,
-            target_user_id,
-            promo,
-            message_kind=dialog_delivery.KIND_PROMO,
-            source_inbox_id=source_inbox_id,
-            transition={
-                "stage": store.STAGE_PROMO_SENT,
-                "bump_outgoing": True,
-                "link_sent": True,
-                "auto_link_at": apology_at,
-                "append_history": True,
-            },
-        )
+        # The approved funnel moves directly from an allowed First DM response to one
+        # complete promo with the exact link. A calm refusal is allowed here and uses
+        # its own soft wording. Only stop requests and aggressive refusals were handled
+        # above as terminal. Generation plus prepare is serialized so two accounts
+        # cannot send the same fresh wording concurrently.
+        async with phrases_svc.generation_lock(phrases_svc.KIND_PROMO):
+            await asyncio.sleep(_delay_reply())
+            history = (store.get_dialog(target_user_id) or {}).get("history") or []
+            promo = await ai_dialog.generate_promo(
+                history,
+                category=category,
+                content_kind=content_kind,
+            )
+            apology_at = (
+                _now() + dt.timedelta(seconds=_auto_link_delay())
+            ).isoformat()
+            result = await _deliver_inbox_message(
+                account_user_id,
+                target_user_id,
+                promo,
+                message_kind=dialog_delivery.KIND_PROMO,
+                source_inbox_id=source_inbox_id,
+                transition={
+                    "stage": store.STAGE_PROMO_SENT,
+                    "bump_outgoing": True,
+                    "link_sent": True,
+                    "auto_link_at": apology_at,
+                    "append_history": True,
+                },
+            )
         if result == "sent":
-            phrases_svc.remember(phrases_svc.KIND_PROMO, promo)
             logger.info(
                 "Promo sent target={} account={} category={} apology_due={}",
                 target_user_id,
@@ -452,25 +494,28 @@ async def _handle_incoming_private_body(
         return
 
     if category == ai_dialog.CATEGORY_SOFT_REFUSAL:
-        reply = ai_dialog.soft_close_text()
-        result = await _deliver_inbox_message(
-            account_user_id,
+        # A calm refusal is not an opt-out and must not cancel the already approved
+        # automatic apology/link-help sequence. Avoid spending the optional Q&A slot;
+        # simply keep the current stage and scheduled automatic work unchanged.
+        logger.info(
+            "Calm refusal keeps funnel active target={} account={} stage={}",
             target_user_id,
-            reply,
-            message_kind=dialog_delivery.KIND_CLOSE,
-            source_inbox_id=source_inbox_id,
-            transition={
-                "stage": store.STAGE_CLOSED,
-                "bump_outgoing": True,
-                "clear_auto_link": True,
-                "append_history": True,
-                "mark_contact_completed": True,
-            },
+            account_user_id,
+            stage,
         )
-        if result != "sent":
-            store.set_stage(target_user_id, store.STAGE_CLOSED, clear_auto_link=True)
-            store.mark_contact_completed(target_user_id)
-        await _cleanup_disabled_account(account_user_id)
+        return
+
+    reserved_slots = _reserved_automatic_slots(stage)
+    if outgoing >= store.MAX_OUTGOING - reserved_slots:
+        logger.info(
+            "Dialog reply skipped to preserve mandatory automatic steps "
+            "target={} account={} stage={} outgoing={} reserved={}",
+            target_user_id,
+            account_user_id,
+            stage,
+            outgoing,
+            reserved_slots,
+        )
         return
 
     await asyncio.sleep(_delay_reply())
@@ -556,7 +601,7 @@ async def _deliver_inbox_message(
     result = await _send_prepared_action(
         account_user_id, target_user_id, action_key, text
     )
-    if result in {"ambiguous", "retry"}:
+    if result in {"ambiguous", "retry", "cooldown"}:
         raise DeliveryPendingError(action_key)
     return result
 
@@ -578,6 +623,14 @@ async def _send_prepared_action(
         dialog_delivery.mark_failed(target_user_id, action_kind, "target_opted_out")
         store.close_for_opt_out(target_user_id)
         return "failed"
+    cooldown = _account_cooldown_seconds(account_user_id)
+    if cooldown > 0:
+        dialog_delivery.mark_failed(
+            target_user_id,
+            action_kind,
+            f"account_cooldown:{math.ceil(cooldown)}",
+        )
+        return "cooldown"
     client = monitor_svc.get_client(account_user_id)
     if client is None or not client.is_connected():
         dialog_delivery.mark_failed(target_user_id, action_kind, "client_unavailable")
@@ -723,16 +776,6 @@ async def _reconcile_prepared_action(row: dict) -> bool:
                         _now() + dt.timedelta(seconds=_auto_link_delay())
                     ).isoformat(),
                 )
-        if kind in {
-            dialog_delivery.KIND_PROMO,
-            dialog_delivery.KIND_AUTO_LINK,
-            dialog_delivery.KIND_DIRECT_LINK,
-        }:
-            phrases_svc.remember(phrases_svc.KIND_PROMO, str(row.get("text") or ""))
-        elif kind == dialog_delivery.KIND_SMOOTH_APOLOGY:
-            phrases_svc.remember(phrases_svc.KIND_APOLOGY, str(row.get("text") or ""))
-        elif kind == dialog_delivery.KIND_LINK_HELP:
-            phrases_svc.remember(phrases_svc.KIND_LINK_HELP, str(row.get("text") or ""))
         await _cleanup_disabled_account(account)
         logger.warning(
             "Recovered dialog message from Telegram kind={} account={} target={} msg_id={}",
@@ -790,7 +833,7 @@ async def recover_ambiguous_scheduled_messages() -> int:
     return await recover_ambiguous_dialog_messages()
 
 
-async def process_due_auto_links() -> int:
+async def process_due_auto_links(limit: int = 25) -> int:
     """Send due promo compatibility steps, apologies and link-help instructions.
 
     The historical function name is retained for the main loop. The approved new
@@ -798,7 +841,7 @@ async def process_due_auto_links() -> int:
     continue even when new First DM sending is paused.
     """
     # Main-menu pause stops only new First DM. Existing dialogs continue.
-    due = store.list_due_auto_links()
+    due = store.list_due_auto_links(limit=max(1, int(limit)))
     sent_count = 0
     for due_row in due:
         target = int(due_row["target_user_id"])
@@ -818,6 +861,20 @@ async def process_due_auto_links() -> int:
                 current = store.get_dialog(target)
                 if not current or current.get("stage") == store.STAGE_CLOSED:
                     continue
+                cooldown = _account_cooldown_seconds(account)
+                if cooldown > 0:
+                    store.set_stage(
+                        target,
+                        str(current.get("stage") or ""),
+                        auto_link_at=_retry_at_for_account(account, 60),
+                    )
+                    logger.info(
+                        "Scheduled dialog deferred by Telegram cooldown account={} target={} wait_sec={}",
+                        account,
+                        target,
+                        math.ceil(cooldown),
+                    )
+                    continue
                 if dialog_inbox.has_pending(account, target):
                     continue
                 outgoing = int(current.get("outgoing_count") or 0)
@@ -830,7 +887,22 @@ async def process_due_auto_links() -> int:
                 stage = str(current.get("stage") or "")
                 history = current.get("history") or []
                 if stage == store.STAGE_PROMO_SENT and int(current.get("link_sent") or 0):
-                    action_kind = dialog_delivery.KIND_SMOOTH_APOLOGY
+                    remaining = store.MAX_OUTGOING - outgoing
+                    if remaining >= 2:
+                        action_kind = dialog_delivery.KIND_SMOOTH_APOLOGY
+                    elif remaining == 1:
+                        # Repair v1.0.64 dialogs where extra Q&A already consumed the
+                        # apology slot. The mandatory opening instruction gets priority.
+                        action_kind = dialog_delivery.KIND_LINK_HELP
+                        logger.warning(
+                            "Skipping apology to preserve link help for legacy budget "
+                            "target={} account={} outgoing={}",
+                            target,
+                            account,
+                            outgoing,
+                        )
+                    else:
+                        continue
                 elif stage == store.STAGE_APOLOGY_SENT and int(current.get("link_sent") or 0):
                     action_kind = dialog_delivery.KIND_LINK_HELP
                 elif stage == store.STAGE_EXPLAINED and not int(current.get("link_sent") or 0):
@@ -909,8 +981,10 @@ async def process_due_auto_links() -> int:
                         "clear_auto_link": True,
                         "append_history": True,
                     }
+                    if stage == store.STAGE_PROMO_SENT:
+                        transition["allow_skip_apology"] = True
                     message_kind = dialog_delivery.KIND_LINK_HELP
-                    retry_stage = store.STAGE_APOLOGY_SENT
+                    retry_stage = stage
                     retry_delay = 60
                 else:
                     text = await ai_dialog.generate_promo(
@@ -962,28 +1036,23 @@ async def process_due_auto_links() -> int:
                 if result == "sent":
                     sent_count += 1
                     if action_kind == dialog_delivery.KIND_AUTO_LINK:
-                        phrases_svc.remember(phrases_svc.KIND_PROMO, text)
                         logger.info("Legacy promo sent target={} account={}", target, account)
                     elif action_kind == dialog_delivery.KIND_SMOOTH_APOLOGY:
-                        phrases_svc.remember(phrases_svc.KIND_APOLOGY, text)
                         logger.info("Smoothing apology sent target={} account={}", target, account)
                     else:
-                        phrases_svc.remember(phrases_svc.KIND_LINK_HELP, text)
                         logger.info("Link help sent target={} account={}", target, account)
                     latest = store.get_dialog(target) or {}
                     if int(latest.get("outgoing_count") or 0) >= store.MAX_OUTGOING:
                         store.set_stage(target, store.STAGE_CLOSED, clear_auto_link=True)
                         store.mark_contact_completed(target)
                         await _cleanup_disabled_account(account)
-                elif result == "failed":
+                elif result in {"failed", "retry", "cooldown"}:
                     latest = store.get_dialog(target)
                     if latest and latest.get("stage") != store.STAGE_CLOSED:
                         store.set_stage(
                             target,
                             retry_stage,
-                            auto_link_at=(
-                                _now() + dt.timedelta(seconds=retry_delay)
-                            ).isoformat(),
+                            auto_link_at=_retry_at_for_account(account, retry_delay),
                         )
             except ai_dialog.ChannelLinkNotConfiguredError as exc:
                 logger.error("Scheduled promo blocked by CHANNEL_LINK: {}", exc)
@@ -994,9 +1063,9 @@ async def process_due_auto_links() -> int:
                 _inflight.discard(key)
     return sent_count
 
-async def process_due_followups() -> int:
+async def process_due_followups(limit: int = 50) -> int:
     """Send one crash-safe silence follow-up after the First DM."""
-    due = store.list_due_followups()
+    due = store.list_due_followups(limit=max(1, int(limit)))
     n = 0
     for d in due:
         target = int(d["target_user_id"])
@@ -1010,6 +1079,14 @@ async def process_due_followups() -> int:
             store.set_stage(target, store.STAGE_CLOSED, clear_auto_link=True)
             store.mark_contact_completed(target)
             await _cleanup_disabled_account(account)
+            continue
+        cooldown = _account_cooldown_seconds(account)
+        if cooldown > 0:
+            store.set_stage(
+                target,
+                store.STAGE_WAITING_REPLY,
+                auto_link_at=_retry_at_for_account(account, 120),
+            )
             continue
         key = (account, target)
         lock = _dialog_locks.setdefault(key, asyncio.Lock())
@@ -1029,13 +1106,14 @@ async def process_due_followups() -> int:
                 if result == "sent":
                     n += 1
                     logger.info("Silence follow-up sent target={} account={}", target, account)
-                elif result == "failed":
+                elif result in {"failed", "retry", "cooldown"}:
                     current = store.get_dialog(target)
                     if current and current.get("stage") != store.STAGE_CLOSED:
+                        fallback = 7200 if result == "failed" else 120
                         store.set_stage(
                             target,
                             store.STAGE_WAITING_REPLY,
-                            auto_link_at=(_now() + dt.timedelta(hours=2)).isoformat(),
+                            auto_link_at=_retry_at_for_account(account, fallback),
                         )
             finally:
                 _inflight.discard(key)

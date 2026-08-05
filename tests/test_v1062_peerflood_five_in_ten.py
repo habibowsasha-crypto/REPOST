@@ -127,7 +127,7 @@ def test_admin_screen_explains_five_in_ten_without_changing_normal_pacing(app_en
     text = menu._peerflood_screen()
     burst_text = menu._peerflood_burst_screen()
 
-    assert "1 мин – 1 мин 30 сек" in text
+    assert "1 мин - 1 мин 30 сек" in text
     assert "5 PeerFlood за 10 минут" in text
     assert "+**10 мин**" in text
     assert "Обычный PeerFlood и все остальные настройки не меняются" in burst_text

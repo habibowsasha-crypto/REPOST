@@ -105,7 +105,7 @@ def test_direct_refusal_preempts_pending_ai_reply(app_env, monkeypatch):
 
     assert len(sent) == 1
     assert "не буду" in sent[0].lower() or "не напишу" in sent[0].lower()
-    assert "https://t.me/+testhash" in sent[0]
+    assert "https://" not in sent[0]
     assert opt_out.is_opted_out(7002)
     assert dialog_store.get_dialog(7002)["stage"] == dialog_store.STAGE_CLOSED
     history = dialog_store.get_dialog(7002)["history"]

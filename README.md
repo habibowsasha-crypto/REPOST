@@ -1,6 +1,59 @@
-# Channel DM Bot v1.0.64
+# Channel DM Bot v1.0.68
 
 Telegram user-account DM bot: monitors selected groups, builds one shared lead queue, sends First DM, continues active dialogs, handles refusals, sends only the administrator's exact channel link, and stores durable state in SQLite.
+
+
+## Changes in v1.0.68 - PeerFlood cooldown anti-stacking
+
+- The configurable 5-in-10 extra cooldown can be applied only once during one active local PeerFlood pause.
+- Further five-event groups in the same pause are consumed but do not add more time.
+- Every local PeerFlood cooldown is capped at the configured ordinary maximum plus the configured 5-in-10 extra.
+- Startup automatically repairs previously inflated local timers such as multi-hour values created by older releases.
+- Telegram FloodWait and confirmed @SpamBot limited states are not shortened by this repair.
+- Manual or automatic resume clears the one-shot burst marker for the next independent pause.
+
+
+## Changes in v1.0.67 - deep audit privacy and cooldown hardening
+
+- Reassuring phrases such as `не беспокойся, всё нормально` and `не отвлекайся, говори` are no longer mistaken for stop requests.
+- Common direct aggressive refusals such as `отвали`, `проваливай`, `иди лесом`, `заткнись` and similar forms are terminal, block promo and create global opt-out.
+- Calm refusal behavior from v1.0.66 is preserved: `нет, спасибо`, `не надо`, `неинтересно` and similar non-aggressive replies may continue to promo.
+- All conversation history sent to OpenAI now redacts URLs, the exact administrator invite link and Telegram usernames. Local classification and similarity checks still use the complete locally stored text.
+- Startup logs no longer print the exact private CHANNEL_LINK. They report only that the configured link was validated.
+- Existing-dialog sends now respect active Telegram PeerFlood and FloodWait cooldowns. Promo, apology, link-help and AI replies wait for the account cooldown instead of retrying on every scheduler tick.
+- Due automatic-message queries are bounded and processed oldest first, preventing an unbounded scheduler batch after a long outage.
+- Incoming dialog inbox items remain pending during account cooldown and are retried after the real Telegram pause without duplicate AI generation.
+- Existing shared queue, source-account priority, dialog ownership, last-20 uniqueness, five-message budget and all approved pacing values remain unchanged.
+
+This section supersedes older statements that the exact configured link may be printed at startup or that active-dialog automatic sends ignore account-level Telegram cooldown.
+
+
+## Changes in v1.0.66 - calm refusal routing correction
+
+- A calm textual refusal such as `нет, спасибо`, `не надо`, `неинтересно` or `не хочу` is non-terminal and may continue to the approved promo branch.
+- Only an explicit request not to write, aggressive refusal, insult or threat blocks the promo and creates global opt-out.
+- Non-text reactions remain neutral or positive and continue the promo branch.
+- A calm refusal received after promo does not close the dialog, does not create opt-out and does not cancel the scheduled apology or link-opening instruction.
+- Any unsent v1.0.65 soft-close outbox action linked to a calm refusal is cancelled during migration so it cannot terminate the dialog after restart.
+- All queue, pacing, PeerFlood, phrase uniqueness, five-message budget and delivery safety rules remain unchanged.
+
+This section supersedes the v1.0.65 statement that a clear calm refusal is terminal before promo generation.
+
+
+## Changes in v1.0.65 - deep audit and crash-safe funnel fixes
+
+- A clear calm refusal such as `нет, спасибо` or `не надо` is now terminal before promo generation. AI classification cannot override an explicit local refusal into the advertising branch.
+- A request not to write or an aggressive refusal receives only a short terminal reply without any channel link. Old prepared v1.0.64 stop replies containing a link are cancelled during migration.
+- The five-message limit now reserves the mandatory apology and link-opening instruction. At most one user-initiated Q&A reply may consume the remaining slot after promo.
+- Legacy v1.0.64 dialogs that already spent the apology slot on extra Q&A prioritize the link-opening instruction as their final allowed message.
+- Phrase uniqueness is journaled atomically in the same SQLite transaction as durable prepare. A crash after Telegram delivery can no longer leave the sent wording outside the last-20 protection window.
+- A nullable `delivery_key` and unique partial index make phrase journal recovery idempotent. Prepared outbox texts also participate in the active uniqueness window.
+- First DM generation and durable prepare are serialized by phrase kind inside the process, preventing concurrent attempts from reading the same old window and selecting the same fresh wording. Promo generation already uses the same protection.
+- Recent examples sent to OpenAI redact the administrator's invite URL and Telegram handles. Local similarity checks still use the complete locally stored text.
+- Two fallback wording inconsistencies were corrected so every generated promo and link-opening instruction satisfies the same validator used by regression tests.
+- Existing queue, source-account priority, dialog ownership, opt-out, pacing, PeerFlood rules and approved four-message automatic funnel are unchanged.
+
+This section supersedes any older statement that a calm refusal may still receive the promotional link or that phrase history is recorded only after Telegram confirms delivery.
 
 
 ## Changes in v1.0.64 - simple First DM and varied four-step funnel
@@ -398,7 +451,7 @@ OPENAI_API_KEY=
 AI_MODEL=gpt-4o-mini
 AI_REQUEST_TIMEOUT_SECONDS=20
 AI_DM_ENABLED=true
-AI_APOLOGY_DELAY_MIN=5
+AI_APOLOGY_DELAY_MIN=60
 AI_APOLOGY_DELAY_MAX=60
 TELEGRAM_DIALOG_DELETE_DAYS=30
 LOCAL_DIALOG_TEXT_RETENTION_DAYS=180
@@ -416,7 +469,7 @@ The Telegram user-session must still exist when cleanup becomes due. The account
 
 ## Quick live test
 
-1. Deploy v1.0.62 over the existing volume/database.
+1. Deploy v1.0.68 over the existing volume/database.
 2. Confirm the new dashboard and all-time First-DM counter.
 3. Send a test First DM and confirm only one routine admin notification.
 4. Continue the dialog and confirm no reply/link/follow-up push notifications appear.

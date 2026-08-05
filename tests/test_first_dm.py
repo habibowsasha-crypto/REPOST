@@ -10,8 +10,8 @@ def test_validator_rules(app_env):
 
     assert validate_first_dm("Привет, можно спросить?")[0]
     assert not validate_first_dm("Смотри https://t.me/x")[0]
-    assert not validate_first_dm("Привет — можно?")[0]
-    ok, _ = validate_first_dm(sanitize_dashes("Привет — можно спросить?"))
+    assert not validate_first_dm("Привет \u2014 можно?")[0]
+    ok, _ = validate_first_dm(sanitize_dashes("Привет \u2014 можно спросить?"))
     assert ok
     assert not validate_first_dm("Какие фильмы любишь?")[0]
     assert not validate_first_dm("")[0]

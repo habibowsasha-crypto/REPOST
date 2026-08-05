@@ -8,6 +8,7 @@ from typing import Any
 
 from config import LOCAL_DIALOG_TEXT_RETENTION_DAYS, TELEGRAM_DIALOG_DELETE_DAYS
 from db.schema import db_lock, get_connection
+from services import phrases as phrases_svc
 
 STATUS_PREPARED = "prepared"
 STATUS_SENT = "sent"
@@ -125,6 +126,13 @@ def prepare(
              WHERE target_user_id=? AND status='claimed'
             """,
             (account, now, target),
+        )
+        phrases_svc.remember(
+            phrases_svc.KIND_FIRST_DM,
+            str(text),
+            delivery_key=f"first_dm:{target}:{now}",
+            conn=conn,
+            created_at=now,
         )
     return True
 
@@ -275,6 +283,14 @@ def commit_sent(
             ) VALUES (?, ?, ?, ?, ?, ?)
             """,
             (event_key, target, account, telegram_message_id, sent, now),
+        )
+        # Idempotent recovery backfill for rows prepared by older versions.
+        phrases_svc.remember(
+            phrases_svc.KIND_FIRST_DM,
+            text,
+            delivery_key=f"first_dm:{target}:{row['prepared_at']}",
+            conn=conn,
+            created_at=sent,
         )
     return True
 

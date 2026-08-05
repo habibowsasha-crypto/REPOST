@@ -124,12 +124,25 @@ def run() -> None:
 
     init_db()
     logger.info("SQLite schema ready")
+    from services import accounts as accounts_svc
+
+    repaired_peerflood = accounts_svc.repair_inflated_peerflood_cooldowns()
+    for item in repaired_peerflood:
+        logger.warning(
+            "Repaired inflated PeerFlood cooldown account={} old_until={} "
+            "safe_until={} cleared={}",
+            item.get("user_id"),
+            item.get("old_until"),
+            item.get("safe_until"),
+            item.get("cleared"),
+        )
 
     background_tasks: list[asyncio.Task] = []
     try:
         from services.ai_dialog import configured_channel_link
 
-        logger.info("Exact CHANNEL_LINK configured: {}", configured_channel_link())
+        configured_channel_link()
+        logger.info("CHANNEL_LINK configured and validated")
     except Exception as exc:
         logger.error(
             "CHANNEL_LINK is not ready: link messages will not be sent until the "

@@ -48,10 +48,10 @@ def _patch_delivery(monkeypatch, client):
     monkeypatch.setattr(dialog_engine, "_auto_link_delay", lambda: 5)
 
 
-def test_default_apology_delay_is_5_to_60_seconds(app_env):
+def test_default_apology_delay_matches_approved_60_seconds(app_env):
     from services import runtime
 
-    assert runtime.get_auto_link_delay_range() == (5, 60)
+    assert runtime.get_auto_link_delay_range() == (60, 60)
 
 
 def test_emoji_only_is_always_non_text_reaction(app_env):
@@ -169,7 +169,7 @@ def test_due_action_after_promo_is_apology_not_second_link(app_env, monkeypatch)
     dialog = dialog_store.get_dialog(9103)
     assert dialog["stage"] == dialog_store.STAGE_APOLOGY_SENT
     assert int(dialog["outgoing_count"]) == 3
-    assert dialog["auto_link_at"] is None
+    assert dialog["auto_link_at"] is not None
     assert client.sent == ["сорян что отвлёк, просто решил поделиться"]
 
 
@@ -194,7 +194,7 @@ def test_pending_user_reply_cancels_due_apology(app_env, monkeypatch):
     assert dialog_store.get_dialog(9104)["stage"] == dialog_store.STAGE_PROMO_SENT
 
 
-def test_promo_store_keeps_exactly_last_30(app_env):
+def test_promo_store_keeps_exactly_last_20(app_env):
     from db.schema import get_connection
     from services import phrases
 
@@ -202,14 +202,14 @@ def test_promo_store_keeps_exactly_last_30(app_env):
         phrases.remember(phrases.KIND_PROMO, f"promo {index}")
 
     recent = phrases.recent_texts(phrases.KIND_PROMO, limit=100)
-    assert len(recent) == 30
+    assert len(recent) == 20
     assert recent[0] == "promo 34"
-    assert recent[-1] == "promo 5"
+    assert recent[-1] == "promo 15"
     count = get_connection().execute(
         "SELECT COUNT(*) AS c FROM sent_phrases WHERE kind=?",
         (phrases.KIND_PROMO,),
     ).fetchone()["c"]
-    assert int(count) == 30
+    assert int(count) == 20
 
 
 def test_similarity_detects_near_duplicate(app_env):
@@ -247,10 +247,10 @@ def test_local_promo_has_required_facts_and_exact_link(app_env):
     assert "копир" in lower or "перенос" in lower or "подхватыва" in lower
     assert "вип" in lower or "vip" in lower
     assert "бесплат" in lower
-    assert "—" not in text and "–" not in text
+    assert "\u2013" not in text and "\u2014" not in text
 
 
-def test_stop_request_leaves_final_link_and_global_optout(app_env, monkeypatch):
+def test_stop_request_closes_without_advertising_and_global_optout(app_env, monkeypatch):
     from services import dialog_engine, dialog_store, opt_out
 
     dialog_store.create_after_first_dm(9105, 305, "ты торгуешь?")
@@ -269,7 +269,7 @@ def test_stop_request_leaves_final_link_and_global_optout(app_env, monkeypatch):
     assert opt_out.is_opted_out(9105)
     assert dialog_store.get_dialog(9105)["stage"] == dialog_store.STAGE_CLOSED
     assert len(client.sent) == 1
-    assert "https://t.me/+testhash" in client.sent[0]
+    assert "https://" not in client.sent[0]
     assert "больше" in client.sent[0].lower()
 
 
@@ -341,10 +341,21 @@ def test_five_outgoing_messages_are_absolute_limit(app_env, monkeypatch):
         )
     )
 
+    # The second Q&A is skipped because the mandatory link-help slot is reserved.
     dialog = dialog_store.get_dialog(9107)
-    assert int(dialog["outgoing_count"]) == 5
-    assert dialog["stage"] == dialog_store.STAGE_CLOSED
-    assert len(client.sent) == 4  # First DM was sent before this fake client was attached.
+    assert int(dialog["outgoing_count"]) == 4
+    assert dialog["stage"] == dialog_store.STAGE_APOLOGY_SENT
+    assert len(client.sent) == 3  # First DM was sent before this fake client was attached.
+
+    past = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=1)).isoformat()
+    dialog_store.set_stage(9107, dialog_store.STAGE_APOLOGY_SENT, auto_link_at=past)
+    asyncio.run(dialog_engine.process_due_auto_links())
+
+    final = dialog_store.get_dialog(9107)
+    assert int(final["outgoing_count"]) == 5
+    assert final["stage"] == dialog_store.STAGE_CLOSED
+    assert len(client.sent) == 4
+    assert "заблокировать" in client.sent[-1].lower()
 
     asyncio.run(
         dialog_engine.handle_incoming_private(

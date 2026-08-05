@@ -61,20 +61,28 @@ _TELEGRAM_HANDLE_RE = re.compile(r"(?<![\w@])@[A-Za-z][A-Za-z0-9_]{4,31}")
 
 # Local rules are only a safety fallback. The main semantic classification is done by AI.
 _STOP_REQUEST_RE = re.compile(
-    r"(не\s+пиши|не\s+пишите|больше\s+не\s+пиши|не\s+надо\s+писать|"
-    r"не\s+нужно\s+писать|не\s+беспокой|не\s+отвлекай|убери\s+меня|"
-    r"удали\s+меня|отстань|отстаньте|не\s+пиш(и|ите)\s+мне|stop\s+writing|do\s+not\s+write)",
+    r"(\bне\s+пиши(?:те)?(?:\s+мне)?\b|\bбольше\s+не\s+пиши(?:те)?\b|"
+    r"\bне\s+надо\s+писать\b|\bне\s+нужно\s+писать\b|"
+    r"\bне\s+беспокой(?:те)?\s+меня\b|\bбольше\s+не\s+беспокой(?:те)?\b|"
+    r"\bне\s+беспокой(?:те)?(?:\s+меня)?\s+больше\b|"
+    r"\bне\s+отвлекай(?:те)?\s+меня\b|\bбольше\s+не\s+отвлекай(?:те)?\b|"
+    r"\bне\s+отвлекай(?:те)?(?:\s+меня)?\s+больше\b|"
+    r"\bубери\s+меня\b|\bудали\s+меня\b|\bоставь\s+меня\s+в\s+покое\b|"
+    r"\bотстань(?:те)?\b|"
+    r"\bstop\s+writing\b|\bdo\s+not\s+write\b)",
     re.IGNORECASE,
 )
 _AGGRESSIVE_RE = re.compile(
     r"(отъеб|отъе\s*б|иди\s+нах|пош[её]л\s+нах|пошла\s+нах|"
     r"заебал|заебала|долбо[её]б|мудак|чмо|сдохни|fuck\s+off|"
-    r"отвали\s+нах|проваливай\s+нах|угрож|жалобу\s+кину)",
+    r"\bотвали\b|\bпроваливай\b|\bзаткнись\b|\bдостал(?:а)?(?:\s+уже)?\b|"
+    r"\bиди\s+(?:лесом|к\s+ч[её]рту|на\s+хер|нахер)\b|"
+    r"\bпош[её]л\s+ты\b|\bна\s+хер\b|\bнахер\b|угрож|жалобу\s+кину)",
     re.IGNORECASE,
 )
 _SOFT_NO_RE = re.compile(
     r"(^\s*нет\s*[.!?]?\s*$|неинтересно|не\s+интересно|не\s+надо|"
-    r"не\s+нужно|нет\s+спасибо|не\s+хочу|не\s+актуально|не\s+сейчас|"
+    r"не\s+нужно|нет\s*[,!.]?\s*спасибо|не\s+хочу|не\s+актуально|не\s+сейчас|"
     r"не\s+торгую|уже\s+не\s+торг|не\s+в\s+рынке|спасибо,?\s*не\s+надо)",
     re.IGNORECASE,
 )
@@ -141,7 +149,7 @@ _PROMO_MECHANICS = [
     "туда программа почти моментально переносит публикации из закрытых VIP-каналов",
     "там софт быстро подхватывает материалы из закрытых торговых випок",
     "программа автоматически и с минимальной задержкой переносит туда посты из закрытых VIP-каналов",
-    "программа собирает там свежие публикации из закрытых випок почти сразу после выхода",
+    "программа почти сразу собирает и переносит свежие публикации из закрытых випок",
     "софт оперативно переносит туда новые материалы из закрытых VIP-каналов",
 ]
 _PROMO_ACCESS = [
@@ -212,7 +220,7 @@ _LINK_HELP_FALLBACKS = [
     "Для надёжности закрой крестиком блок «Заблокировать / Добавить» над сообщениями и нажми ссылку повторно. Если Telegram всё равно не откроет - скопируй её вручную.",
     "Если Telegram не реагирует на ссылку, нажми крестик у панели «Заблокировать / Добавить» сверху чата и повтори попытку. Не поможет - скопируй вручную.",
     "Если не пускает в канал, убери крестиком панель «Заблокировать / Добавить» над диалогом и ещё раз нажми ссылку. Если не получится - скопируй её вручную.",
-    "Если ссылка остаётся недоступной, закрой крестиком «Заблокировать / Добавить» над чатом и попробуй снова. Последний вариант - скопировать ссылку вручную.",
+    "Если ссылка остаётся недоступной, закрой крестиком «Заблокировать / Добавить» над чатом и попробуй снова. В крайнем случае скопируй ссылку вручную.",
 ]
 
 _FIRST_DM_SILENCE_FALLBACKS = [
@@ -228,10 +236,10 @@ _AGGRESSIVE_CLOSE_FALLBACKS = [
     "понял тебя, больше писать не буду",
 ]
 
-_STOP_WITH_LINK_FALLBACKS = [
-    "хорошо, больше писать не буду. только ссылку оставлю, вдруг когда-нибудь пригодится",
-    "понял, больше не напишу. ссылку оставлю напоследок, вдруг потом пригодится",
-    "ок, больше беспокоить не буду. только оставлю ссылку на случай если понадобится",
+_STOP_CLOSE_FALLBACKS = [
+    "хорошо, больше писать не буду. извини за беспокойство",
+    "понял, больше не напишу. извини что отвлёк",
+    "ок, больше беспокоить не буду. всего доброго",
 ]
 
 _SOFT_CLOSE_FALLBACKS = [
@@ -344,6 +352,17 @@ async def classify_user_message(
         return CATEGORY_NORMAL
 
     fallback = local_category(text)
+    # Terminal local decisions are safety rules, not hints for the model. A calm
+    # refusal remains a non-terminal soft_refusal category and is allowed to enter
+    # the approved promo branch. Only a request to stop or aggressive refusal may
+    # terminate the funnel.
+    if fallback in {
+        CATEGORY_STOP_REQUEST,
+        CATEGORY_AGGRESSIVE_REFUSAL,
+    }:
+        return fallback
+    if fallback == CATEGORY_SOFT_REFUSAL:
+        return fallback
     if not (AI_DM_ENABLED and OPENAI_API_KEY):
         return fallback
 
@@ -353,7 +372,7 @@ async def classify_user_message(
         "normal - обычный ответ или вопрос\n"
         "unclear - смысл нельзя уверенно понять\n"
         "link_request - просит ссылку или говорит скинуть\n"
-        "soft_refusal - спокойно отказывается, не интересно, не торгует\n"
+        "soft_refusal - спокойно отказывается, не интересно, не торгует; эта категория не блокирует рекламу\n"
         "stop_request - спокойно просит больше не писать или удалить его\n"
         "aggressive_refusal - прямое оскорбление, агрессивный мат или угроза\n"
         "Одиночное 'не' после вопроса о торговле обычно означает обычный отрицательный "
@@ -408,11 +427,37 @@ MAX_GENERATION_ATTEMPTS = 3
 ANTI_REPEAT_WINDOW = 20
 
 
+def _redact_for_ai(text: str) -> str:
+    """Remove invite links and Telegram handles before sending context to OpenAI."""
+    value = str(text or "")
+    exact_link = (CHANNEL_LINK or "").strip()
+    if exact_link:
+        value = value.replace(exact_link, "[ссылка]")
+    value = _URL_RE.sub("[ссылка]", value)
+    value = _TELEGRAM_HANDLE_RE.sub("[username]", value)
+    return value.strip()
+
+
+def _history_messages_for_ai(history: list[dict]) -> list[dict[str, str]]:
+    """Build a bounded and redacted model history without Telegram identifiers."""
+    messages: list[dict[str, str]] = []
+    for item in (history or [])[-10:]:
+        role = "assistant" if item.get("role") == "assistant" else "user"
+        content = _redact_for_ai(str(item.get("text") or ""))[:600]
+        if content:
+            messages.append({"role": role, "content": content})
+    return messages
+
+
 def _recent_block(recent: list[str]) -> str:
     if not recent:
         return ""
-    return "\nПоследние формулировки этого типа, которые нельзя повторять или близко копировать:\n" + "\n".join(
-        f"- {item}" for item in recent[:ANTI_REPEAT_WINDOW]
+    # Do not send the administrator's invite link or Telegram handles back to AI.
+    # Similarity checks already ignore URLs, so redaction does not weaken uniqueness.
+    redacted = [_redact_for_ai(item) for item in recent[:ANTI_REPEAT_WINDOW]]
+    return (
+        "\nПоследние формулировки этого типа, которые нельзя повторять или близко копировать:\n"
+        + "\n".join(f"- {item}" for item in redacted if item)
     )
 
 
@@ -756,7 +801,7 @@ async def generate_terminal_reply(
     if category == CATEGORY_AGGRESSIVE_REFUSAL:
         return random.choice(_AGGRESSIVE_CLOSE_FALLBACKS)
     if category == CATEGORY_STOP_REQUEST:
-        return _enforce_admin_link(random.choice(_STOP_WITH_LINK_FALLBACKS), include_link=True)
+        return random.choice(_STOP_CLOSE_FALLBACKS)
     return random.choice(_SOFT_CLOSE_FALLBACKS)
 
 
@@ -861,9 +906,7 @@ async def _openai_reply(
         },
         {"role": "system", "content": instruction},
     ]
-    for item in (history or [])[-10:]:
-        role = "assistant" if item.get("role") == "assistant" else "user"
-        messages.append({"role": role, "content": str(item.get("text") or "")[:600]})
+    messages.extend(_history_messages_for_ai(history))
 
     response = await asyncio.wait_for(
         client.chat.completions.create(

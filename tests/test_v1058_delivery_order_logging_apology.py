@@ -442,29 +442,30 @@ def test_first_dm_ai_attempts_are_bounded_then_local_fallback(app_env, monkeypat
     monkeypatch.setattr(ai_first_dm, "_openai_first_dm", duplicate)
 
     text = asyncio.run(ai_first_dm.generate_first_dm())
-    assert calls == ai_first_dm.MAX_AI_FIRST_DM_ATTEMPTS == 2
+    assert calls == ai_first_dm.MAX_AI_FIRST_DM_ATTEMPTS == 3
     assert text != recent
     assert ai_first_dm.validate_first_dm(text)[0]
     assert not ai_first_dm._too_similar_recent(text, [recent])
 
 
-def test_first_dm_families_are_diverse_without_invented_newbie_biography(app_env):
+def test_first_dm_is_simple_and_has_no_trading_topic(app_env):
     from services import ai_first_dm
+    from texts.first_dm import FIRST_DM_TEMPLATES
 
-    assert len(ai_first_dm._STYLES) >= 8
-    assert "newbie" not in ai_first_dm._STYLES
-    required = {"market_view", "watchlist", "analysis_source", "format", "timeframe"}
-    assert required.issubset(set(ai_first_dm._STYLES))
+    assert len(FIRST_DM_TEMPLATES) > 20
+    for text in FIRST_DM_TEMPLATES:
+        assert ai_first_dm.validate_first_dm(text)[0]
+        assert not ai_first_dm._TOPIC_RE.search(text)
 
 
 def test_locked_limits_and_uniqueness_window_remain_unchanged(app_env):
     from services import dialog_store, phrases, runtime
 
     assert dialog_store.MAX_OUTGOING == 5
-    assert runtime.get_account_interval_range() == (600, 900)
+    assert runtime.get_account_interval_range() == (120, 420)
     assert runtime.get_global_spacing_range() == (90, 180)
-    assert runtime.get_daily_limit() == 45
+    assert runtime.get_daily_limit() == 125
 
     for index in range(35):
         phrases.remember(phrases.KIND_PROMO, f"promo-{index}")
-    assert len(phrases.recent_texts(phrases.KIND_PROMO, limit=100)) == 30
+    assert len(phrases.recent_texts(phrases.KIND_PROMO, limit=100)) == 20

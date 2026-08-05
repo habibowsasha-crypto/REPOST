@@ -9,7 +9,7 @@ import pytest
 def test_version_is_authoritative(app_env):
     import config
 
-    assert config.app_version() == "1.0.62"
+    assert config.app_version() == "1.0.68"
 
 
 def test_missing_version_fails_loudly(app_env, monkeypatch):

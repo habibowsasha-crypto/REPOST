@@ -125,6 +125,10 @@ def init_db() -> None:
             "peerflood_window_started_at TEXT"
         )
         _ensure_column(
+            conn, "accounts", "peerflood_burst_applied_at",
+            "peerflood_burst_applied_at TEXT"
+        )
+        _ensure_column(
             conn, "accounts", "interval_backup_min", "interval_backup_min INTEGER"
         )
         _ensure_column(
@@ -392,14 +396,27 @@ def init_db() -> None:
             )
             """
         )
+        _ensure_column(
+            conn,
+            "sent_phrases",
+            "delivery_key",
+            "delivery_key TEXT",
+        )
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_sent_phrases_kind
             ON sent_phrases(kind, id DESC)
             """
         )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_sent_phrases_delivery_key
+            ON sent_phrases(kind, delivery_key)
+            WHERE delivery_key IS NOT NULL
+            """
+        )
 
-        # v1.0.64 keeps separate global anti-repeat windows for every
+        # v1.0.65 keeps separate global anti-repeat windows for every
         # approved funnel message type. Older rows are safely trimmed on startup.
         for phrase_kind in ("first_dm", "promo", "apology", "link_help"):
             conn.execute(
@@ -586,6 +603,24 @@ def init_db() -> None:
             ON dialog_outbox(source_inbox_id, status)
             """
         )
+        # v1.0.65 never sends an advertising link after a request to stop. Cancel
+        # any old prepared terminal message from v1.0.64 that still contains a URL.
+        conn.execute(
+            """
+            UPDATE dialog_outbox
+               SET status='failed',
+                   last_error='v1.0.65_stop_reply_link_removed',
+                   updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE status='prepared'
+               AND message_kind='stop_close'
+               AND (
+                    lower(text) LIKE '%http://%'
+                    OR lower(text) LIKE '%https://%'
+                    OR lower(text) LIKE '%t.me/%'
+               )
+            """
+        )
+
 
         conn.execute(
             """
@@ -628,6 +663,40 @@ def init_db() -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_dialog_inbox_pending
             ON dialog_inbox(account_user_id, target_user_id, status, is_hard_stop, id)
+            """
+        )
+
+        # v1.0.66 restores the approved rule: a calm refusal is not terminal and may
+        # still receive the promo. Cancel any unsent v1.0.65 soft-close action so a
+        # restart cannot deliver the obsolete close and terminate the dialog.
+        conn.execute(
+            """
+            UPDATE dialog_outbox
+               SET status='failed',
+                   last_error='v1.0.66_soft_refusal_close_cancelled',
+                   updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE status='prepared'
+               AND message_kind='close'
+               AND source_inbox_id IN (
+                   SELECT id
+                     FROM dialog_inbox
+                    WHERE is_hard_stop=0
+                      AND (
+                           trim(lower(text)) IN ('нет', 'нет.', 'нет!', 'нет?')
+                           OR lower(text) LIKE '%неинтересно%'
+                           OR lower(text) LIKE '%не интересно%'
+                           OR lower(text) LIKE '%не надо%'
+                           OR lower(text) LIKE '%не нужно%'
+                           OR lower(text) LIKE '%нет спасибо%'
+                           OR lower(text) LIKE '%нет, спасибо%'
+                           OR lower(text) LIKE '%не хочу%'
+                           OR lower(text) LIKE '%не актуально%'
+                           OR lower(text) LIKE '%не сейчас%'
+                           OR lower(text) LIKE '%не торгую%'
+                           OR lower(text) LIKE '%уже не торг%'
+                           OR lower(text) LIKE '%не в рынке%'
+                      )
+               )
             """
         )
 

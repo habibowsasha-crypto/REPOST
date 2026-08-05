@@ -244,22 +244,51 @@ async def on_peer_flood(account_user_id: int) -> None:
     account_user_id = int(account_user_id)
     from services import runtime as runtime_svc
 
+    repair = accounts_svc.clamp_peerflood_cooldown(account_user_id)
+    if repair.get("changed"):
+        logger.warning(
+            "PeerFlood cooldown clamped account={} old_until={} safe_until={} cleared={}",
+            account_user_id,
+            repair.get("old_until"),
+            repair.get("safe_until"),
+            repair.get("cleared"),
+        )
     acc = accounts_svc.get_account(account_user_id)
     st = get_state(account_user_id) or {}
     st_status = str(st.get("status") or "")
+    active_local_cooldown = False
+    if acc and acc.get("is_paused") and str(acc.get("pause_reason") or "").lower() == "peerflood":
+        current_cd = _parse_iso(acc.get("cooldown_until"))
+        active_local_cooldown = bool(current_cd and current_cd > _now())
+    if not active_local_cooldown:
+        accounts_svc.clear_peerflood_burst_marker(account_user_id)
 
     # Count every real PeerFlood exception, including concurrent dialog sends
     # received while the account is already inside its ordinary cooldown.
     info = accounts_svc.register_peerflood_hit(account_user_id)
     streak = int(info.get("streak") or 1)
     burst_triggered = bool(info.get("burst_triggered"))
+    burst_suppressed = bool(info.get("burst_suppressed"))
     extra_seconds = int(info.get("extra_pause_seconds") or 0)
+
+    if burst_suppressed:
+        logger.warning(
+            "PeerFlood 5-in-10 extra suppressed account={} reason=already_applied_in_active_pause",
+            account_user_id,
+        )
 
     if acc and acc.get("is_paused"):
         cd = _parse_iso(acc.get("cooldown_until"))
         if cd and cd > _now():
             if burst_triggered and extra_seconds > 0:
-                extended_until = cd + dt.timedelta(seconds=extra_seconds)
+                _, ordinary_hi = runtime_svc.get_peer_flood_range_seconds()
+                hard_cap = _now() + dt.timedelta(
+                    seconds=int(ordinary_hi) + int(extra_seconds)
+                )
+                extended_until = min(
+                    cd + dt.timedelta(seconds=extra_seconds),
+                    hard_cap,
+                )
                 conn = get_connection()
                 with db_lock(), conn:
                     conn.execute(
@@ -698,6 +727,7 @@ async def resume_account(account_user_id: int, *, source: str = "manual") -> Non
                        pause_reason=NULL,
                        cooldown_until=NULL,
                        next_send_at=NULL,
+                       peerflood_burst_applied_at=NULL,
                        updated_at=?
                  WHERE user_id=?
                 """,
@@ -710,6 +740,7 @@ async def resume_account(account_user_id: int, *, source: str = "manual") -> Non
                    SET is_paused=0,
                        pause_reason=NULL,
                        cooldown_until=NULL,
+                       peerflood_burst_applied_at=NULL,
                        updated_at=?
                  WHERE user_id=?
                 """,

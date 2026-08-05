@@ -112,6 +112,7 @@ def list_accounts() -> list[dict[str, Any]]:
                dm_interval_min_sec, dm_interval_max_sec,
                COALESCE(peerflood_streak, 0) AS peerflood_streak,
                peerflood_last_at, peerflood_window_started_at,
+               peerflood_burst_applied_at,
                interval_backup_min, interval_backup_max, interval_backoff_until,
                COALESCE(auth_status, 'unknown') AS auth_status,
                auth_error, auth_lost_at, auth_notified_at,
@@ -136,6 +137,7 @@ def get_account(user_id: int) -> Optional[dict[str, Any]]:
                dm_interval_min_sec, dm_interval_max_sec,
                COALESCE(peerflood_streak, 0) AS peerflood_streak,
                peerflood_last_at, peerflood_window_started_at,
+               peerflood_burst_applied_at,
                interval_backup_min, interval_backup_max, interval_backoff_until,
                COALESCE(auth_status, 'unknown') AS auth_status,
                auth_error, auth_lost_at, auth_notified_at,
@@ -584,10 +586,10 @@ def format_dm_interval(acc: dict) -> str:
 def register_peerflood_hit(user_id: int) -> dict:
     """Register one PeerFlood and apply the exact rolling 5-in-10 rule.
 
-    The ordinary admin-configured pause is always preserved. Only the fifth
-    event for the same account inside the preceding ten minutes adds the
-    separately configurable extra cooldown. After a trigger, that five-event
-    group is consumed and a new group starts from the next PeerFlood.
+    The fifth event inside ten minutes may add the separately configured extra
+    cooldown only once while the current local PeerFlood pause is active. Any
+    further five-event groups during that same pause are counted and consumed
+    but cannot stack more time.
     """
     user_id = int(user_id)
     now = _now()
@@ -600,6 +602,13 @@ def register_peerflood_hit(user_id: int) -> dict:
     base_seconds = int(runtime_svc.pick_peer_flood_seconds())
     conn = get_connection()
     with db_lock(), conn:
+        marker_row = conn.execute(
+            "SELECT peerflood_burst_applied_at FROM accounts WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+        burst_already_applied = bool(
+            marker_row and marker_row["peerflood_burst_applied_at"]
+        )
         conn.execute(
             "DELETE FROM peerflood_hits WHERE account_user_id=? AND occurred_at<?",
             (user_id, cutoff_iso),
@@ -618,8 +627,10 @@ def register_peerflood_hit(user_id: int) -> dict:
         ).fetchone()
         hit_number = int(row["c"] if row else 1)
         window_started = str(row["first_at"]) if row and row["first_at"] else now_iso
-        burst_triggered = hit_number >= threshold
-        if burst_triggered:
+        threshold_reached = hit_number >= threshold
+        burst_triggered = bool(threshold_reached and not burst_already_applied)
+        burst_suppressed = bool(threshold_reached and burst_already_applied)
+        if threshold_reached:
             conn.execute(
                 "DELETE FROM peerflood_hits WHERE account_user_id=?",
                 (user_id,),
@@ -635,10 +646,22 @@ def register_peerflood_hit(user_id: int) -> dict:
                SET peerflood_streak=?,
                    peerflood_last_at=?,
                    peerflood_window_started_at=?,
+                   peerflood_burst_applied_at=CASE
+                       WHEN ?=1 THEN ?
+                       ELSE peerflood_burst_applied_at
+                   END,
                    updated_at=?
              WHERE user_id=?
             """,
-            (persisted_count, now_iso, persisted_window, now_iso, user_id),
+            (
+                persisted_count,
+                now_iso,
+                persisted_window,
+                1 if burst_triggered else 0,
+                now_iso,
+                now_iso,
+                user_id,
+            ),
         )
 
     extra_seconds = (
@@ -654,11 +677,133 @@ def register_peerflood_hit(user_id: int) -> dict:
         "base_pause_seconds": int(base_seconds),
         "extra_pause_seconds": int(extra_seconds),
         "burst_triggered": bool(burst_triggered),
+        "burst_suppressed": bool(burst_suppressed),
         "window_seconds": 10 * 60,
         "threshold": threshold,
         "interval_bumped": False,
         "rapid": bool(hit_number > 1),
     }
+
+
+def clear_peerflood_burst_marker(user_id: int) -> None:
+    """Allow one future 5-in-10 extension after the active pause has ended."""
+    conn = get_connection()
+    with db_lock(), conn:
+        conn.execute(
+            """
+            UPDATE accounts
+               SET peerflood_burst_applied_at=NULL, updated_at=?
+             WHERE user_id=?
+            """,
+            (_now_iso(), int(user_id)),
+        )
+
+
+def clamp_peerflood_cooldown(user_id: int) -> dict[str, Any]:
+    """Clamp only local PeerFlood pauses to the configured safe ceiling.
+
+    The maximum local pause is measured from the most recent real PeerFlood and
+    equals ordinary range maximum plus the configured 5-in-10 extra. Telegram
+    FloodWait and @SpamBot limited states are not modified here.
+    """
+    from services import runtime as runtime_svc
+
+    user_id = int(user_id)
+    conn = get_connection()
+    row = conn.execute(
+        """
+        SELECT user_id, is_paused, cooldown_until, pause_reason,
+               peerflood_last_at, updated_at
+          FROM accounts WHERE user_id=?
+        """,
+        (user_id,),
+    ).fetchone()
+    if not row:
+        return {"changed": False, "cleared": False}
+    reason = str(row["pause_reason"] or "").strip().lower()
+    if not bool(row["is_paused"]) or reason != "peerflood":
+        return {"changed": False, "cleared": False}
+
+    def _parse(raw):
+        if not raw:
+            return None
+        try:
+            value = dt.datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=dt.timezone.utc)
+            return value.astimezone(dt.timezone.utc)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    current_until = _parse(row["cooldown_until"])
+    reference = _parse(row["peerflood_last_at"]) or _parse(row["updated_at"])
+    if current_until is None or reference is None:
+        return {"changed": False, "cleared": False}
+    _, ordinary_hi = runtime_svc.get_peer_flood_range_seconds()
+    extra = runtime_svc.get_peer_flood_burst_extra_seconds()
+    safe_until = reference + dt.timedelta(seconds=int(ordinary_hi) + int(extra))
+    if current_until <= safe_until:
+        return {"changed": False, "cleared": False, "safe_until": safe_until.isoformat()}
+
+    now = _now()
+    with db_lock(), conn:
+        if safe_until <= now:
+            conn.execute(
+                """
+                UPDATE accounts
+                   SET is_paused=0, cooldown_until=NULL, pause_reason=NULL,
+                       peerflood_burst_applied_at=NULL,
+                       next_send_at=CASE
+                           WHEN next_send_at IS NOT NULL AND next_send_at>?
+                           THEN NULL ELSE next_send_at END,
+                       updated_at=?
+                 WHERE user_id=?
+                """,
+                (now.isoformat(), now.isoformat(), user_id),
+            )
+            return {
+                "changed": True,
+                "cleared": True,
+                "old_until": current_until.isoformat(),
+                "safe_until": safe_until.isoformat(),
+            }
+        conn.execute(
+            """
+            UPDATE accounts
+               SET cooldown_until=?,
+                   next_send_at=CASE
+                       WHEN next_send_at IS NOT NULL AND next_send_at>?
+                       THEN NULL ELSE next_send_at END,
+                   updated_at=?
+             WHERE user_id=?
+            """,
+            (safe_until.isoformat(), safe_until.isoformat(), now.isoformat(), user_id),
+        )
+    return {
+        "changed": True,
+        "cleared": False,
+        "old_until": current_until.isoformat(),
+        "safe_until": safe_until.isoformat(),
+    }
+
+
+def repair_inflated_peerflood_cooldowns() -> list[dict[str, Any]]:
+    """Repair all persisted local PeerFlood timers that exceed the safe ceiling."""
+    conn = get_connection()
+    rows = conn.execute(
+        """
+        SELECT user_id FROM accounts
+         WHERE is_paused=1
+           AND LOWER(TRIM(COALESCE(pause_reason, '')))='peerflood'
+           AND cooldown_until IS NOT NULL
+        """
+    ).fetchall()
+    repaired: list[dict[str, Any]] = []
+    for row in rows:
+        result = clamp_peerflood_cooldown(int(row["user_id"]))
+        if result.get("changed"):
+            repaired.append({"user_id": int(row["user_id"]), **result})
+    return repaired
 
 def maybe_restore_interval_after_success(user_id: int) -> bool:
     """Restore only a legacy interval backup; do not alter the 5-in-10 counter."""
