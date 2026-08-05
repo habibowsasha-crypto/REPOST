@@ -957,6 +957,23 @@ async def _send_first_dm(
 
         pacing.record_successful_send(account_id)
         try:
+            reset = accounts_svc.reset_peerflood_series_after_success(account_id)
+            if reset.get("changed"):
+                logger.info(
+                    "PeerFlood series reset after successful First DM account={} "
+                    "deleted_hits={}",
+                    account_id,
+                    reset.get("deleted_hits", 0),
+                )
+        except Exception as exc:
+            # Telegram and the First-DM outbox are already committed. A local
+            # diagnostics reset must never turn a proven send into a retry.
+            logger.exception(
+                "PeerFlood series reset after First DM failed account={}: {}",
+                account_id,
+                exc,
+            )
+        try:
             from services import audience as audience_svc
 
             audience_svc.record_first_dm(

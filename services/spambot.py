@@ -66,6 +66,7 @@ def _notify_peerflood(
     streak: int = 1,
     burst_triggered: bool = False,
     extra_seconds: int = 0,
+    spambot_check_started: bool = True,
 ) -> str:
     from services import runtime as runtime_svc
 
@@ -77,6 +78,11 @@ def _notify_peerflood(
         )
     else:
         burst = f"\n🔁 Серия за 10 минут: **{streak}/5**"
+    spambot_line = (
+        "🤖 SpamBot: **проверка запущена**"
+        if spambot_check_started
+        else "🤖 SpamBot: **повторная проверка не запускается**"
+    )
     return (
         "🚨 **ОБНАРУЖЕН PEERFLOOD**\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
@@ -84,7 +90,7 @@ def _notify_peerflood(
         "⏸ First DM: **остановлены**\n"
         f"⏳ Общая пауза: **{pause}**"
         f"{burst}\n"
-        "🤖 SpamBot: **проверка запущена**"
+        f"{spambot_line}"
     )
 
 
@@ -325,6 +331,11 @@ async def on_peer_flood(account_user_id: int) -> None:
     acc = accounts_svc.get_account(account_user_id)
     st = get_state(account_user_id) or {}
     st_status = str(st.get("status") or "")
+    previous_peerflood_at = _parse_iso((acc or {}).get("peerflood_last_at"))
+    repeated_within_ten_minutes = bool(
+        previous_peerflood_at
+        and dt.timedelta(0) <= (_now() - previous_peerflood_at) < dt.timedelta(minutes=10)
+    )
     active_local_cooldown = False
     if acc and acc.get("is_paused") and str(acc.get("pause_reason") or "").lower() == "peerflood":
         current_cd = _parse_iso(acc.get("cooldown_until"))
@@ -381,6 +392,7 @@ async def on_peer_flood(account_user_id: int) -> None:
                         streak=streak,
                         burst_triggered=True,
                         extra_seconds=extra_seconds,
+                        spambot_check_started=False,
                     )
                 )
                 logger.warning(
@@ -436,14 +448,16 @@ async def on_peer_flood(account_user_id: int) -> None:
             ),
         )
 
-    # One check now; next_check only as safety net (not immediate re-queue)
-    _upsert_state(
-        account_user_id,
-        status=STATUS_CHECKING,
-        next_check_at=(_now() + dt.timedelta(hours=12)).isoformat(),
-        limited_until=None,
-    )
     label = _account_label(account_user_id)
+    suppress_repeat_check = bool(repeated_within_ten_minutes)
+    if not suppress_repeat_check:
+        # One check now; next_check only as safety net (not immediate re-queue).
+        _upsert_state(
+            account_user_id,
+            status=STATUS_CHECKING,
+            next_check_at=(_now() + dt.timedelta(hours=12)).isoformat(),
+            limited_until=None,
+        )
     await notify_admins(
         _notify_peerflood(
             label,
@@ -451,8 +465,38 @@ async def on_peer_flood(account_user_id: int) -> None:
             streak=streak,
             burst_triggered=burst_triggered,
             extra_seconds=extra_seconds,
+            spambot_check_started=not suppress_repeat_check,
         )
     )
+    if suppress_repeat_check:
+        # The first real PeerFlood in the rolling series already started a
+        # SpamBot check. Repeating /start for every later hit adds noise and can
+        # itself look automated. Treat the local PeerFlood as authoritative,
+        # wait its ordinary cooldown, then use the existing safe auto-resume
+        # path (which adds the normal 2-7 minute account interval).
+        if st_status == STATUS_LIMITED:
+            logger.info(
+                "Repeated PeerFlood SpamBot check suppressed account={} series={}/5 "
+                "reason=existing_limited_state",
+                account_user_id,
+                streak,
+            )
+            return
+        _upsert_state(
+            account_user_id,
+            status=STATUS_FREE_PENDING,
+            last_reply="peerflood_repeat_spambot_check_suppressed",
+            next_check_at=min_until.isoformat(),
+            limited_until=None,
+        )
+        logger.info(
+            "Repeated PeerFlood SpamBot check suppressed account={} series={}/5 "
+            "resume_not_before={}",
+            account_user_id,
+            streak,
+            min_until.isoformat(),
+        )
+        return
     await check_account(account_user_id, force=True)
 
 

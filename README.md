@@ -479,7 +479,7 @@ The Telegram user-session must still exist when cleanup becomes due. The account
 
 ## Quick live test
 
-1. Deploy v1.0.71 over the existing volume/database.
+1. Deploy v1.0.72 over the existing volume/database.
 2. Confirm the new dashboard and all-time First-DM counter.
 3. Send a test First DM and confirm only one routine admin notification.
 4. Continue the dialog and confirm no reply/link/follow-up push notifications appear.
@@ -521,3 +521,13 @@ Do not commit `.env`, SQLite databases or Telegram session files. Restrict acces
 - A production dispatch round re-checks the global flag before the actual First-DM send and returns the claimed lead to the queue if the administrator pressed pause mid-round.
 - Startup migration repairs v1.0.70 accounts that were auto-resumed by SpamBot while the global worker remained paused.
 - Healthy active dialogs still continue during a normal global First-DM pause; only PeerFlood accounts waiting for safe recovery remain blocked.
+
+## v1.0.72 - PeerFlood series reset and SpamBot check deduplication
+
+- The first real PeerFlood in a rolling series still launches one SpamBot check.
+- Later PeerFlood events inside the same 10-minute window do not send another `/start` to SpamBot.
+- A repeated PeerFlood still receives the approved 60-90 second local pause and then the existing automatic 2-7 minute recovery interval.
+- A real SpamBot `limited` result remains authoritative and is never overwritten by the deduplication path.
+- One proven successful First DM clears all current PeerFlood hit rows, the visible series counter and the one-pause burst marker.
+- The next PeerFlood after a successful First DM starts fresh at 1/5.
+- Daily limits, account/global pacing, the five-in-ten extra pause, queue ownership and dialog behavior are unchanged.

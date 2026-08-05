@@ -685,6 +685,62 @@ def register_peerflood_hit(user_id: int) -> dict:
     }
 
 
+def reset_peerflood_series_after_success(user_id: int) -> dict[str, int | bool]:
+    """Clear the rolling PeerFlood series after one proven successful First DM.
+
+    A real successful cold DM is stronger evidence than an old PeerFlood hit.
+    Clearing both the denormalized account counters and the source hit rows keeps
+    the next genuine PeerFlood at 1/5 instead of carrying stale events forward.
+    This does not alter pacing, next_send_at, cooldowns or participation.
+    """
+    user_id = int(user_id)
+    conn = get_connection()
+    with db_lock(), conn:
+        row = conn.execute(
+            """
+            SELECT COALESCE(peerflood_streak, 0) AS streak,
+                   peerflood_last_at, peerflood_window_started_at,
+                   peerflood_burst_applied_at
+              FROM accounts
+             WHERE user_id=?
+            """,
+            (user_id,),
+        ).fetchone()
+        hit_row = conn.execute(
+            "SELECT COUNT(*) AS c FROM peerflood_hits WHERE account_user_id=?",
+            (user_id,),
+        ).fetchone()
+        hits = int(hit_row["c"] if hit_row else 0)
+        changed = bool(
+            hits
+            or (row and int(row["streak"] or 0))
+            or (row and row["peerflood_last_at"])
+            or (row and row["peerflood_window_started_at"])
+            or (row and row["peerflood_burst_applied_at"])
+        )
+        conn.execute(
+            "DELETE FROM peerflood_hits WHERE account_user_id=?",
+            (user_id,),
+        )
+        cur = conn.execute(
+            """
+            UPDATE accounts
+               SET peerflood_streak=0,
+                   peerflood_last_at=NULL,
+                   peerflood_window_started_at=NULL,
+                   peerflood_burst_applied_at=NULL,
+                   updated_at=?
+             WHERE user_id=?
+            """,
+            (_now_iso(), user_id),
+        )
+    return {
+        "changed": bool(changed),
+        "deleted_hits": hits,
+        "account_found": bool(int(cur.rowcount or 0)),
+    }
+
+
 def clear_peerflood_burst_marker(user_id: int) -> None:
     """Allow one future 5-in-10 extension after the active pause has ended."""
     conn = get_connection()
