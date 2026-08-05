@@ -500,3 +500,11 @@ The release archive includes the full project plan, patch report and test report
 ## Security note
 
 Do not commit `.env`, SQLite databases or Telegram session files. Restrict access to the Railway volume. Only IDs listed in `ADMIN_ID_LIST` can control the bot.
+
+## v1.0.70 - PeerFlood resume loop and bounded dialog recovery
+
+- Automatic SpamBot resume schedules the next First DM through the existing per-account 2-7 minute interval.
+- A PeerFlood on one lead stops that lead's current account round; the same target is not immediately probed by another account.
+- Ambiguous dialog recovery uses username-first entity resolution, persisted retry timestamps and bounded attempts.
+- Unrecoverable legacy follow-ups are closed safely instead of retrying every scheduler tick forever.
+- Manual admin resume remains an explicit immediate override.

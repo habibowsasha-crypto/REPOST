@@ -218,6 +218,22 @@ def upsert_from_activity(
         return "created"
 
 
+def get_lead(target_user_id: int) -> dict[str, Any] | None:
+    """Return one lead row for diagnostics and deterministic tests."""
+    conn = get_connection()
+    row = conn.execute(
+        """
+        SELECT target_user_id, username, first_name, last_name, access_hash,
+               source_chat_id, source_account_user_id, status, eligible_at,
+               claimed_by_account, claimed_at, send_attempts, last_error,
+               failure_reason, failure_at, last_seen_at, created_at, updated_at
+          FROM leads WHERE target_user_id=?
+        """,
+        (int(target_user_id),),
+    ).fetchone()
+    return dict(row) if row else None
+
+
 def count_by_status(status: str | None = None) -> int:
     conn = get_connection()
     if status:

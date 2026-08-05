@@ -123,19 +123,27 @@ def _notify_unknown(label: str, reply: str) -> str:
     )
 
 
-def _notify_resumed(label: str, source: str) -> str:
+def _notify_resumed(
+    label: str, source: str, *, next_first_dm_at: str | None = None
+) -> str:
     src = {
         "manual": "вручную",
         "auto": "автоматически",
         "spambot_free": "после проверки SpamBot",
         "spambot_auto": "после автоматической проверки SpamBot",
     }.get(source, source)
+    protective = (
+        f"\n⏳ Следующий First DM: **не раньше {_format_admin_time(next_first_dm_at)}**"
+        if next_first_dm_at
+        else ""
+    )
     return (
         "▶️ **FIRST DM АККАУНТА ВОЗОБНОВЛЕНЫ**\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
         f"👤 Аккаунт: **{label}**\n"
         f"🔄 Возобновление: **{src}**\n"
         "✅ Аккаунт снова участвует в отправке First DM."
+        f"{protective}"
     )
 
 
@@ -711,12 +719,26 @@ async def _apply_parse(
 async def resume_account(account_user_id: int, *, source: str = "manual") -> None:
     """Clear PeerFlood pause and mark SpamBot idle.
 
-    Manual resume also clears next_send_at so admin override takes effect now.
-    Auto resume (spambot_*) keeps next_send_at to avoid sticky same-account loops.
+    Manual resume is an explicit administrator override and may send immediately.
+    Every automatic SpamBot resume creates a fresh normal 2-7 minute account
+    interval (or the current configured per-account interval). This prevents the
+    account from being probed by a real First DM immediately after SpamBot says
+    that no formal restriction is visible.
     """
     account_user_id = int(account_user_id)
     pacing.set_paused(account_user_id, "", paused=False)
     clear_next = source == "manual"
+    next_first_dm_at: str | None = None
+    now = _now()
+    if not clear_next:
+        acc = accounts_svc.get_account(account_user_id) or {}
+        delay_seconds = pacing.random_account_interval_seconds(acc)
+        protective = now + dt.timedelta(seconds=delay_seconds)
+        existing_next = _parse_iso(acc.get("next_send_at"))
+        if existing_next and existing_next > protective:
+            protective = existing_next
+        next_first_dm_at = protective.isoformat()
+
     conn = get_connection()
     with db_lock(), conn:
         if clear_next:
@@ -731,7 +753,7 @@ async def resume_account(account_user_id: int, *, source: str = "manual") -> Non
                        updated_at=?
                  WHERE user_id=?
                 """,
-                (_now_iso(), account_user_id),
+                (now.isoformat(), account_user_id),
             )
         else:
             conn.execute(
@@ -740,11 +762,12 @@ async def resume_account(account_user_id: int, *, source: str = "manual") -> Non
                    SET is_paused=0,
                        pause_reason=NULL,
                        cooldown_until=NULL,
+                       next_send_at=?,
                        peerflood_burst_applied_at=NULL,
                        updated_at=?
                  WHERE user_id=?
                 """,
-                (_now_iso(), account_user_id),
+                (next_first_dm_at, now.isoformat(), account_user_id),
             )
     _upsert_state(
         account_user_id,
@@ -753,9 +776,16 @@ async def resume_account(account_user_id: int, *, source: str = "manual") -> Non
         next_check_at=None,
         limited_until=None,
     )
-    logger.info("Account {} resumed ({})", account_user_id, source)
+    logger.info(
+        "Account {} resumed ({}) next_first_dm_at={}",
+        account_user_id,
+        source,
+        next_first_dm_at or "immediate_manual_override",
+    )
     label = _account_label(account_user_id)
-    await notify_admins(_notify_resumed(label, source))
+    await notify_admins(
+        _notify_resumed(label, source, next_first_dm_at=next_first_dm_at)
+    )
     try:
         await monitor_svc.refresh_monitor()
     except Exception as exc:

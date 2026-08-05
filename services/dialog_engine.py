@@ -17,7 +17,9 @@ from telethon.errors import (
     UserIsBlockedError,
     UserPrivacyRestrictedError,
     ChatWriteForbiddenError,
+    PeerIdInvalidError,
 )
+from telethon.tl.types import InputPeerUser
 
 from services import account_auth
 from services import ai_dialog
@@ -610,6 +612,58 @@ def _normalize_message_text(value: str | None) -> str:
     return telegram_history.normalize_text(value)
 
 
+def _dialog_entity_user_id(entity) -> int | None:
+    for attr in ("user_id", "id"):
+        value = getattr(entity, attr, None)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _load_dialog_identity(target_user_id: int) -> dict:
+    from db.schema import get_connection
+
+    row = get_connection().execute(
+        """
+        SELECT username, access_hash, source_account_user_id
+          FROM audience WHERE user_id=?
+        """,
+        (int(target_user_id),),
+    ).fetchone()
+    return dict(row) if row else {}
+
+
+async def _resolve_dialog_entity(client, account: int, target: int, identity: dict):
+    """Resolve an owned dialog without trusting a recycled username."""
+    username = str(identity.get("username") or "").strip().lstrip("@")
+    if username:
+        try:
+            entity = await client.get_input_entity(username)
+        except (ValueError, TypeError, LookupError, PeerIdInvalidError):
+            entity = None
+        if entity is not None and _dialog_entity_user_id(entity) == target:
+            return entity
+
+    try:
+        return await client.get_input_entity(target)
+    except (ValueError, TypeError, LookupError, PeerIdInvalidError):
+        pass
+
+    access_hash = identity.get("access_hash")
+    source_account = identity.get("source_account_user_id")
+    if (
+        access_hash is not None
+        and source_account is not None
+        and int(source_account) == int(account)
+    ):
+        return InputPeerUser(target, int(access_hash))
+    return None
+
+
 async def _send_prepared_action(
     account_user_id: int,
     target_user_id: int,
@@ -636,7 +690,25 @@ async def _send_prepared_action(
         dialog_delivery.mark_failed(target_user_id, action_kind, "client_unavailable")
         return "retry"
     try:
-        entity = await client.get_input_entity(int(target_user_id))
+        identity = _load_dialog_identity(target_user_id)
+        entity = await _resolve_dialog_entity(
+            client, account_user_id, target_user_id, identity
+        )
+        if entity is None:
+            dialog_delivery.mark_failed(
+                target_user_id, action_kind, "entity_unavailable_before_send"
+            )
+            store.set_stage(target_user_id, store.STAGE_CLOSED, clear_auto_link=True)
+            store.mark_contact_completed(target_user_id)
+            logger.warning(
+                "Dialog closed because Telegram entity is unavailable before send "
+                "kind={} account={} target={}",
+                action_kind,
+                account_user_id,
+                target_user_id,
+            )
+            await _cleanup_disabled_account(account_user_id)
+            return "failed"
         if opt_out_svc.is_opted_out(target_user_id) and not allow_opt_out:
             dialog_delivery.mark_failed(target_user_id, action_kind, "target_opted_out")
             store.close_for_opt_out(target_user_id)
@@ -714,6 +786,54 @@ async def _send_prepared_action(
         return "ambiguous"
 
 
+_DIALOG_RECOVERY_NO_ENTITY_MAX_ATTEMPTS = 3
+_DIALOG_RECOVERY_GENERIC_MAX_ATTEMPTS = 6
+_DIALOG_RECOVERY_NO_ENTITY_DELAY_SECONDS = 900
+_DIALOG_RECOVERY_GENERIC_DELAY_SECONDS = 900
+
+
+def _defer_or_abandon_dialog_recovery(
+    row: dict,
+    *,
+    reason: str,
+    max_attempts: int,
+    delay_seconds: int,
+) -> bool:
+    target = int(row["target_user_id"])
+    action_key = str(row["action_kind"])
+    account = int(row["account_user_id"])
+    kind = str(row.get("message_kind") or action_key.split(":", 1)[0])
+    attempts = dialog_delivery.defer_recovery(
+        target, action_key, reason, delay_seconds=delay_seconds
+    )
+    if attempts < max_attempts:
+        logger.warning(
+            "Dialog recovery deferred kind={} account={} target={} reason={} "
+            "attempt={}/{} retry_sec={}",
+            kind,
+            account,
+            target,
+            reason,
+            attempts,
+            max_attempts,
+            delay_seconds,
+        )
+        return False
+
+    final_reason = f"recovery_exhausted:{reason}:{attempts}"
+    dialog_delivery.abandon_recovery(target, action_key, final_reason)
+    logger.error(
+        "Dialog recovery abandoned safely kind={} account={} target={} "
+        "reason={} attempts={}",
+        kind,
+        account,
+        target,
+        reason,
+        attempts,
+    )
+    return True
+
+
 async def _reconcile_prepared_action(row: dict) -> bool:
     target = int(row["target_user_id"])
     account = int(row["account_user_id"])
@@ -721,9 +841,21 @@ async def _reconcile_prepared_action(row: dict) -> bool:
     kind = str(row.get("message_kind") or action_key.split(":", 1)[0])
     client = monitor_svc.get_client(account)
     if client is None or not client.is_connected():
-        return False
+        return _defer_or_abandon_dialog_recovery(
+            row,
+            reason="client_unavailable",
+            max_attempts=_DIALOG_RECOVERY_GENERIC_MAX_ATTEMPTS,
+            delay_seconds=300,
+        )
     try:
-        entity = await client.get_input_entity(target)
+        entity = await _resolve_dialog_entity(client, account, target, row)
+        if entity is None:
+            return _defer_or_abandon_dialog_recovery(
+                row,
+                reason="entity_unavailable",
+                max_attempts=_DIALOG_RECOVERY_NO_ENTITY_MAX_ATTEMPTS,
+                delay_seconds=_DIALOG_RECOVERY_NO_ENTITY_DELAY_SECONDS,
+            )
         prepared_at = pacing._parse_iso(row.get("prepared_at"))
         lower_bound = prepared_at - dt.timedelta(minutes=2) if prepared_at else None
         found = await telegram_history.find_outgoing_text_since(
@@ -733,25 +865,77 @@ async def _reconcile_prepared_action(row: dict) -> bool:
             since=lower_bound,
         )
     except Exception as exc:
+        if isinstance(exc, FloodWaitError):
+            seconds = int(getattr(exc, "seconds", 60) or 60)
+            pacing.apply_floodwait(account, seconds)
+            return _defer_or_abandon_dialog_recovery(
+                row,
+                reason=f"FloodWait:{seconds}",
+                max_attempts=_DIALOG_RECOVERY_GENERIC_MAX_ATTEMPTS,
+                delay_seconds=max(900, seconds),
+            )
+        if isinstance(exc, PeerFloodError):
+            try:
+                from services import spambot as spambot_svc
+
+                await spambot_svc.on_peer_flood(account)
+            except Exception as sp_exc:
+                logger.warning(
+                    "SpamBot from dialog recovery failed account={} error_type={}",
+                    account,
+                    type(sp_exc).__name__,
+                )
+                pacing.set_paused(account, "PeerFlood", paused=True)
+            return _defer_or_abandon_dialog_recovery(
+                row,
+                reason="PeerFlood",
+                max_attempts=_DIALOG_RECOVERY_GENERIC_MAX_ATTEMPTS,
+                delay_seconds=_DIALOG_RECOVERY_GENERIC_DELAY_SECONDS,
+            )
         if account_auth.is_auth_loss_error(exc):
             await account_auth.register_auth_loss(account, exc, notify=True)
             await monitor_svc.disconnect_account(account, cancel_tasks=True)
+            dialog_delivery.defer_recovery(
+                target, action_key, "authorization_lost", delay_seconds=21600
+            )
             logger.warning(
                 "Dialog recovery paused because authorization was lost "
-                "kind={} account={} target={}",
+                "kind={} account={} target={} retry_sec=21600",
                 kind,
                 account,
                 target,
             )
             return False
-        logger.exception(
-            "Cannot inspect Telegram history kind={} account={} target={}: {}",
+        expected_entity_miss = isinstance(
+            exc, (ValueError, TypeError, LookupError, PeerIdInvalidError)
+        )
+        if expected_entity_miss:
+            return _defer_or_abandon_dialog_recovery(
+                row,
+                reason=type(exc).__name__,
+                max_attempts=_DIALOG_RECOVERY_NO_ENTITY_MAX_ATTEMPTS,
+                delay_seconds=_DIALOG_RECOVERY_NO_ENTITY_DELAY_SECONDS,
+            )
+        logger.warning(
+            "Cannot inspect Telegram history kind={} account={} target={} "
+            "error_type={}",
             kind,
             account,
             target,
-            exc,
+            type(exc).__name__,
         )
-        return False
+        logger.opt(exception=exc).debug(
+            "Dialog recovery diagnostic kind={} account={} target={}",
+            kind,
+            account,
+            target,
+        )
+        return _defer_or_abandon_dialog_recovery(
+            row,
+            reason=type(exc).__name__,
+            max_attempts=_DIALOG_RECOVERY_GENERIC_MAX_ATTEMPTS,
+            delay_seconds=_DIALOG_RECOVERY_GENERIC_DELAY_SECONDS,
+        )
 
     if found is not None:
         committed = dialog_delivery.commit_sent(

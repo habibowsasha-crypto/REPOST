@@ -200,6 +200,15 @@ def _participating_sender_ids() -> set[int]:
     }
 
 
+def _peerflood_lead_retry_seconds(acc: dict[str, Any] | None = None) -> int:
+    """Back off the lead after PeerFlood instead of probing other accounts.
+
+    Reuse the already approved per-account First-DM interval. The queue row gets
+    its own eligible_at, so a different lead may still be processed safely.
+    """
+    return pacing.random_account_interval_seconds(acc)
+
+
 def _untried_ready_accounts(
     lead: dict[str, Any], ready: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -295,7 +304,6 @@ async def _attempt_lead_across_accounts(
                 )
                 continue
             except PeerFloodError:
-                queue_svc.release_claim(target_id, as_pending=True)
                 try:
                     from services import spambot as spambot_svc
 
@@ -307,8 +315,20 @@ async def _attempt_lead_across_accounts(
                         _safe_error_name(exc),
                     )
                     pacing.set_paused(account_id, "PeerFlood", paused=True)
-                had_account_cooldown = True
-                continue
+                retry_seconds = _peerflood_lead_retry_seconds(fresh)
+                queue_svc.defer_claim(
+                    target_id,
+                    seconds=retry_seconds,
+                    reason=f"peerflood_entity_account:{account_id}",
+                )
+                logger.warning(
+                    "Lead deferred after PeerFlood; no cross-account probe "
+                    "target={} account={} retry_sec={}",
+                    target_id,
+                    account_id,
+                    retry_seconds,
+                )
+                return False
             except PeerIdInvalidError:
                 queue_svc.record_account_failure(
                     target_id,
@@ -412,7 +432,22 @@ async def _attempt_lead_across_accounts(
             _remember_text(generated_text)
             pacing.mark_global_sent()
             return True
-        if result in {"flood", "peerflood", "auth_lost"}:
+        if result == "peerflood":
+            retry_seconds = _peerflood_lead_retry_seconds(fresh)
+            queue_svc.defer_claim(
+                target_id,
+                seconds=retry_seconds,
+                reason=f"peerflood_send_account:{account_id}",
+            )
+            logger.warning(
+                "Lead deferred after PeerFlood send; no cross-account probe "
+                "target={} account={} retry_sec={}",
+                target_id,
+                account_id,
+                retry_seconds,
+            )
+            return False
+        if result in {"flood", "auth_lost"}:
             had_account_cooldown = True
             continue
         if result == "error":

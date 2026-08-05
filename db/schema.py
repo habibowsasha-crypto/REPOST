@@ -591,6 +591,21 @@ def init_db() -> None:
             "allow_opt_out",
             "allow_opt_out INTEGER NOT NULL DEFAULT 0",
         )
+        _ensure_column(
+            conn,
+            "dialog_outbox",
+            "recovery_attempts",
+            "recovery_attempts INTEGER NOT NULL DEFAULT 0",
+        )
+        _ensure_column(
+            conn, "dialog_outbox", "recovery_next_at", "recovery_next_at TEXT"
+        )
+        _ensure_column(
+            conn,
+            "dialog_outbox",
+            "recovery_last_error",
+            "recovery_last_error TEXT",
+        )
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_dialog_outbox_target_status
@@ -603,6 +618,35 @@ def init_db() -> None:
             ON dialog_outbox(source_inbox_id, status)
             """
         )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_dialog_outbox_recovery_due
+            ON dialog_outbox(status, recovery_next_at, prepared_at)
+            """
+        )
+
+        migration_name = "v1_0_70_peerflood_resume_and_dialog_recovery"
+        applied = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE name=?",
+            (migration_name,),
+        ).fetchone()
+        if not applied:
+            conn.execute(
+                """
+                UPDATE dialog_outbox
+                   SET recovery_attempts=COALESCE(recovery_attempts, 0),
+                       recovery_next_at=NULL,
+                       recovery_last_error=NULL
+                 WHERE status='prepared'
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO schema_migrations(name, applied_at)
+                VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                """,
+                (migration_name,),
+            )
         # v1.0.65 never sends an advertising link after a request to stop. Cancel
         # any old prepared terminal message from v1.0.64 that still contains a URL.
         conn.execute(

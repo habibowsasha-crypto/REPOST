@@ -159,8 +159,9 @@ def prepare(
             INSERT INTO dialog_outbox (
                 target_user_id, action_kind, account_user_id, text, status,
                 prepared_at, telegram_message_id, sent_at, last_error, updated_at,
-                message_kind, transition_json, source_inbox_id, allow_opt_out
-            ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?)
+                message_kind, transition_json, source_inbox_id, allow_opt_out,
+                recovery_attempts, recovery_next_at, recovery_last_error
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, 0, NULL, NULL)
             ON CONFLICT(target_user_id, action_kind) DO UPDATE SET
                 account_user_id=excluded.account_user_id,
                 text=excluded.text,
@@ -173,7 +174,10 @@ def prepare(
                 message_kind=excluded.message_kind,
                 transition_json=excluded.transition_json,
                 source_inbox_id=excluded.source_inbox_id,
-                allow_opt_out=excluded.allow_opt_out
+                allow_opt_out=excluded.allow_opt_out,
+                recovery_attempts=0,
+                recovery_next_at=NULL,
+                recovery_last_error=NULL
             """,
             (
                 target,
@@ -316,7 +320,9 @@ def commit_sent(
             """
             UPDATE dialog_outbox
                SET status=?, telegram_message_id=COALESCE(?, telegram_message_id),
-                   sent_at=COALESCE(sent_at, ?), last_error=NULL, updated_at=?
+                   sent_at=COALESCE(sent_at, ?), last_error=NULL, updated_at=?,
+                   recovery_attempts=0, recovery_next_at=NULL,
+                   recovery_last_error=NULL
              WHERE target_user_id=? AND action_kind=?
             """,
             (STATUS_SENT, telegram_message_id, sent, now, target, action_key),
@@ -397,7 +403,8 @@ def get(target_user_id: int, action_kind: str) -> dict[str, Any] | None:
         """
         SELECT target_user_id, action_kind, account_user_id, text, status,
                prepared_at, telegram_message_id, sent_at, last_error, updated_at,
-               message_kind, transition_json, source_inbox_id, allow_opt_out
+               message_kind, transition_json, source_inbox_id, allow_opt_out,
+               recovery_attempts, recovery_next_at, recovery_last_error
           FROM dialog_outbox
          WHERE target_user_id=? AND action_kind=?
         """,
@@ -419,7 +426,8 @@ def list_prepared_for_target(target_user_id: int) -> list[dict[str, Any]]:
         """
         SELECT target_user_id, action_kind, account_user_id, text, status,
                prepared_at, telegram_message_id, sent_at, last_error, updated_at,
-               message_kind, transition_json, source_inbox_id, allow_opt_out
+               message_kind, transition_json, source_inbox_id, allow_opt_out,
+               recovery_attempts, recovery_next_at, recovery_last_error
           FROM dialog_outbox
          WHERE target_user_id=? AND status=?
          ORDER BY prepared_at ASC
@@ -438,16 +446,99 @@ def list_stale_prepared(
         """
         SELECT o.target_user_id, o.action_kind, o.account_user_id, o.text,
                o.prepared_at, o.message_kind, o.transition_json,
-               o.source_inbox_id, o.allow_opt_out, a.username, a.access_hash
+               o.source_inbox_id, o.allow_opt_out, o.recovery_attempts,
+               o.recovery_next_at, o.recovery_last_error,
+               a.username, a.access_hash, a.source_account_user_id
           FROM dialog_outbox o
           LEFT JOIN audience a ON a.user_id=o.target_user_id
          WHERE o.status=? AND o.prepared_at <= ?
-         ORDER BY o.prepared_at ASC
+           AND (o.recovery_next_at IS NULL OR o.recovery_next_at <= ?)
+         ORDER BY COALESCE(o.recovery_next_at, o.prepared_at) ASC
          LIMIT ?
         """,
-        (STATUS_PREPARED, cutoff, int(limit)),
+        (STATUS_PREPARED, cutoff, _now_iso(), int(limit)),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def defer_recovery(
+    target_user_id: int,
+    action_kind: str,
+    error: str,
+    *,
+    delay_seconds: int,
+) -> int:
+    """Persist a bounded recovery backoff for one ambiguous dialog message."""
+    now = _now()
+    retry_at = (now + dt.timedelta(seconds=max(1, int(delay_seconds)))).isoformat()
+    conn = get_connection()
+    with db_lock(), conn:
+        conn.execute(
+            """
+            UPDATE dialog_outbox
+               SET recovery_attempts=COALESCE(recovery_attempts, 0) + 1,
+                   recovery_next_at=?, recovery_last_error=?, updated_at=?
+             WHERE target_user_id=? AND action_kind=? AND status=?
+            """,
+            (
+                retry_at,
+                str(error)[:500],
+                now.isoformat(),
+                int(target_user_id),
+                str(action_kind),
+                STATUS_PREPARED,
+            ),
+        )
+        row = conn.execute(
+            """
+            SELECT COALESCE(recovery_attempts, 0) AS c
+              FROM dialog_outbox
+             WHERE target_user_id=? AND action_kind=?
+            """,
+            (int(target_user_id), str(action_kind)),
+        ).fetchone()
+        return int(row["c"] if row else 0)
+
+
+def abandon_recovery(target_user_id: int, action_kind: str, error: str) -> None:
+    """Stop an unrecoverable ambiguous action without risking a duplicate send."""
+    now = _now_iso()
+    conn = get_connection()
+    with db_lock(), conn:
+        conn.execute(
+            """
+            UPDATE dialog_outbox
+               SET status=?, last_error=?, updated_at=?, recovery_next_at=NULL,
+                   recovery_last_error=?
+             WHERE target_user_id=? AND action_kind=? AND status=?
+            """,
+            (
+                STATUS_FAILED,
+                str(error)[:500],
+                now,
+                str(error)[:500],
+                int(target_user_id),
+                str(action_kind),
+                STATUS_PREPARED,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE dialogs
+               SET stage='closed', auto_link_at=NULL,
+                   lifecycle_completed_at=COALESCE(lifecycle_completed_at, ?),
+                   updated_at=?
+             WHERE target_user_id=? AND stage!='closed'
+            """,
+            (now, now, int(target_user_id)),
+        )
+        conn.execute(
+            """
+            UPDATE contacts SET status='completed', updated_at=?
+             WHERE target_user_id=?
+            """,
+            (now, int(target_user_id)),
+        )
 
 
 def clear_for_target(target_user_id: int, *, preserve_opt_out_allowed: bool = False) -> None:
