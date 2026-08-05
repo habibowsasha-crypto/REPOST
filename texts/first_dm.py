@@ -1,12 +1,46 @@
-"""Local simple First DM templates without links or advertising."""
+"""Approved local First DM pools for magnet and legacy modes."""
 
 from __future__ import annotations
 
 import random
 
-# Approved style: a very simple human opener that is easy to answer.
-# No trading, market, signals or advertising context in the First DM.
-FIRST_DM_TEMPLATES: list[str] = [
+# Main v1.0.73 mode. Each message contains a concrete trading situation and
+# can be answered with a short opinion, choice or personal experience.
+MAGNET_FIRST_DM_TEMPLATES: list[str] = [
+    "Привет, часто сигнал замечаешь уже после движения?",
+    "Привет, что чаще - пропускаешь вход или заходишь поздно?",
+    "Привет, бывало, что хороший вход ушёл без тебя?",
+    "Привет, ты сигналы вручную отслеживаешь или через софт?",
+    "Привет, уведомления по сигналам у тебя всегда вовремя приходят?",
+    "Привет, ты больше по споту или по фьючам?",
+    "Привет, ты сам анализируешь или смотришь готовые сигналы?",
+    "Привет, часто открываешь сигнал, а цена уже далеко от входа?",
+    "Привет, успеваешь заходить по сигналам до основного движения?",
+    "Привет, бывает, что сигналов много, а уследить нереально?",
+    "Привет, сделки по сигналам открываешь вручную или автоматизировал?",
+    "Привет, что хуже - пропустить вход или зайти после движения?",
+    "Привет, часто пропускаешь входы, когда телефон не под рукой?",
+    "Привет, бывало, что нормальный сигнал выходил, пока ты спал?",
+    "Привет, ты обычно заходишь до импульса или уже после?",
+    "Привет, сам проверяешь каналы или ждёшь уведомления?",
+    "Привет, что чаще мешает - позднее уведомление или сомнения?",
+    "Привет, часто хороший вход пропускаешь, потому что поздно увидел?",
+    "Привет, ты реально успеваешь вручную следить за всеми сигналами?",
+    "Привет, у тебя чаще сигнал пропущен или вход уже убежал?",
+    "Привет, бывало, что уведомление пришло уже после импульса?",
+    "Привет, ты больше скальпишь или держишь сделки подольше?",
+    "Привет, у тебя чаще стоп выбивает или вход пропускаешь?",
+    "Привет, сигналы смотришь для идей или прямо по ним заходишь?",
+    "Привет, ты входишь сразу по сигналу или сначала перепроверяешь?",
+    "Привет, часто цена уходит, пока проверяешь сигнал?",
+    "Привет, тебе проще следить за одним каналом или за несколькими?",
+    "Привет, ты больше пропускаешь дневные сигналы или ночные?",
+    "Привет, бывало, что увидел сигнал и уже поздно заходить?",
+    "Привет, ты успеваешь проверять все торговые уведомления?",
+]
+
+# Previous approved behavior is deliberately preserved for instant rollback.
+LEGACY_FIRST_DM_TEMPLATES: list[str] = [
     "Привет, можно один вопрос?",
     "Привет, можно спросить?",
     "Привет, ты занят?",
@@ -69,12 +103,17 @@ FIRST_DM_TEMPLATES: list[str] = [
     "Привет, есть вопрос",
 ]
 
+# Backward-compatible alias for older imports and tests.
+FIRST_DM_TEMPLATES = MAGNET_FIRST_DM_TEMPLATES
 
-def pick_first_dm(*, recent: list[str] | None = None) -> str:
-    """Pick an exact non-repeat from the approved simple local pool."""
+
+def templates_for_style(style: str) -> list[str]:
+    return LEGACY_FIRST_DM_TEMPLATES if str(style).strip().lower() == "legacy" else MAGNET_FIRST_DM_TEMPLATES
+
+
+def pick_first_dm(*, recent: list[str] | None = None, style: str = "magnet") -> str:
+    """Pick an exact non-repeat from the selected approved local pool."""
     recent_set = {str(item).strip().casefold() for item in (recent or [])[:20]}
-    pool = [
-        item for item in FIRST_DM_TEMPLATES
-        if item.strip().casefold() not in recent_set
-    ]
-    return random.choice(pool or FIRST_DM_TEMPLATES)
+    templates = templates_for_style(style)
+    pool = [item for item in templates if item.strip().casefold() not in recent_set]
+    return random.choice(pool or templates)

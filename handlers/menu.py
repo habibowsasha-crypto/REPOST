@@ -9,6 +9,7 @@ from config import (
     ADMIN_ID_LIST,
     AI_DM_ENABLED,
     AI_MODEL,
+    FIRST_DM_STYLE,
     AI_REPLY_DELAY_MAX,
     AI_REPLY_DELAY_MIN,
     CHANNEL_LINK,
@@ -157,6 +158,7 @@ def _dashboard_text() -> str:
         DIV,
         link_line,
         ai_line,
+        f"🧲 First DM: `{FIRST_DM_STYLE}`",
         monitor_line,
     )
 

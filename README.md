@@ -531,3 +531,32 @@ Do not commit `.env`, SQLite databases or Telegram session files. Restrict acces
 - One proven successful First DM clears all current PeerFlood hit rows, the visible series counter and the one-pause burst marker.
 - The next PeerFlood after a successful First DM starts fresh at 1/5.
 - Daily limits, account/global pacing, the five-in-ten extra pause, queue ownership and dialog behavior are unchanged.
+
+## First DM modes v1.0.74
+
+The default mode is `magnet`. It sends short trading questions about missed entries, late entries, signal monitoring, notifications, spot or futures, and manual or automated tracking.
+
+The previous neutral opener system is preserved as `legacy`. To roll back without changing the ZIP or database, set:
+
+```env
+FIRST_DM_STYLE=legacy
+```
+
+To return to the new system, set:
+
+```env
+FIRST_DM_STYLE=magnet
+```
+
+Both modes keep the global last-20 uniqueness check and allow only the short ASCII hyphen `-`.
+
+
+## v1.0.74 First DM structural hardening
+
+- Magnet mode accepts only reviewed, grammatically complete questions from the approved local pool.
+- Free-form AI keyword combinations cannot be sent.
+- Any form of the word help is forbidden in magnet First DM.
+- Similarity fallback never weakens the last-20 uniqueness rule.
+- Invalid FIRST_DM_STYLE values fail closed instead of silently enabling magnet.
+- The dashboard shows the active First DM mode.
+- Legacy rollback remains available with FIRST_DM_STYLE=legacy.

@@ -68,6 +68,15 @@ AI_DM_ENABLED: bool = config("AI_DM_ENABLED", default="true").lower() in {
     "on",
 }
 
+# First DM content mode. "magnet" is the new trading question system.
+# Set FIRST_DM_STYLE=legacy for an instant rollback to the previous neutral openers.
+FIRST_DM_STYLE: str = config("FIRST_DM_STYLE", default="magnet").strip().lower()
+if FIRST_DM_STYLE not in {"magnet", "legacy"}:
+    raise RuntimeError(
+        "FIRST_DM_STYLE must be exactly 'magnet' or 'legacy'; "
+        f"got {FIRST_DM_STYLE!r}"
+    )
+
 # ---------------------------------------------------------------------------
 # Pacing (seconds unless noted)
 # ---------------------------------------------------------------------------

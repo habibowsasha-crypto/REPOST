@@ -1,4 +1,4 @@
-"""AI-generated simple First DM with strict validation and anti-repeat."""
+"""AI-generated First DM with selectable magnet and legacy modes."""
 
 from __future__ import annotations
 
@@ -10,48 +10,89 @@ from typing import Optional
 
 from loguru import logger
 
-from config import AI_DM_ENABLED, AI_MODEL, AI_REQUEST_TIMEOUT_SECONDS, OPENAI_API_KEY
+from config import (
+    AI_DM_ENABLED,
+    AI_MODEL,
+    AI_REQUEST_TIMEOUT_SECONDS,
+    FIRST_DM_STYLE,
+    OPENAI_API_KEY,
+)
 from services import phrases as phrases_svc
-from texts.first_dm import FIRST_DM_TEMPLATES, pick_first_dm
+from texts.first_dm import MAGNET_FIRST_DM_TEMPLATES, pick_first_dm, templates_for_style
 
 _BAD_DASHES = ("\u2014", "\u2013", "\u2212")
-_LINK_RE = re.compile(
-    r"(https?://|t\.me/|telegram\.me/|www\.|\.com/|\.ru/)",
+_LINK_RE = re.compile(r"(https?://|t\.me/|telegram\.me/|www\.|\.com/|\.ru/)", re.IGNORECASE)
+_WORD_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9]+")
+
+_MAGNET_TOPIC_RE = re.compile(
+    r"(сигнал|вход|движен|цен|уведомлен|сделк|спот|фьюч|торг|скальп|"
+    r"стоп|импульс|канал|софт|анализ|крипт)",
     re.IGNORECASE,
 )
-_TOPIC_RE = re.compile(
+_MAGNET_RESPONSE_RE = re.compile(
+    r"(часто|бывал|что чаще|что хуже|или|успева|вручную|сам |смотри|"
+    r"отслеж|открыва|заход|пропуска|проверя|ждёшь|ждешь|больше|всегда|бывает)",
+    re.IGNORECASE,
+)
+_FORBIDDEN_MAGNET_RE = re.compile(
+    r"(нужн[аоы]?\s+(твоя|моя)?\s*помощ|поможешь|можешь помочь|"
+    r"можно\s+(один\s+)?вопрос|можно спросить|можно поговорить|"
+    r"можно пару слов|могу спросить|что-то спросить|кое-что спросить|"
+    r"есть минутк|не отвлек|ты занят|свободен сейчас|есть просьба)",
+    re.IGNORECASE,
+)
+
+_LEGACY_TOPIC_RE = re.compile(
     r"(рынок|торг|сделк|позици|сигнал|график|крипт|биток|альт|золот|"
     r"таймфрейм|\bтф\b|разбор|стратег|вип|vip|канал|софт|ссылк)",
     re.IGNORECASE,
 )
-_SOFT_HOOK_RE = re.compile(
+_LEGACY_HOOK_RE = re.compile(
     r"(привет|слушай|можно|вопрос|спросить|уточнить|узнать|занят|свобод|"
     r"отвлек|помеш|минут|секунд|удобно|ответить|момент)",
     re.IGNORECASE,
 )
-_WORD_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9]+")
 
-_SYSTEM_PROMPT = """Ты пишешь незнакомому человеку первое короткое сообщение в Telegram.
+_MAGNET_SYSTEM_PROMPT = """Ты пишешь незнакомому человеку первый короткий DM в Telegram.
 
-Нужен только простой бытовой заход, на который легко ответить:
-- «Привет, можно один вопрос?»
-- «Привет, ты занят?»
-- «Можно кое-что спросить?»
-- «Не отвлеку?»
+Цель - получить естественный короткий ответ от человека, который интересуется криптой или трейдингом.
+Сообщение должно поднимать одну узнаваемую ситуацию:
+- сигнал увидели после движения
+- вход пропустили или зашли поздно
+- сигналы отслеживают вручную или через софт
+- уведомления приходят поздно
+- спот или фьючерсы
+- свой анализ или готовые сигналы
 
 Строго:
-- 2-7 слов
-- одна короткая фраза
-- без темы рынка, трейдинга, сигналов, позиции, канала и рекламы
-- без ссылки, эмодзи, длинного тире и официального тона
-- не объясняй, что именно хочешь спросить
+- один конкретный вопрос
+- 5-12 слов
+- начинается с «Привет,»
+- ответ возможен в 1-5 словах
+- без ссылки, рекламы, обещаний и эмодзи
+- без просьбы о помощи
+- не спрашивай разрешения задать другой вопрос
+- не используй «можно вопрос», «можно поговорить», «можно пару слов»
+- только короткий дефис -
 - не копируй недавние формулировки
 - верни только готовое сообщение
 """
 
-# One initial generation plus at most two repeat generations.
+_LEGACY_SYSTEM_PROMPT = """Ты пишешь незнакомому человеку первое короткое сообщение в Telegram.
+Нужен простой нейтральный заход без темы трейдинга и рекламы.
+Строго: 2-7 слов, одна фраза, без ссылки, эмодзи и длинного тире. Верни только сообщение.
+"""
+
 MAX_AI_FIRST_DM_ATTEMPTS = 3
 ANTI_REPEAT_WINDOW = 20
+
+
+class FirstDMUnavailableError(RuntimeError):
+    """No approved unique First DM is currently available."""
+
+
+def _approved_magnet_norms() -> set[str]:
+    return {_normalize(item) for item in MAGNET_FIRST_DM_TEMPLATES}
 
 
 def sanitize_dashes(text: str) -> str:
@@ -61,11 +102,12 @@ def sanitize_dashes(text: str) -> str:
     return out.strip()
 
 
-def validate_first_dm(text: str) -> tuple[bool, str]:
+def validate_first_dm(text: str, *, style: str | None = None) -> tuple[bool, str]:
+    selected = (style or FIRST_DM_STYLE).strip().lower()
     raw = sanitize_dashes(text)
     if not raw:
         return False, "empty"
-    if len(raw) > 60:
+    if len(raw) > 120:
         return False, "too_long"
     if any(dash in str(text or "") for dash in _BAD_DASHES):
         return False, "bad_dash"
@@ -73,13 +115,37 @@ def validate_first_dm(text: str) -> tuple[bool, str]:
         return False, "multiline"
     if _LINK_RE.search(raw):
         return False, "has_link"
-    if _TOPIC_RE.search(raw):
-        return False, "has_topic"
     words = _WORD_RE.findall(raw)
-    if not 2 <= len(words) <= 7:
+
+    if selected == "legacy":
+        if not 2 <= len(words) <= 7:
+            return False, "word_count"
+        if _LEGACY_TOPIC_RE.search(raw):
+            return False, "has_topic"
+        if not _LEGACY_HOOK_RE.search(raw):
+            return False, "not_simple_hook"
+        return True, "ok"
+
+    if not 5 <= len(words) <= 12:
         return False, "word_count"
-    if not _SOFT_HOOK_RE.search(raw):
-        return False, "not_simple_hook"
+    if not raw.casefold().startswith("привет"):
+        return False, "no_greeting"
+    if not raw.endswith("?"):
+        return False, "not_question"
+    if re.search(r"помощ|помог|помож|помоч", raw, re.IGNORECASE):
+        return False, "help_topic_forbidden"
+    if _FORBIDDEN_MAGNET_RE.search(raw):
+        return False, "forbidden_empty_hook"
+    if not _MAGNET_TOPIC_RE.search(raw):
+        return False, "no_trading_topic"
+    if not _MAGNET_RESPONSE_RE.search(raw):
+        return False, "not_answer_magnet"
+    # Magnet mode is intentionally closed-world: only reviewed, grammatically
+    # complete questions from the approved pool may be sent. AI can propose a
+    # wording, but it must match one reviewed structure exactly after harmless
+    # normalization. This prevents keyword-soup and semantic nonsense.
+    if _normalize(raw) not in _approved_magnet_norms():
+        return False, "not_approved_structure"
     return True, "ok"
 
 
@@ -111,87 +177,70 @@ def _too_similar_recent(text: str, recent: list[str], *, threshold: float = 0.86
     if not normalized:
         return True
     for old in recent[:ANTI_REPEAT_WINDOW]:
-        if normalized == _normalize(old):
-            return True
-        if _similarity(text, old) >= threshold:
+        if normalized == _normalize(old) or _similarity(text, old) >= threshold:
             return True
     return False
 
 
-def _local_first_dm(recent: list[str]) -> str:
-    candidates = list(FIRST_DM_TEMPLATES)
+def _local_first_dm(recent: list[str], *, style: str | None = None) -> str:
+    selected = (style or FIRST_DM_STYLE).strip().lower()
+    candidates = list(templates_for_style(selected))
     random.shuffle(candidates)
     for candidate in candidates:
         clean = sanitize_dashes(candidate)
-        ok, _reason = validate_first_dm(clean)
+        ok, _reason = validate_first_dm(clean, style=selected)
         if ok and not _too_similar_recent(clean, recent):
             return clean
 
-    # The local pool is deliberately larger than the 20-message window. If all
-    # remaining candidates are semantically close, exact repetition is still forbidden.
-    recent_exact = {_normalize(item) for item in recent[:ANTI_REPEAT_WINDOW]}
-    exact_new = [item for item in candidates if _normalize(item) not in recent_exact]
-    if exact_new:
-        def score(item: str) -> float:
-            return max((_similarity(item, old) for old in recent[:ANTI_REPEAT_WINDOW]), default=0.0)
-        return sanitize_dashes(min(exact_new, key=score))
-    return sanitize_dashes(pick_first_dm(recent=recent))
+    # Do not weaken the similarity rule in fallback. Sending nothing is safer
+    # than knowingly repeating a wording that the uniqueness guard rejected.
+    raise FirstDMUnavailableError(
+        f"no approved unique First DM available for style={selected}"
+    )
 
 
 async def generate_first_dm() -> str:
-    """Generate the approved simple First DM using the last 20 global messages."""
-    recent = phrases_svc.recent_texts(
-        phrases_svc.KIND_FIRST_DM,
-        limit=ANTI_REPEAT_WINDOW,
-    )
+    """Generate a First DM using the configured magnet or legacy mode."""
+    selected = FIRST_DM_STYLE
+    recent = phrases_svc.recent_texts(phrases_svc.KIND_FIRST_DM, limit=ANTI_REPEAT_WINDOW)
     if AI_DM_ENABLED and OPENAI_API_KEY:
         for attempt in range(MAX_AI_FIRST_DM_ATTEMPTS):
             try:
-                text = await _openai_first_dm(recent, retry=attempt)
+                text = await _openai_first_dm(recent, retry=attempt, style=selected)
             except Exception as exc:
                 logger.warning("AI first DM attempt {} failed: {}", attempt + 1, exc)
                 continue
             clean = sanitize_dashes(text or "")
-            ok, reason = validate_first_dm(clean)
+            ok, reason = validate_first_dm(clean, style=selected)
             if not ok:
-                logger.warning("AI first DM rejected reason={} text={!r}", reason, clean[:80])
+                logger.warning("AI first DM rejected style={} reason={} text={!r}", selected, reason, clean[:120])
                 continue
             if _too_similar_recent(clean, recent):
-                logger.warning("AI first DM too similar attempt={} text={!r}", attempt + 1, clean[:80])
+                logger.warning("AI first DM too similar attempt={} text={!r}", attempt + 1, clean[:120])
                 continue
             return clean
-    return _local_first_dm(recent)
+    return _local_first_dm(recent, style=selected)
 
 
-async def _openai_first_dm(recent: list[str], *, retry: int = 0) -> Optional[str]:
+async def _openai_first_dm(recent: list[str], *, retry: int = 0, style: str = "magnet") -> Optional[str]:
     from openai import AsyncOpenAI
 
-    client = AsyncOpenAI(
-        api_key=OPENAI_API_KEY,
-        timeout=AI_REQUEST_TIMEOUT_SECONDS,
-        max_retries=1,
-    )
+    client = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=AI_REQUEST_TIMEOUT_SECONDS, max_retries=1)
     avoid = ""
     if recent:
         avoid = "\nПоследние 20 сообщений, которые нельзя повторять или близко копировать:\n" + "\n".join(
             f"- {item}" for item in recent[:ANTI_REPEAT_WINDOW]
         )
-    retry_note = (
-        "\nПредыдущий вариант не прошёл проверку. Напиши заметно иначе."
-        if retry else ""
-    )
+    retry_note = "\nПредыдущий вариант не прошёл проверку. Напиши заметно иначе." if retry else ""
     response = await asyncio.wait_for(
         client.chat.completions.create(
             model=AI_MODEL,
             messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": "Сформулируй новый простой First DM." + avoid + retry_note,
-                },
+                {"role": "system", "content": _LEGACY_SYSTEM_PROMPT if style == "legacy" else _MAGNET_SYSTEM_PROMPT},
+                {"role": "user", "content": "Сформулируй новый First DM." + avoid + retry_note},
             ],
             temperature=1.0 if retry == 0 else 1.15,
-            max_tokens=40,
+            max_tokens=60,
             presence_penalty=0.7,
             frequency_penalty=0.5,
         ),
