@@ -479,7 +479,7 @@ The Telegram user-session must still exist when cleanup becomes due. The account
 
 ## Quick live test
 
-1. Deploy v1.0.69 over the existing volume/database.
+1. Deploy v1.0.71 over the existing volume/database.
 2. Confirm the new dashboard and all-time First-DM counter.
 3. Send a test First DM and confirm only one routine admin notification.
 4. Continue the dialog and confirm no reply/link/follow-up push notifications appear.
@@ -508,3 +508,16 @@ Do not commit `.env`, SQLite databases or Telegram session files. Restrict acces
 - Ambiguous dialog recovery uses username-first entity resolution, persisted retry timestamps and bounded attempts.
 - Unrecoverable legacy follow-ups are closed safely instead of retrying every scheduler tick forever.
 - Manual admin resume remains an explicit immediate override.
+
+
+## v1.0.71 - Global First-DM pause and SpamBot resume guard
+
+- The main `PAUSE FIRST DM` switch is authoritative for automatic SpamBot recovery.
+- A SpamBot-free PeerFlood account is not auto-resumed while global First DM is paused.
+- No misleading `FIRST DM ACCOUNT RESUMED` notification is emitted during the global pause.
+- The paused account receives a rolling Telegram cooldown, so overdue active-dialog messages cannot recreate the resume/PeerFlood loop.
+- Starting First DM later allows automatic recovery, followed by the existing 2-7 minute protective interval.
+- The protective interval is now written to both `next_send_at` and `cooldown_until`, so it blocks First DM and dialog sends.
+- A production dispatch round re-checks the global flag before the actual First-DM send and returns the claimed lead to the queue if the administrator pressed pause mid-round.
+- Startup migration repairs v1.0.70 accounts that were auto-resumed by SpamBot while the global worker remained paused.
+- Healthy active dialogs still continue during a normal global First-DM pause; only PeerFlood accounts waiting for safe recovery remain blocked.

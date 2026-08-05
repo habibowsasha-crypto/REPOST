@@ -19,6 +19,7 @@ from services import account_auth
 from services import accounts as accounts_svc
 from services import monitor as monitor_svc
 from services import pacing
+from services import runtime
 
 STATUS_IDLE = "idle"
 STATUS_CHECKING = "checking"
@@ -124,7 +125,11 @@ def _notify_unknown(label: str, reply: str) -> str:
 
 
 def _notify_resumed(
-    label: str, source: str, *, next_first_dm_at: str | None = None
+    label: str,
+    source: str,
+    *,
+    next_first_dm_at: str | None = None,
+    global_first_dm_paused: bool = False,
 ) -> str:
     src = {
         "manual": "вручную",
@@ -137,6 +142,16 @@ def _notify_resumed(
         if next_first_dm_at
         else ""
     )
+    if global_first_dm_paused:
+        return (
+            "✅ **ПАУЗА АККАУНТА СНЯТА**\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            f"👤 Аккаунт: **{label}**\n"
+            f"🔄 Снятие: **{src}**\n"
+            "⏸ Общая рассылка First DM остаётся на паузе.\n"
+            "💬 Новые First DM не отправляются."
+            f"{protective}"
+        )
     return (
         "▶️ **FIRST DM АККАУНТА ВОЗОБНОВЛЕНЫ**\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
@@ -153,6 +168,52 @@ def _now() -> dt.datetime:
 
 def _now_iso() -> str:
     return _now().isoformat()
+
+
+def _hold_account_for_global_pause(
+    account_user_id: int, *, seconds: int = 60
+) -> dt.datetime:
+    """Keep a SpamBot-free account blocked while global First DM is paused.
+
+    Existing dialogs intentionally continue during a normal global First-DM
+    pause. A PeerFlood account is different: automatically releasing it would
+    let an overdue dialog probe Telegram immediately and recreate the
+    resume/PeerFlood loop. This rolling hold keeps both First DM and dialog
+    sends blocked until the administrator starts First DM again.
+    """
+    now = _now()
+    hold_until = now + dt.timedelta(seconds=max(30, int(seconds)))
+    acc = accounts_svc.get_account(int(account_user_id)) or {}
+    for key in ("cooldown_until", "next_send_at"):
+        existing = _parse_iso(acc.get(key))
+        if existing and existing > hold_until:
+            hold_until = existing
+    conn = get_connection()
+    with db_lock(), conn:
+        conn.execute(
+            """
+            UPDATE accounts
+               SET is_paused=1,
+                   pause_reason='PeerFlood',
+                   cooldown_until=?,
+                   next_send_at=CASE
+                       WHEN next_send_at IS NOT NULL
+                        AND julianday(next_send_at) > julianday(?)
+                       THEN next_send_at
+                       ELSE ?
+                   END,
+                   updated_at=?
+             WHERE user_id=?
+            """,
+            (
+                hold_until.isoformat(),
+                hold_until.isoformat(),
+                hold_until.isoformat(),
+                now.isoformat(),
+                int(account_user_id),
+            ),
+        )
+    return hold_until
 
 
 def _parse_iso(value: str | None) -> Optional[dt.datetime]:
@@ -670,6 +731,21 @@ async def _apply_parse(
             return
 
         if SPAMBOT_AUTO_RESUME:
+            if not runtime.is_worker_enabled():
+                retry_at = _hold_account_for_global_pause(account_user_id)
+                _upsert_state(
+                    account_user_id,
+                    status=STATUS_FREE_PENDING,
+                    last_reply=reply_text[:500],
+                    next_check_at=retry_at.isoformat(),
+                    limited_until=None,
+                )
+                logger.info(
+                    "SpamBot free for {} - automatic resume deferred because "
+                    "global First DM is paused",
+                    account_user_id,
+                )
+                return
             await resume_account(account_user_id, source="spambot_free")
         else:
             _upsert_state(
@@ -761,13 +837,18 @@ async def resume_account(account_user_id: int, *, source: str = "manual") -> Non
                 UPDATE accounts
                    SET is_paused=0,
                        pause_reason=NULL,
-                       cooldown_until=NULL,
+                       cooldown_until=?,
                        next_send_at=?,
                        peerflood_burst_applied_at=NULL,
                        updated_at=?
                  WHERE user_id=?
                 """,
-                (next_first_dm_at, now.isoformat(), account_user_id),
+                (
+                    next_first_dm_at,
+                    next_first_dm_at,
+                    now.isoformat(),
+                    account_user_id,
+                ),
             )
     _upsert_state(
         account_user_id,
@@ -784,7 +865,12 @@ async def resume_account(account_user_id: int, *, source: str = "manual") -> Non
     )
     label = _account_label(account_user_id)
     await notify_admins(
-        _notify_resumed(label, source, next_first_dm_at=next_first_dm_at)
+        _notify_resumed(
+            label,
+            source,
+            next_first_dm_at=next_first_dm_at,
+            global_first_dm_paused=not runtime.is_worker_enabled(),
+        )
     )
     try:
         await monitor_svc.refresh_monitor()
@@ -811,6 +897,19 @@ async def process_due_checks() -> int:
         status = str(row["status"] or "")
         if status == STATUS_FREE_PENDING:
             if not SPAMBOT_AUTO_RESUME:
+                continue
+            if not runtime.is_worker_enabled():
+                # The main pause is authoritative for new First DM. Keep the
+                # account in its Telegram-safe paused state and do not emit a
+                # misleading automatic-resume notification while the dispatcher
+                # is globally stopped. Re-check at a bounded cadence so starting
+                # First DM later resumes the account without a restart.
+                retry_at = _hold_account_for_global_pause(uid)
+                _upsert_state(
+                    uid,
+                    status=STATUS_FREE_PENDING,
+                    next_check_at=retry_at.isoformat(),
+                )
                 continue
             acc = accounts_svc.get_account(uid)
             cooldown = _parse_iso((acc or {}).get("cooldown_until"))

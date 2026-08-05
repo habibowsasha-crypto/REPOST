@@ -261,6 +261,8 @@ async def _attempt_lead_across_accounts(
     lead: dict[str, Any],
     accounts: list[dict[str, Any]],
     text: str | None = None,
+    *,
+    enforce_global_pause: bool = False,
 ) -> bool:
     """Try ready accounts in the existing order.
 
@@ -275,6 +277,14 @@ async def _attempt_lead_across_accounts(
     had_account_cooldown = False
 
     for acc in accounts:
+        if enforce_global_pause and not runtime.is_worker_enabled():
+            queue_svc.release_claim(target_id, as_pending=True)
+            logger.info(
+                "First DM attempt stopped because global pause became active "
+                "target={}",
+                target_id,
+            )
+            return False
         account_id = int(acc["user_id"])
         fresh = accounts_svc.get_account(account_id) or acc
         ok, _reason = pacing.account_is_send_ready(fresh)
@@ -392,6 +402,14 @@ async def _attempt_lead_across_accounts(
                     # read the same last-20 window and choose the same fresh wording.
                     async with phrases_svc.generation_lock(phrases_svc.KIND_FIRST_DM):
                         generated_text = await generate_first_dm()
+                        if enforce_global_pause and not runtime.is_worker_enabled():
+                            queue_svc.release_claim(target_id, as_pending=True)
+                            logger.info(
+                                "Generated First DM discarded because global pause "
+                                "became active target={}",
+                                target_id,
+                            )
+                            return False
                         result = await _send_first_dm(
                             client,
                             account_id,
@@ -411,6 +429,9 @@ async def _attempt_lead_across_accounts(
                     had_retryable_error = True
                     break
             else:
+                if enforce_global_pause and not runtime.is_worker_enabled():
+                    queue_svc.release_claim(target_id, as_pending=True)
+                    return False
                 result = await _send_first_dm(
                     client,
                     account_id,
@@ -421,6 +442,9 @@ async def _attempt_lead_across_accounts(
         else:
             if generated_text is None:
                 continue
+            if enforce_global_pause and not runtime.is_worker_enabled():
+                queue_svc.release_claim(target_id, as_pending=True)
+                return False
             result = await _send_first_dm(
                 client,
                 account_id,
@@ -501,6 +525,8 @@ async def _attempt_lead_across_accounts(
 
 
 async def _tick() -> bool:
+    if not runtime.is_worker_enabled():
+        return False
     if not pacing.global_ready():
         return False
     ready = _list_ready_accounts()
@@ -513,6 +539,14 @@ async def _tick() -> bool:
         return False
     target_id = int(lead["target_user_id"])
 
+    if not runtime.is_worker_enabled():
+        queue_svc.release_claim(target_id, as_pending=True)
+        logger.info(
+            "First DM claim released because global pause became active target={}",
+            target_id,
+        )
+        return False
+
     if opt_out_svc.is_opted_out(target_id):
         queue_svc.cancel_lead(target_id, "opt_out")
         return True
@@ -523,7 +557,9 @@ async def _tick() -> bool:
 
     # Entity resolution is performed inside the account round. AI is called only
     # after at least one ready account has a real Telegram entity.
-    return await _attempt_lead_across_accounts(lead, ordered)
+    return await _attempt_lead_across_accounts(
+        lead, ordered, enforce_global_pause=True
+    )
 
 
 def _target_label(lead: dict[str, Any]) -> str:

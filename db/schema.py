@@ -386,6 +386,74 @@ def init_db() -> None:
             """
         )
 
+        # v1.0.71 repairs the exact v1.0.70 production state where SpamBot had
+        # automatically resumed an account while the global First-DM worker was
+        # paused. Re-arm those accounts as FREE_PENDING and place a short rolling
+        # Telegram cooldown so overdue dialog messages cannot immediately probe
+        # the account before the new runtime guard takes over.
+        migration_name = "v1_0_71_global_pause_spambot_guard"
+        applied = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE name=?",
+            (migration_name,),
+        ).fetchone()
+        if not applied:
+            worker_row = conn.execute(
+                "SELECT value FROM runtime_meta WHERE key='dm_worker_enabled'"
+            ).fetchone()
+            worker_enabled = bool(
+                worker_row
+                and str(worker_row["value"] or "").strip().lower()
+                in {"1", "true", "yes", "on"}
+            )
+            if not worker_enabled:
+                hold_until = conn.execute(
+                    "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+60 seconds') AS value"
+                ).fetchone()["value"]
+                conn.execute(
+                    """
+                    UPDATE accounts
+                       SET is_paused=1,
+                           pause_reason='PeerFlood',
+                           cooldown_until=CASE
+                               WHEN cooldown_until IS NOT NULL
+                                AND julianday(cooldown_until) > julianday(?)
+                               THEN cooldown_until
+                               ELSE ?
+                           END,
+                           next_send_at=CASE
+                               WHEN next_send_at IS NOT NULL
+                                AND julianday(next_send_at) > julianday(?)
+                               THEN next_send_at
+                               ELSE ?
+                           END,
+                           updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     WHERE is_paused=0
+                       AND user_id IN (
+                           SELECT account_user_id
+                             FROM spambot_state
+                            WHERE last_reply LIKE 'resumed:spambot_%'
+                       )
+                    """,
+                    (hold_until, hold_until, hold_until, hold_until),
+                )
+                conn.execute(
+                    """
+                    UPDATE spambot_state
+                       SET status='free_pending_resume',
+                           next_check_at=?,
+                           updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     WHERE last_reply LIKE 'resumed:spambot_%'
+                    """,
+                    (hold_until,),
+                )
+            conn.execute(
+                """
+                INSERT INTO schema_migrations(name, applied_at)
+                VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                """,
+                (migration_name,),
+            )
+
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS sent_phrases (
