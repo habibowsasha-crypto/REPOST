@@ -1,4 +1,13 @@
-# Channel DM Bot v1.0.78
+# Channel DM Bot v1.0.79
+
+
+## Changes in v1.0.79 - active dialogs continue during First DM pause
+
+- The main First DM pause now blocks only new First DM sends.
+- After SpamBot confirms that an account is free and the approved PeerFlood cooldown has elapsed, the Telegram cooldown is cleared even when the global First DM worker remains paused.
+- Existing dialogs can answer immediately, while next_send_at still protects future First DM pacing.
+- A startup migration repairs accounts left in the old rolling global-pause hold.
+- A real PeerFlood during an active-dialog reply still re-applies the normal safety pause.
 
 ## Changes in v1.0.78 - hashless local-cache owner and stable no-entity terminal
 

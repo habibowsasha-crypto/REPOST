@@ -524,6 +524,71 @@ def init_db() -> None:
                 (migration_name,),
             )
 
+        # v1.0.79 separates the global First DM switch from active-dialog
+        # delivery. Older releases kept SpamBot-free accounts inside a rolling
+        # PeerFlood cooldown while the global worker was paused, which also
+        # blocked replies in already-open dialogs. Clear only proven FREE_PENDING
+        # rows and preserve a normal next_send_at guard for future First DMs.
+        migration_name = "v1_0_79_active_dialogs_ignore_global_first_dm_pause"
+        applied = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE name=?",
+            (migration_name,),
+        ).fetchone()
+        if not applied:
+            worker_row = conn.execute(
+                "SELECT value FROM runtime_meta WHERE key='dm_worker_enabled'"
+            ).fetchone()
+            worker_enabled = bool(
+                worker_row
+                and str(worker_row["value"] or "").strip().lower()
+                in {"1", "true", "yes", "on"}
+            )
+            if not worker_enabled:
+                next_first_dm_at = conn.execute(
+                    "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+120 seconds') AS value"
+                ).fetchone()["value"]
+                conn.execute(
+                    """
+                    UPDATE accounts
+                       SET is_paused=0,
+                           pause_reason=NULL,
+                           cooldown_until=NULL,
+                           next_send_at=CASE
+                               WHEN next_send_at IS NOT NULL
+                                AND julianday(next_send_at) > julianday(?)
+                               THEN next_send_at
+                               ELSE ?
+                           END,
+                           peerflood_burst_applied_at=NULL,
+                           updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     WHERE pause_reason='PeerFlood'
+                       AND user_id IN (
+                           SELECT account_user_id
+                             FROM spambot_state
+                            WHERE status='free_pending_resume'
+                       )
+                    """,
+                    (next_first_dm_at, next_first_dm_at),
+                )
+                conn.execute(
+                    """
+                    UPDATE spambot_state
+                       SET status='idle',
+                           last_reply='resumed:v1.0.79_dialog_unblock',
+                           next_check_at=NULL,
+                           limited_until=NULL,
+                           updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     WHERE status='free_pending_resume'
+                    """
+                )
+            conn.execute(
+                """
+                INSERT INTO schema_migrations(name, applied_at)
+                VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                """,
+                (migration_name,),
+            )
+
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS sent_phrases (
