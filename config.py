@@ -139,9 +139,20 @@ FLOODWAIT_EXTRA_SECONDS: int = int(config("FLOODWAIT_EXTRA_SECONDS", default="45
 # ---------------------------------------------------------------------------
 # Dialog retention
 # ---------------------------------------------------------------------------
+# Legacy fixed deadline from First DM. It remains available for rollback when
+# DIALOG_AUTO_DELETE_ENABLED is false.
 TELEGRAM_DIALOG_DELETE_DAYS: int = max(1, int(
     config("TELEGRAM_DIALOG_DELETE_DAYS", default="30")
 ))
+DIALOG_AUTO_DELETE_ENABLED: bool = config(
+    "DIALOG_AUTO_DELETE_ENABLED", default="false"
+).lower() in {"1", "true", "yes", "on"}
+DIALOG_AUTO_DELETE_AFTER_DAYS: int = max(1, int(
+    config("DIALOG_AUTO_DELETE_AFTER_DAYS", default="7")
+))
+DIALOG_AUTO_DELETE_FOR_BOTH: bool = config(
+    "DIALOG_AUTO_DELETE_FOR_BOTH", default="true"
+).lower() in {"1", "true", "yes", "on"}
 LOCAL_DIALOG_TEXT_RETENTION_DAYS: int = max(1, int(
     config("LOCAL_DIALOG_TEXT_RETENTION_DAYS", default="180")
 ))

@@ -688,6 +688,9 @@ def init_db() -> None:
             conn, "dialogs", "lifecycle_completed_at", "lifecycle_completed_at TEXT"
         )
         _ensure_column(
+            conn, "dialogs", "last_message_at", "last_message_at TEXT"
+        )
+        _ensure_column(
             conn,
             "dialogs",
             "telegram_delete_abandoned_at",
@@ -718,6 +721,7 @@ def init_db() -> None:
                 history_purge_at TEXT,
                 history_purged_at TEXT,
                 lifecycle_completed_at TEXT,
+                last_message_at TEXT,
                 telegram_delete_abandoned_at TEXT,
                 first_dm_text TEXT NOT NULL DEFAULT '',
                 first_dm_prepared_at TEXT,
@@ -735,6 +739,12 @@ def init_db() -> None:
             "dialog_archives",
             "lifecycle_completed_at",
             "lifecycle_completed_at TEXT",
+        )
+        _ensure_column(
+            conn,
+            "dialog_archives",
+            "last_message_at",
+            "last_message_at TEXT",
         )
         _ensure_column(
             conn,
@@ -1259,12 +1269,18 @@ def init_db() -> None:
         rows = conn.execute(
             """
             SELECT d.target_user_id, d.first_dm_at, d.first_dm_message_id,
-                   o.sent_at, o.telegram_message_id, a.first_dm_at AS audience_dm_at
+                   d.updated_at, d.last_message_at, o.sent_at, o.telegram_message_id,
+                   a.first_dm_at AS audience_dm_at,
+                   (SELECT MAX(i.received_at) FROM dialog_inbox i
+                     WHERE i.target_user_id=d.target_user_id) AS latest_incoming_at,
+                   (SELECT MAX(x.sent_at) FROM dialog_outbox x
+                     WHERE x.target_user_id=d.target_user_id
+                       AND x.sent_at IS NOT NULL) AS latest_outgoing_at
               FROM dialogs d
               LEFT JOIN first_dm_outbox o ON o.target_user_id=d.target_user_id
               LEFT JOIN audience a ON a.user_id=d.target_user_id
              WHERE d.first_dm_at IS NULL OR d.history_purge_at IS NULL
-                OR d.telegram_delete_at IS NULL
+                OR d.telegram_delete_at IS NULL OR d.last_message_at IS NULL
             """
         ).fetchall()
         if rows:
@@ -1284,11 +1300,35 @@ def init_db() -> None:
                         base = base.replace(tzinfo=_dt.timezone.utc)
                 except (TypeError, ValueError):
                     continue
+                activity_candidates = [
+                    row["last_message_at"],
+                    row["latest_incoming_at"],
+                    row["latest_outgoing_at"],
+                    row["sent_at"],
+                    base.isoformat(),
+                ]
+                if not any(activity_candidates):
+                    activity_candidates.append(row["updated_at"])
+                parsed_activity = []
+                for candidate in activity_candidates:
+                    if not candidate:
+                        continue
+                    try:
+                        value = _dt.datetime.fromisoformat(
+                            str(candidate).replace("Z", "+00:00")
+                        )
+                        if value.tzinfo is None:
+                            value = value.replace(tzinfo=_dt.timezone.utc)
+                        parsed_activity.append(value.astimezone(_dt.timezone.utc))
+                    except (TypeError, ValueError):
+                        continue
+                last_message = max(parsed_activity) if parsed_activity else base
                 conn.execute(
                     """
                     UPDATE dialogs
                        SET first_dm_at=COALESCE(first_dm_at, ?),
                            first_dm_message_id=COALESCE(first_dm_message_id, ?),
+                           last_message_at=COALESCE(last_message_at, ?),
                            telegram_delete_at=COALESCE(telegram_delete_at, ?),
                            history_purge_at=COALESCE(history_purge_at, ?)
                      WHERE target_user_id=?
@@ -1296,8 +1336,59 @@ def init_db() -> None:
                     (
                         base.isoformat(),
                         row["telegram_message_id"],
+                        last_message.isoformat(),
                         (base + _dt.timedelta(days=TELEGRAM_DIALOG_DELETE_DAYS)).isoformat(),
                         (base + _dt.timedelta(days=LOCAL_DIALOG_TEXT_RETENTION_DAYS)).isoformat(),
                         int(row["target_user_id"]),
+                    ),
+                )
+
+        # v1.0.84 opt-in mode schedules Telegram deletion from the latest real
+        # incoming or outgoing message instead of from the original First DM.
+        from config import DIALOG_AUTO_DELETE_AFTER_DAYS, DIALOG_AUTO_DELETE_ENABLED
+
+        if DIALOG_AUTO_DELETE_ENABLED:
+            import datetime as _dt
+
+            pending_rows = conn.execute(
+                """
+                SELECT target_user_id, last_message_at, first_dm_at
+                  FROM dialogs
+                 WHERE telegram_deleted_at IS NULL
+                   AND telegram_delete_abandoned_at IS NULL
+                """
+            ).fetchall()
+            for pending in pending_rows:
+                raw_activity = pending["last_message_at"] or pending["first_dm_at"]
+                if not raw_activity:
+                    continue
+                try:
+                    activity = _dt.datetime.fromisoformat(
+                        str(raw_activity).replace("Z", "+00:00")
+                    )
+                    if activity.tzinfo is None:
+                        activity = activity.replace(tzinfo=_dt.timezone.utc)
+                    activity = activity.astimezone(_dt.timezone.utc)
+                except (TypeError, ValueError):
+                    continue
+                conn.execute(
+                    """
+                    UPDATE dialogs
+                       SET last_message_at=COALESCE(last_message_at, ?),
+                           telegram_delete_at=?,
+                           telegram_delete_next_attempt_at=NULL,
+                           telegram_delete_attempts=0,
+                           telegram_delete_last_error=NULL
+                     WHERE target_user_id=?
+                       AND telegram_deleted_at IS NULL
+                       AND telegram_delete_abandoned_at IS NULL
+                    """,
+                    (
+                        activity.isoformat(),
+                        (
+                            activity
+                            + _dt.timedelta(days=max(1, DIALOG_AUTO_DELETE_AFTER_DAYS))
+                        ).isoformat(),
+                        int(pending["target_user_id"]),
                     ),
                 )
