@@ -12,6 +12,7 @@ from typing import Set, Tuple
 
 from loguru import logger
 
+import config as app_config
 from config import DIALOG_FLOW_VARIANT
 from telethon.errors import (
     FloodWaitError,
@@ -100,6 +101,82 @@ def _retry_at_for_account(account_user_id: int, fallback_seconds: int) -> str:
 
 _FOLLOWUP_PEERFLOOD_RETRY_SECONDS = 6 * 60 * 60
 _DIALOG_PEERFLOOD_RETRY_SECONDS = 60
+_DIALOG_PEERFLOOD_MAX_WINDOWS = 3
+
+
+def _dialog_peerflood_guard_enabled() -> bool:
+    return bool(getattr(app_config, "DIALOG_PEERFLOOD_GUARD_ENABLED", False))
+
+
+def _peerflood_guard_active(account_user_id: int) -> bool:
+    if not _dialog_peerflood_guard_enabled():
+        return False
+    from services import accounts as accounts_svc
+
+    account = accounts_svc.get_account(int(account_user_id)) or {}
+    reason = str(account.get("pause_reason") or "").strip().lower()
+    if reason != "peerflood":
+        return False
+    until = pacing._parse_iso(account.get("cooldown_until"))
+    return bool(until and until > _now())
+
+
+def _peerflood_guard_retry_at(account_user_id: int) -> str:
+    from services import accounts as accounts_svc
+
+    account = accounts_svc.get_account(int(account_user_id)) or {}
+    until = pacing._parse_iso(account.get("cooldown_until"))
+    if until is None or until <= _now():
+        until = _now() + dt.timedelta(seconds=_DIALOG_PEERFLOOD_RETRY_SECONDS)
+    return (until + dt.timedelta(seconds=1)).isoformat()
+
+
+def _peerflood_guard_retry_seconds(account_user_id: int) -> int:
+    retry_at = pacing._parse_iso(_peerflood_guard_retry_at(account_user_id))
+    if retry_at is None:
+        return _DIALOG_PEERFLOOD_RETRY_SECONDS
+    return max(1, math.ceil((retry_at - _now()).total_seconds()))
+
+
+async def _notify_peerflood_manual_review(
+    account_user_id: int,
+    target_user_id: int,
+    *,
+    attempts: int,
+) -> None:
+    text = (
+        "⚠️ **ДИАЛОГ НУЖЕН РУЧНОЙ ПРОВЕРКИ**\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 Аккаунт: `{int(account_user_id)}`\n"
+        f"💬 Пользователь: `{int(target_user_id)}`\n"
+        f"🔁 PeerFlood-окон использовано: **{int(attempts)}**\n"
+        "📥 Входящие и неотправленный ответ сохранены.\n"
+        "⛔ Автоматические попытки для этого диалога остановлены."
+    )
+    for admin_id in getattr(app_config, "ADMIN_ID_LIST", []):
+        try:
+            await app_config.bot.send_message(int(admin_id), text, parse_mode="md")
+        except Exception as exc:
+            logger.warning(
+                "PeerFlood manual-review notice failed admin={} account={} target={} "
+                "error_type={}",
+                admin_id,
+                account_user_id,
+                target_user_id,
+                type(exc).__name__,
+            )
+
+
+def _combined_batch_text(rows: list[dict]) -> str:
+    parts = [str(row.get("text") or "").strip() for row in rows]
+    return "\n".join(part for part in parts if part).strip()
+
+
+def _combined_batch_content_kind(rows: list[dict]) -> str:
+    kinds = [str(row.get("content_kind") or "text") for row in rows]
+    if "text" in kinds:
+        return "text"
+    return kinds[-1] if kinds else "text"
 
 
 def _global_pre_reply_blocked(
@@ -181,6 +258,26 @@ async def handle_incoming_private(
             "superseded_by_hard_stop",
             include_hard_stop=False,
         )
+        if _peerflood_guard_active(account_user_id):
+            logger.info(
+                "Hard stop saved without AI during PeerFlood account={} target={} "
+                "inbox_id={} retry_at={}",
+                account_user_id,
+                target_user_id,
+                row_id,
+                _peerflood_guard_retry_at(account_user_id),
+            )
+            return
+    elif _peerflood_guard_active(account_user_id):
+        logger.info(
+            "Incoming saved without AI during PeerFlood account={} target={} "
+            "inbox_id={} retry_at={}",
+            account_user_id,
+            target_user_id,
+            row_id,
+            _peerflood_guard_retry_at(account_user_id),
+        )
+        return
 
     lock = _dialog_locks.setdefault(key, asyncio.Lock())
     async with lock:
@@ -192,33 +289,179 @@ async def handle_incoming_private(
 
 
 async def _drain_dialog_inbox(account_user_id: int, target_user_id: int) -> None:
-    """Drain all saved messages for one dialog in deterministic order."""
+    """Drain durable incoming messages, batching them only under the optional guard."""
     while True:
-        # PeerFlood and local account cooldowns protect only cold outreach. A real
-        # incoming reply must be processed immediately by the account that owns the
-        # dialog. Telegram delivery errors are handled per outbox action below.
-        row = dialog_inbox.claim_next(account_user_id, target_user_id)
-        if row is None:
+        guarded = _dialog_peerflood_guard_enabled()
+        if guarded and _peerflood_guard_active(account_user_id):
+            logger.info(
+                "Incoming dialog buffered by PeerFlood guard account={} target={} retry_at={}",
+                account_user_id,
+                target_user_id,
+                _peerflood_guard_retry_at(account_user_id),
+            )
             return
-        row_id = int(row["id"])
-        text = str(row.get("text") or "").strip()
-        content_kind = str(row.get("content_kind") or "text")
-        is_hard_stop = bool(int(row.get("is_hard_stop") or 0))
+
+        if guarded:
+            rows = dialog_inbox.claim_pending_batch(account_user_id, target_user_id)
+        else:
+            single = dialog_inbox.claim_next(account_user_id, target_user_id)
+            rows = [single] if single is not None else []
+        if not rows:
+            return
+
+        row_ids = [int(row["id"]) for row in rows]
+        latest_row_id = max(row_ids)
+        first_row = rows[0]
+        is_hard_stop = bool(int(first_row.get("is_hard_stop") or 0))
+
         try:
-            history_already_appended = bool(int(row.get("history_appended") or 0))
-            if not history_already_appended:
-                store.append_history(target_user_id, "user", text)
-                dialog_inbox.mark_history_appended(row_id)
-                history_already_appended = True
+            if guarded:
+                if dialog_delivery.has_peerflood_manual_review(
+                    target_user_id, account_user_id
+                ):
+                    for row in rows:
+                        if not bool(int(row.get("history_appended") or 0)):
+                            store.append_history(
+                                target_user_id, "user", str(row.get("text") or "")
+                            )
+                            dialog_inbox.mark_history_appended(int(row["id"]))
+                    dialog_inbox.mark_many_manual_review(
+                        row_ids, "peerflood_manual_review_active"
+                    )
+                    logger.warning(
+                        "Incoming dialog retained for existing manual review "
+                        "account={} target={} rows={}",
+                        account_user_id,
+                        target_user_id,
+                        len(row_ids),
+                    )
+                    if opt_out_svc.is_opted_out(target_user_id):
+                        store.close_for_opt_out(target_user_id)
+                    return
+
+                deferred = dialog_delivery.latest_peerflood_deferred(
+                    target_user_id, account_user_id
+                )
+                if deferred is not None:
+                    deferred_source = int(deferred.get("source_inbox_id") or 0)
+                    if latest_row_id > deferred_source:
+                        superseded = dialog_delivery.supersede_peerflood_deferred(
+                            target_user_id,
+                            account_user_id,
+                            newer_source_inbox_id=latest_row_id,
+                        )
+                        logger.info(
+                            "Stale saved dialog reply superseded by newer incoming "
+                            "account={} target={} old_source={} new_source={} rows={}",
+                            account_user_id,
+                            target_user_id,
+                            deferred_source,
+                            latest_row_id,
+                            superseded,
+                        )
+                    elif latest_row_id == deferred_source:
+                        attempts = int(deferred.get("recovery_attempts") or 0)
+                        if attempts >= _DIALOG_PEERFLOOD_MAX_WINDOWS:
+                            dialog_delivery.mark_peerflood_manual_review(
+                                target_user_id,
+                                str(deferred["action_kind"]),
+                                attempts=attempts,
+                            )
+                            dialog_inbox.mark_many_manual_review(
+                                row_ids, "peerflood_retry_windows_exhausted"
+                            )
+                            await _notify_peerflood_manual_review(
+                                account_user_id,
+                                target_user_id,
+                                attempts=attempts,
+                            )
+                            if opt_out_svc.is_opted_out(target_user_id):
+                                store.close_for_opt_out(target_user_id)
+                            return
+
+                        retry_at = pacing._parse_iso(deferred.get("recovery_next_at"))
+                        if retry_at is not None and retry_at > _now():
+                            dialog_inbox.requeue_many(
+                                row_ids, "waiting_peerflood_retry_window"
+                            )
+                            return
+
+                        prepared = dialog_delivery.reprepare_failed(
+                            target_user_id, str(deferred["action_kind"])
+                        )
+                        if prepared is None:
+                            dialog_inbox.requeue_many(
+                                row_ids, "peerflood_reply_not_ready"
+                            )
+                            return
+                        result = await _send_prepared_action(
+                            account_user_id,
+                            target_user_id,
+                            str(prepared["action_kind"]),
+                            str(prepared.get("text") or ""),
+                        )
+                        if result == "sent":
+                            dialog_inbox.mark_many_done(row_ids)
+                            continue
+                        if result == "peerflood":
+                            latest = dialog_delivery.get(
+                                target_user_id, str(prepared["action_kind"])
+                            ) or {}
+                            attempts = int(latest.get("recovery_attempts") or 0)
+                            if attempts >= _DIALOG_PEERFLOOD_MAX_WINDOWS:
+                                dialog_delivery.mark_peerflood_manual_review(
+                                    target_user_id,
+                                    str(prepared["action_kind"]),
+                                    attempts=attempts,
+                                )
+                                dialog_inbox.mark_many_manual_review(
+                                    row_ids, "peerflood_retry_windows_exhausted"
+                                )
+                                await _notify_peerflood_manual_review(
+                                    account_user_id,
+                                    target_user_id,
+                                    attempts=attempts,
+                                )
+                                if opt_out_svc.is_opted_out(target_user_id):
+                                    store.close_for_opt_out(target_user_id)
+                                return
+                        if result in {"peerflood", "retry", "cooldown", "ambiguous"}:
+                            dialog_inbox.requeue_many(
+                                row_ids, f"saved_reply_{result}"
+                            )
+                            return
+                        dialog_inbox.mark_many_done(row_ids)
+                        continue
+
+            history_appended_for_all = True
+            for row in rows:
+                if not bool(int(row.get("history_appended") or 0)):
+                    store.append_history(
+                        target_user_id, "user", str(row.get("text") or "")
+                    )
+                    dialog_inbox.mark_history_appended(int(row["id"]))
+                history_appended_for_all = history_appended_for_all and True
+
+            text = (
+                _combined_batch_text(rows)
+                if guarded and len(rows) > 1
+                else str(first_row.get("text") or "").strip()
+            )
+            content_kind = (
+                _combined_batch_content_kind(rows)
+                if guarded and len(rows) > 1
+                else str(first_row.get("content_kind") or "text")
+            )
+
             if is_hard_stop:
                 await _process_hard_stop(
                     account_user_id,
                     target_user_id,
                     text,
-                    history_already_appended=history_already_appended,
-                    source_inbox_id=row_id,
+                    history_already_appended=history_appended_for_all,
+                    source_inbox_id=int(first_row["id"]),
                 )
-                dialog_inbox.mark_done(row_id)
+                dialog_inbox.mark_many_done(row_ids)
                 dialog_inbox.ignore_pending_for_target(
                     target_user_id,
                     "ignored_after_hard_stop",
@@ -227,17 +470,18 @@ async def _drain_dialog_inbox(account_user_id: int, target_user_id: int) -> None
                 return
 
             if opt_out_svc.is_opted_out(target_user_id):
-                dialog_inbox.mark_ignored(row_id, "target_opted_out")
+                for row_id in row_ids:
+                    dialog_inbox.mark_ignored(row_id, "target_opted_out")
                 continue
 
-            body_kwargs = {"history_already_appended": history_already_appended}
+            body_kwargs = {"history_already_appended": history_appended_for_all}
             body_signature = inspect.signature(_handle_incoming_private_body)
             accepts_kwargs = any(
                 parameter.kind is inspect.Parameter.VAR_KEYWORD
                 for parameter in body_signature.parameters.values()
             )
             if "source_inbox_id" in body_signature.parameters or accepts_kwargs:
-                body_kwargs["source_inbox_id"] = row_id
+                body_kwargs["source_inbox_id"] = latest_row_id
             if "content_kind" in body_signature.parameters or accepts_kwargs:
                 body_kwargs["content_kind"] = content_kind
             await _handle_incoming_private_body(
@@ -246,32 +490,36 @@ async def _drain_dialog_inbox(account_user_id: int, target_user_id: int) -> None
                 text,
                 **body_kwargs,
             )
-            dialog_inbox.mark_done(row_id)
+            dialog_inbox.mark_many_done(row_ids)
         except DeliveryPendingError as exc:
-            dialog_inbox.requeue(row_id, str(exc))
+            dialog_inbox.requeue_many(row_ids, str(exc))
             logger.info(
-                "Incoming dialog delivery deferred account={} target={} inbox_id={} reason={}",
+                "Incoming dialog delivery deferred account={} target={} inbox_ids={} "
+                "reason={}",
                 account_user_id,
                 target_user_id,
-                row_id,
+                row_ids,
                 exc,
             )
             return
         except asyncio.CancelledError:
             if is_hard_stop:
-                dialog_inbox.requeue(row_id, "hard_stop_worker_cancelled")
+                dialog_inbox.requeue_many(row_ids, "hard_stop_worker_cancelled")
             elif opt_out_svc.is_opted_out(target_user_id):
-                dialog_inbox.mark_ignored(row_id, "cancelled_after_opt_out")
+                for row_id in row_ids:
+                    dialog_inbox.mark_ignored(row_id, "cancelled_after_opt_out")
             else:
-                dialog_inbox.requeue(row_id, "worker_cancelled")
+                dialog_inbox.requeue_many(row_ids, "worker_cancelled")
             raise
         except Exception as exc:
-            dialog_inbox.requeue(row_id, f"{type(exc).__name__}: {exc}")
+            dialog_inbox.requeue_many(
+                row_ids, f"{type(exc).__name__}: {exc}"
+            )
             logger.exception(
-                "Incoming dialog processing failed account={} target={} inbox_id={}: {}",
+                "Incoming dialog processing failed account={} target={} inbox_ids={}: {}",
                 account_user_id,
                 target_user_id,
-                row_id,
+                row_ids,
                 exc,
             )
             return
@@ -680,7 +928,7 @@ async def _deliver_inbox_message(
     result = await _send_prepared_action(
         account_user_id, target_user_id, action_key, text
     )
-    if result in {"ambiguous", "retry", "cooldown"}:
+    if result in {"ambiguous", "retry", "cooldown", "peerflood"}:
         raise DeliveryPendingError(action_key)
     return result
 
@@ -895,13 +1143,19 @@ async def _send_prepared_action(
         except Exception as sp_exc:
             logger.exception("SpamBot from scheduled dialog: {}", sp_exc)
             pacing.set_paused(account_user_id, "PeerFlood", paused=True)
+        if _dialog_peerflood_guard_enabled():
+            delay_seconds = _peerflood_guard_retry_seconds(account_user_id)
+        elif message_kind == dialog_delivery.KIND_FOLLOWUP:
+            delay_seconds = _FOLLOWUP_PEERFLOOD_RETRY_SECONDS
+        else:
+            delay_seconds = _DIALOG_PEERFLOOD_RETRY_SECONDS
+        retry_at = dialog_delivery.mark_failed_with_backoff(
+            target_user_id,
+            action_kind,
+            "PeerFlood",
+            delay_seconds=delay_seconds,
+        )
         if message_kind == dialog_delivery.KIND_FOLLOWUP:
-            retry_at = dialog_delivery.mark_failed_with_backoff(
-                target_user_id,
-                action_kind,
-                "PeerFlood",
-                delay_seconds=_FOLLOWUP_PEERFLOOD_RETRY_SECONDS,
-            )
             logger.warning(
                 "Silence follow-up held after PeerFlood account={} target={} retry_at={}",
                 account_user_id,
@@ -909,12 +1163,16 @@ async def _send_prepared_action(
                 retry_at,
             )
             return "peerflood"
-        dialog_delivery.mark_failed_with_backoff(
-            target_user_id,
-            action_kind,
-            "PeerFlood",
-            delay_seconds=_DIALOG_PEERFLOOD_RETRY_SECONDS,
-        )
+        if _dialog_peerflood_guard_enabled():
+            logger.warning(
+                "Dialog reply saved for next PeerFlood window account={} target={} "
+                "kind={} retry_at={}",
+                account_user_id,
+                target_user_id,
+                message_kind,
+                retry_at,
+            )
+            return "peerflood"
         return "retry"
     except (UserPrivacyRestrictedError, UserIsBlockedError, ChatWriteForbiddenError):
         dialog_delivery.mark_failed(target_user_id, action_kind, "privacy_or_blocked")
@@ -1059,7 +1317,11 @@ async def _reconcile_prepared_action(row: dict) -> bool:
                 row,
                 reason="PeerFlood",
                 max_attempts=_DIALOG_RECOVERY_GENERIC_MAX_ATTEMPTS,
-                delay_seconds=_DIALOG_PEERFLOOD_RETRY_SECONDS,
+                delay_seconds=(
+                    _peerflood_guard_retry_seconds(account)
+                    if _dialog_peerflood_guard_enabled()
+                    else _DIALOG_PEERFLOOD_RETRY_SECONDS
+                ),
             )
         if account_auth.is_auth_loss_error(exc):
             await account_auth.register_auth_loss(account, exc, notify=True)
@@ -1202,6 +1464,16 @@ async def recover_ambiguous_dialog_messages() -> int:
                 target,
             )
             continue
+        if _peerflood_guard_active(account):
+            logger.info(
+                "Prepared dialog recovery held by PeerFlood guard kind={} "
+                "account={} target={} retry_at={}",
+                row.get("message_kind") or row.get("action_kind"),
+                account,
+                target,
+                _peerflood_guard_retry_at(account),
+            )
+            continue
         if await _reconcile_prepared_action(row):
             recovered += 1
     return recovered
@@ -1247,6 +1519,22 @@ async def process_due_auto_links(limit: int = 25) -> int:
                         account,
                         target,
                         current.get("stage"),
+                    )
+                    continue
+                if _peerflood_guard_active(account):
+                    retry_at = _peerflood_guard_retry_at(account)
+                    store.set_stage(
+                        target,
+                        str(current.get("stage") or store.STAGE_WAITING_REPLY),
+                        auto_link_at=retry_at,
+                    )
+                    logger.info(
+                        "Background dialog action frozen by PeerFlood guard "
+                        "account={} target={} stage={} retry_at={}",
+                        account,
+                        target,
+                        current.get("stage"),
+                        retry_at,
                     )
                     continue
                 # These scheduled steps belong to a dialog that already has durable
@@ -1358,6 +1646,80 @@ async def process_due_auto_links(limit: int = 25) -> int:
                         account,
                         stage,
                         action_kind,
+                    )
+                    continue
+
+                peerflood_failed = bool(
+                    _dialog_peerflood_guard_enabled()
+                    and existing_status == dialog_delivery.STATUS_FAILED
+                    and (
+                        str((existing or {}).get("last_error") or "") == "PeerFlood"
+                        or str((existing or {}).get("recovery_last_error") or "")
+                        == "PeerFlood"
+                    )
+                )
+                if peerflood_failed:
+                    attempts = int((existing or {}).get("recovery_attempts") or 0)
+                    if attempts >= _DIALOG_PEERFLOOD_MAX_WINDOWS:
+                        dialog_delivery.mark_peerflood_manual_review(
+                            target, action_kind, attempts=attempts
+                        )
+                        store.set_stage(target, stage, clear_auto_link=True)
+                        await _notify_peerflood_manual_review(
+                            account, target, attempts=attempts
+                        )
+                        continue
+                    retry_at = pacing._parse_iso((existing or {}).get("recovery_next_at"))
+                    if retry_at is not None and retry_at > _now():
+                        store.set_stage(target, stage, auto_link_at=retry_at.isoformat())
+                        continue
+                    prepared = dialog_delivery.reprepare_failed(target, action_kind)
+                    if prepared is None:
+                        store.set_stage(
+                            target,
+                            stage,
+                            auto_link_at=_peerflood_guard_retry_at(account),
+                        )
+                        continue
+                    result = await _send_prepared_action(
+                        account,
+                        target,
+                        action_kind,
+                        str(prepared.get("text") or ""),
+                    )
+                    if result == "sent":
+                        sent_count += 1
+                        logger.info(
+                            "Saved background dialog action sent after PeerFlood "
+                            "account={} target={} action={}",
+                            account,
+                            target,
+                            action_kind,
+                        )
+                        latest = store.get_dialog(target) or {}
+                        if int(latest.get("outgoing_count") or 0) >= store.MAX_OUTGOING:
+                            store.set_stage(
+                                target, store.STAGE_CLOSED, clear_auto_link=True
+                            )
+                            store.mark_contact_completed(target)
+                            await _cleanup_disabled_account(account)
+                        continue
+                    latest_outbox = dialog_delivery.get(target, action_kind) or {}
+                    attempts = int(latest_outbox.get("recovery_attempts") or 0)
+                    if result == "peerflood" and attempts >= _DIALOG_PEERFLOOD_MAX_WINDOWS:
+                        dialog_delivery.mark_peerflood_manual_review(
+                            target, action_kind, attempts=attempts
+                        )
+                        store.set_stage(target, stage, clear_auto_link=True)
+                        await _notify_peerflood_manual_review(
+                            account, target, attempts=attempts
+                        )
+                        continue
+                    retry_at = str(latest_outbox.get("recovery_next_at") or "")
+                    store.set_stage(
+                        target,
+                        stage,
+                        auto_link_at=(retry_at or _peerflood_guard_retry_at(account)),
                     )
                     continue
 

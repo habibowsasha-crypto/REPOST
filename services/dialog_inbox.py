@@ -13,6 +13,7 @@ STATUS_PENDING = "pending"
 STATUS_PROCESSING = "processing"
 STATUS_DONE = "done"
 STATUS_IGNORED = "ignored"
+STATUS_MANUAL_REVIEW = "manual_review"
 
 
 def _now_iso() -> str:
@@ -258,3 +259,133 @@ def count_by_status(status: str) -> int:
         (str(status),),
     ).fetchone()
     return int(row["c"] if row else 0)
+
+
+def has_pending_hard_stop(account_user_id: int, target_user_id: int) -> bool:
+    """Return True when an immediate textual stop still awaits processing."""
+    conn = get_connection()
+    row = conn.execute(
+        """
+        SELECT 1 FROM dialog_inbox
+         WHERE account_user_id=? AND target_user_id=?
+           AND status=? AND is_hard_stop=1
+         LIMIT 1
+        """,
+        (int(account_user_id), int(target_user_id), STATUS_PENDING),
+    ).fetchone()
+    return row is not None
+
+
+def claim_pending_batch(
+    account_user_id: int,
+    target_user_id: int,
+    *,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Claim one hard stop or all currently pending normal messages as one batch.
+
+    The function is used only by the optional PeerFlood dialog guard. A hard stop
+    always wins and remains a single immediate action. Normal messages are claimed
+    together so one AI response can cover all user context accumulated during the
+    cooldown window.
+    """
+    account = int(account_user_id)
+    target = int(target_user_id)
+    max_rows = max(1, int(limit))
+    conn = get_connection()
+    with db_lock(), conn:
+        hard_stop = conn.execute(
+            """
+            SELECT id, account_user_id, target_user_id, telegram_message_id,
+                   text, is_hard_stop, status, received_at, updated_at,
+                   history_appended, content_kind
+              FROM dialog_inbox
+             WHERE account_user_id=? AND target_user_id=? AND status=?
+               AND is_hard_stop=1
+             ORDER BY id ASC
+             LIMIT 1
+            """,
+            (account, target, STATUS_PENDING),
+        ).fetchone()
+        if hard_stop:
+            rows = [hard_stop]
+        else:
+            rows = conn.execute(
+                """
+                SELECT id, account_user_id, target_user_id, telegram_message_id,
+                       text, is_hard_stop, status, received_at, updated_at,
+                       history_appended, content_kind
+                  FROM dialog_inbox
+                 WHERE account_user_id=? AND target_user_id=? AND status=?
+                   AND is_hard_stop=0
+                 ORDER BY id ASC
+                 LIMIT ?
+                """,
+                (account, target, STATUS_PENDING, max_rows),
+            ).fetchall()
+        if not rows:
+            return []
+        ids = [int(row["id"]) for row in rows]
+        placeholders = ",".join("?" for _ in ids)
+        now = _now_iso()
+        cur = conn.execute(
+            f"""
+            UPDATE dialog_inbox
+               SET status=?, processing_started_at=?, updated_at=?, last_error=NULL
+             WHERE id IN ({placeholders}) AND status=?
+            """,
+            (STATUS_PROCESSING, now, now, *ids, STATUS_PENDING),
+        )
+        if int(cur.rowcount or 0) != len(ids):
+            return []
+        result = [dict(row) for row in rows]
+        for row in result:
+            row["status"] = STATUS_PROCESSING
+            row["processing_started_at"] = now
+        return result
+
+
+def mark_many_done(row_ids: list[int]) -> None:
+    _finish_many(row_ids, STATUS_DONE, None)
+
+
+def mark_many_manual_review(row_ids: list[int], reason: str) -> None:
+    """Remove rows from automatic recovery while preserving their text in SQLite."""
+    _finish_many(row_ids, STATUS_MANUAL_REVIEW, reason)
+
+
+def _finish_many(row_ids: list[int], status: str, reason: str | None) -> None:
+    ids = sorted({int(value) for value in row_ids})
+    if not ids:
+        return
+    placeholders = ",".join("?" for _ in ids)
+    now = _now_iso()
+    conn = get_connection()
+    with db_lock(), conn:
+        conn.execute(
+            f"""
+            UPDATE dialog_inbox
+               SET status=?, processed_at=?, processing_started_at=NULL,
+                   updated_at=?, last_error=?
+             WHERE id IN ({placeholders})
+            """,
+            (str(status), now, now, reason, *ids),
+        )
+
+
+def requeue_many(row_ids: list[int], error: str | None = None) -> None:
+    ids = sorted({int(value) for value in row_ids})
+    if not ids:
+        return
+    placeholders = ",".join("?" for _ in ids)
+    now = _now_iso()
+    conn = get_connection()
+    with db_lock(), conn:
+        conn.execute(
+            f"""
+            UPDATE dialog_inbox
+               SET status=?, processing_started_at=NULL, updated_at=?, last_error=?
+             WHERE id IN ({placeholders})
+            """,
+            (STATUS_PENDING, now, error, *ids),
+        )

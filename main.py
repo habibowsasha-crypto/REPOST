@@ -7,7 +7,15 @@ import sys
 
 from loguru import logger
 
-from config import ADMIN_ID_LIST, BOT_TOKEN, DB_PATH, LOG_LEVEL, app_version, bot
+from config import (
+    ADMIN_ID_LIST,
+    BOT_TOKEN,
+    DB_PATH,
+    DIALOG_PEERFLOOD_GUARD_ENABLED,
+    LOG_LEVEL,
+    app_version,
+    bot,
+)
 from db.schema import close_connection, init_db
 
 # Register Telethon handlers on the shared bot client.
@@ -124,6 +132,10 @@ def run() -> None:
 
     init_db()
     logger.info("SQLite schema ready")
+    logger.info(
+        "Dialog PeerFlood guard: {}",
+        "enabled" if DIALOG_PEERFLOOD_GUARD_ENABLED else "disabled",
+    )
     from services import accounts as accounts_svc
 
     repaired_peerflood = accounts_svc.repair_inflated_peerflood_cooldowns()

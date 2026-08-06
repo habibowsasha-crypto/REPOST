@@ -134,6 +134,15 @@ SPAMBOT_AUTO_RESUME: bool = config("SPAMBOT_AUTO_RESUME", default="true").lower(
     "yes",
     "on",
 }
+
+# Optional protection for established dialogs during a Telegram PeerFlood pause.
+# true  - buffer new incoming messages, freeze background dialog automation,
+#         reuse one saved reply per cooldown window and merge newer user context.
+# false - preserve the legacy immediate-dialog behavior from v1.0.87.
+DIALOG_PEERFLOOD_GUARD_ENABLED: bool = config(
+    "DIALOG_PEERFLOOD_GUARD_ENABLED", default="true"
+).lower() in {"1", "true", "yes", "on"}
+
 FLOODWAIT_EXTRA_SECONDS: int = int(config("FLOODWAIT_EXTRA_SECONDS", default="45"))
 
 # ---------------------------------------------------------------------------
