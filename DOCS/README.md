@@ -1,5 +1,15 @@
-# Channel DM Bot v1.0.84
+# Channel DM Bot v1.0.85
 
+
+
+## v1.0.85 - manual First DM state preserved during SpamBot resume
+
+- SpamBot auto-resume clears only the temporary Telegram transport pause.
+- The per-account manual First DM switch remains authoritative and is never enabled by SpamBot.
+- When First DM is manually disabled, automatic resume notifications are suppressed.
+- A manual transport resume reports that First DM remains disabled and real dialogs continue.
+- The stored next First DM time is not rewritten by automatic resume while the account is manually disabled.
+- Active dialogs, pending inbox, crash-safe outbox, pacing and database contents are unchanged.
 
 
 ## v1.0.84 - inactivity-based Telegram dialog auto-delete

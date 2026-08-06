@@ -155,6 +155,7 @@ def _notify_resumed(
     *,
     next_first_dm_at: str | None = None,
     global_first_dm_paused: bool = False,
+    account_first_dm_enabled: bool = True,
 ) -> str:
     src = {
         "manual": "вручную",
@@ -167,6 +168,21 @@ def _notify_resumed(
         if next_first_dm_at
         else ""
     )
+    if not account_first_dm_enabled:
+        global_line = (
+            "\n⏸ Общая рассылка First DM также остаётся на паузе."
+            if global_first_dm_paused
+            else ""
+        )
+        return (
+            "✅ **TELEGRAM-ПАУЗА АККАУНТА СНЯТА**\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            f"👤 Аккаунт: **{label}**\n"
+            f"🔄 Снятие: **{src}**\n"
+            "⏸ First DM остаются отключены вручную.\n"
+            "💬 Реальные диалоги продолжаются."
+            f"{global_line}"
+        )
     if global_first_dm_paused:
         return (
             "✅ **ТРАНСПОРТНАЯ ПАУЗА АККАУНТА СНЯТА**\n"
@@ -811,6 +827,7 @@ async def resume_account(account_user_id: int, *, source: str = "manual") -> boo
         acc = conn.execute(
             """
             SELECT is_paused, pause_reason, cooldown_until, next_send_at,
+                   participates,
                    COALESCE(auth_status, 'unknown') AS auth_status,
                    dm_interval_min_sec, dm_interval_max_sec
               FROM accounts WHERE user_id=?
@@ -858,15 +875,20 @@ async def resume_account(account_user_id: int, *, source: str = "manual") -> boo
             )
             return False
 
+        account_first_dm_enabled = bool(acc["participates"])
         clear_next = source == "manual"
         next_first_dm_at: str | None = None
-        if not clear_next:
+        next_send_value = acc["next_send_at"]
+        if not clear_next and account_first_dm_enabled:
             delay_seconds = pacing.random_account_interval_seconds(dict(acc))
             protective = now + dt.timedelta(seconds=delay_seconds)
             existing_next = _parse_iso(acc["next_send_at"])
             if existing_next and existing_next > protective:
                 protective = existing_next
             next_first_dm_at = protective.isoformat()
+            next_send_value = next_first_dm_at
+        elif clear_next:
+            next_send_value = None
 
         conn.execute(
             """
@@ -879,7 +901,7 @@ async def resume_account(account_user_id: int, *, source: str = "manual") -> boo
                    updated_at=?
              WHERE user_id=?
             """,
-            (None if clear_next else next_first_dm_at, now.isoformat(), account_user_id),
+            (next_send_value, now.isoformat(), account_user_id),
         )
         conn.execute(
             """
@@ -894,24 +916,42 @@ async def resume_account(account_user_id: int, *, source: str = "manual") -> boo
                 limited_until=NULL,
                 updated_at=excluded.updated_at
             """,
-            (account_user_id, STATUS_IDLE, f"resumed:{source}", now.isoformat()),
+            (
+                account_user_id,
+                STATUS_IDLE,
+                (
+                    f"resumed:{source}"
+                    if account_first_dm_enabled
+                    else f"transport_resumed_first_dm_manual_off:{source}"
+                ),
+                now.isoformat(),
+            ),
         )
 
     logger.info(
-        "Account {} resumed ({}) next_first_dm_at={}",
+        "Account {} transport resumed ({}) first_dm_enabled={} next_first_dm_at={}",
         account_user_id,
         source,
-        next_first_dm_at or "immediate_manual_override",
+        account_first_dm_enabled,
+        next_first_dm_at or ("manual_override" if clear_next else "unchanged"),
     )
     label = _account_label(account_user_id)
-    await notify_admins(
-        _notify_resumed(
-            label,
-            source,
-            next_first_dm_at=next_first_dm_at,
-            global_first_dm_paused=not runtime.is_worker_enabled(),
+    notify_resume = not (source == "spambot_auto" and not account_first_dm_enabled)
+    if notify_resume:
+        await notify_admins(
+            _notify_resumed(
+                label,
+                source,
+                next_first_dm_at=next_first_dm_at,
+                global_first_dm_paused=not runtime.is_worker_enabled(),
+                account_first_dm_enabled=account_first_dm_enabled,
+            )
         )
-    )
+    else:
+        logger.info(
+            "SpamBot auto-resume admin notification suppressed because First DM is manually disabled account={}",
+            account_user_id,
+        )
     try:
         await monitor_svc.refresh_monitor()
     except Exception as exc:
