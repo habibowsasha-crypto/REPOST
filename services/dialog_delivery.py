@@ -654,6 +654,81 @@ def clear_for_target(target_user_id: int, *, preserve_opt_out_allowed: bool = Fa
             )
 
 
+def resume_legacy_peerflood_manual_reviews(
+    *, delay_seconds: int = 5 * 60
+) -> dict[str, int]:
+    """Resume v1.0.88 PeerFlood rows stopped after the former three-window cap."""
+    delay = max(1, int(delay_seconds))
+    now_dt = dt.datetime.now(dt.timezone.utc)
+    now = now_dt.isoformat()
+    retry_at = (now_dt + dt.timedelta(seconds=delay)).isoformat()
+    conn = get_connection()
+    with db_lock(), conn:
+        rows = conn.execute(
+            """
+            SELECT target_user_id, account_user_id, source_inbox_id
+              FROM dialog_outbox
+             WHERE status=? AND last_error LIKE 'manual_review:PeerFlood%'
+            """,
+            (STATUS_FAILED,),
+        ).fetchall()
+        if not rows:
+            return {"outbox": 0, "inbox": 0, "background": 0}
+
+        outbox_cur = conn.execute(
+            """
+            UPDATE dialog_outbox
+               SET last_error='PeerFlood', recovery_last_error='PeerFlood',
+                   recovery_next_at=?, updated_at=?
+             WHERE status=? AND last_error LIKE 'manual_review:PeerFlood%'
+            """,
+            (retry_at, now, STATUS_FAILED),
+        )
+
+        pairs = {
+            (int(row["account_user_id"]), int(row["target_user_id"]))
+            for row in rows
+            if row["source_inbox_id"] is not None
+        }
+        inbox_count = 0
+        for account_user_id, target_user_id in pairs:
+            cur = conn.execute(
+                """
+                UPDATE dialog_inbox
+                   SET status='pending', processed_at=NULL,
+                       processing_started_at=NULL, updated_at=?,
+                       last_error='resumed_v1_0_89_unbounded_peerflood_retry'
+                 WHERE account_user_id=? AND target_user_id=?
+                   AND status='manual_review'
+                """,
+                (now, account_user_id, target_user_id),
+            )
+            inbox_count += int(cur.rowcount or 0)
+
+        background_targets = {
+            int(row["target_user_id"])
+            for row in rows
+            if row["source_inbox_id"] is None
+        }
+        background_count = 0
+        for target_user_id in background_targets:
+            cur = conn.execute(
+                """
+                UPDATE dialogs
+                   SET auto_link_at=?, updated_at=?
+                 WHERE target_user_id=? AND stage!='closed'
+                """,
+                (retry_at, now, target_user_id),
+            )
+            background_count += int(cur.rowcount or 0)
+
+    return {
+        "outbox": int(outbox_cur.rowcount or 0),
+        "inbox": inbox_count,
+        "background": background_count,
+    }
+
+
 def list_peerflood_deferred(
     target_user_id: int,
     account_user_id: int,
@@ -670,11 +745,7 @@ def list_peerflood_deferred(
          WHERE target_user_id=? AND account_user_id=?
            AND source_inbox_id IS NOT NULL
            AND status=?
-           AND (
-                last_error='PeerFlood'
-                OR recovery_last_error='PeerFlood'
-                OR last_error LIKE 'manual_review:PeerFlood%'
-           )
+           AND (last_error='PeerFlood' OR recovery_last_error='PeerFlood')
          ORDER BY source_inbox_id ASC, updated_at ASC
         """,
         (int(target_user_id), int(account_user_id), STATUS_FAILED),
@@ -711,11 +782,7 @@ def supersede_peerflood_deferred(
                AND source_inbox_id IS NOT NULL
                AND source_inbox_id < ?
                AND status=?
-               AND (
-                    last_error='PeerFlood'
-                    OR recovery_last_error='PeerFlood'
-                    OR last_error LIKE 'manual_review:PeerFlood%'
-               )
+               AND (last_error='PeerFlood' OR recovery_last_error='PeerFlood')
             """,
             (
                 STATUS_FAILED,
@@ -763,50 +830,3 @@ def reprepare_failed(target_user_id: int, action_kind: str) -> dict[str, Any] | 
         if int(cur.rowcount or 0) != 1:
             return None
     return get(target, action_key)
-
-
-def mark_peerflood_manual_review(
-    target_user_id: int,
-    action_kind: str,
-    *,
-    attempts: int,
-) -> None:
-    """Preserve an unsent answer and stop automatic retries after bounded windows."""
-    reason = f"manual_review:PeerFlood:{max(1, int(attempts))}"
-    now = _now_iso()
-    conn = get_connection()
-    with db_lock(), conn:
-        conn.execute(
-            """
-            UPDATE dialog_outbox
-               SET status=?, last_error=?, recovery_next_at=NULL,
-                   recovery_last_error=?, updated_at=?
-             WHERE target_user_id=? AND action_kind=?
-            """,
-            (
-                STATUS_FAILED,
-                reason,
-                reason,
-                now,
-                int(target_user_id),
-                str(action_kind),
-            ),
-        )
-
-
-def has_peerflood_manual_review(
-    target_user_id: int,
-    account_user_id: int,
-) -> bool:
-    conn = get_connection()
-    row = conn.execute(
-        """
-        SELECT 1 FROM dialog_outbox
-         WHERE target_user_id=? AND account_user_id=?
-           AND source_inbox_id IS NOT NULL
-           AND status=? AND last_error LIKE 'manual_review:PeerFlood%'
-         LIMIT 1
-        """,
-        (int(target_user_id), int(account_user_id), STATUS_FAILED),
-    ).fetchone()
-    return row is not None

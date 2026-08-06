@@ -133,10 +133,20 @@ def run() -> None:
     init_db()
     logger.info("SQLite schema ready")
     logger.info(
-        "Dialog PeerFlood guard: {}",
+        "Dialog PeerFlood guard: {} (retry every 5 minutes, unlimited)",
         "enabled" if DIALOG_PEERFLOOD_GUARD_ENABLED else "disabled",
     )
     from services import accounts as accounts_svc
+    from services import dialog_delivery as dialog_delivery_svc
+
+    resumed_legacy = dialog_delivery_svc.resume_legacy_peerflood_manual_reviews()
+    if resumed_legacy.get("outbox"):
+        logger.warning(
+            "Resumed legacy PeerFlood manual-review rows outbox={} inbox={} background={}",
+            resumed_legacy.get("outbox"),
+            resumed_legacy.get("inbox"),
+            resumed_legacy.get("background"),
+        )
 
     repaired_peerflood = accounts_svc.repair_inflated_peerflood_cooldowns()
     for item in repaired_peerflood:
