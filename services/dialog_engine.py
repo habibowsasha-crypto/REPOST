@@ -84,7 +84,7 @@ def _link_retry_at() -> str:
 
 
 def _account_cooldown_seconds(account_user_id: int) -> float:
-    """Existing dialogs continue normally, except during Telegram cooldowns."""
+    """Return the cold-outreach cooldown used only by First DM work."""
     return pacing.account_cooldown_seconds(int(account_user_id))
 
 
@@ -95,6 +95,7 @@ def _retry_at_for_account(account_user_id: int, fallback_seconds: int) -> str:
 
 
 _FOLLOWUP_PEERFLOOD_RETRY_SECONDS = 6 * 60 * 60
+_DIALOG_PEERFLOOD_RETRY_SECONDS = 60
 
 
 def _global_pre_reply_blocked(
@@ -189,15 +190,9 @@ async def handle_incoming_private(
 async def _drain_dialog_inbox(account_user_id: int, target_user_id: int) -> None:
     """Drain all saved messages for one dialog in deterministic order."""
     while True:
-        cooldown = _account_cooldown_seconds(account_user_id)
-        if cooldown > 0:
-            logger.info(
-                "Incoming dialog deferred by Telegram cooldown account={} target={} wait_sec={}",
-                account_user_id,
-                target_user_id,
-                math.ceil(cooldown),
-            )
-            return
+        # PeerFlood and local account cooldowns protect only cold outreach. A real
+        # incoming reply must be processed immediately by the account that owns the
+        # dialog. Telegram delivery errors are handled per outbox action below.
         row = dialog_inbox.claim_next(account_user_id, target_user_id)
         if row is None:
             return
@@ -602,6 +597,10 @@ async def _deliver_inbox_message(
         existing = dialog_delivery.get(target_user_id, action_key)
         if existing and str(existing.get("status")) == dialog_delivery.STATUS_SENT:
             return "sent"
+    if existing and str(existing.get("status")) == dialog_delivery.STATUS_FAILED:
+        retry_at = pacing._parse_iso(existing.get("recovery_next_at"))
+        if retry_at is not None and retry_at > _now():
+            raise DeliveryPendingError(action_key)
 
     prepared = dialog_delivery.prepare(
         target_user_id,
@@ -619,6 +618,10 @@ async def _deliver_inbox_message(
             return "sent"
         if existing and str(existing.get("status")) == dialog_delivery.STATUS_PREPARED:
             raise DeliveryPendingError(action_key)
+        if existing and str(existing.get("status")) == dialog_delivery.STATUS_FAILED:
+            retry_at = pacing._parse_iso(existing.get("recovery_next_at"))
+            if retry_at is not None and retry_at > _now():
+                raise DeliveryPendingError(action_key)
         return "failed"
 
     result = await _send_prepared_action(
@@ -765,14 +768,9 @@ async def _send_prepared_action(
         dialog_delivery.mark_failed(target_user_id, action_kind, "target_opted_out")
         store.close_for_opt_out(target_user_id)
         return "failed"
-    cooldown = _account_cooldown_seconds(account_user_id)
-    if cooldown > 0:
-        dialog_delivery.mark_failed(
-            target_user_id,
-            action_kind,
-            f"account_cooldown:{math.ceil(cooldown)}",
-        )
-        return "cooldown"
+    # Do not apply the cold-outreach account cooldown to an established dialog.
+    # The same account must answer a real incoming message without cross-account
+    # transfer. Telegram errors are persisted as per-action retry state.
     client = monitor_svc.get_client(account_user_id)
     if client is None or not client.is_connected():
         dialog_delivery.mark_failed(target_user_id, action_kind, "client_unavailable")
@@ -824,8 +822,15 @@ async def _send_prepared_action(
         return "sent"
     except FloodWaitError as exc:
         seconds = int(getattr(exc, "seconds", 60) or 60)
+        # Keep the account cooldown for First DM, but retry only this dialog action
+        # after Telegram's explicit wait. Other real dialogs are not globally held.
         pacing.apply_floodwait(account_user_id, seconds)
-        dialog_delivery.mark_failed(target_user_id, action_kind, f"FloodWait:{seconds}")
+        dialog_delivery.mark_failed_with_backoff(
+            target_user_id,
+            action_kind,
+            f"FloodWait:{seconds}",
+            delay_seconds=seconds,
+        )
         return "retry"
     except PeerFloodError:
         try:
@@ -849,7 +854,12 @@ async def _send_prepared_action(
                 retry_at,
             )
             return "peerflood"
-        dialog_delivery.mark_failed(target_user_id, action_kind, "PeerFlood")
+        dialog_delivery.mark_failed_with_backoff(
+            target_user_id,
+            action_kind,
+            "PeerFlood",
+            delay_seconds=_DIALOG_PEERFLOOD_RETRY_SECONDS,
+        )
         return "retry"
     except (UserPrivacyRestrictedError, UserIsBlockedError, ChatWriteForbiddenError):
         dialog_delivery.mark_failed(target_user_id, action_kind, "privacy_or_blocked")
@@ -992,7 +1002,7 @@ async def _reconcile_prepared_action(row: dict) -> bool:
                 row,
                 reason="PeerFlood",
                 max_attempts=_DIALOG_RECOVERY_GENERIC_MAX_ATTEMPTS,
-                delay_seconds=_DIALOG_RECOVERY_GENERIC_DELAY_SECONDS,
+                delay_seconds=_DIALOG_PEERFLOOD_RETRY_SECONDS,
             )
         if account_auth.is_auth_loss_error(exc):
             await account_auth.register_auth_loss(account, exc, notify=True)
@@ -1167,20 +1177,8 @@ async def process_due_auto_links(limit: int = 25) -> int:
                         current.get("stage"),
                     )
                     continue
-                cooldown = _account_cooldown_seconds(account)
-                if cooldown > 0:
-                    store.set_stage(
-                        target,
-                        str(current.get("stage") or ""),
-                        auto_link_at=_retry_at_for_account(account, 60),
-                    )
-                    logger.info(
-                        "Scheduled dialog deferred by Telegram cooldown account={} target={} wait_sec={}",
-                        account,
-                        target,
-                        math.ceil(cooldown),
-                    )
-                    continue
+                # These scheduled steps belong to a dialog that already has durable
+                # incoming proof. First DM cooldowns must not stop the conversation.
                 if dialog_inbox.has_pending(account, target):
                     continue
                 outgoing = int(current.get("outgoing_count") or 0)
@@ -1358,7 +1356,9 @@ async def process_due_auto_links(limit: int = 25) -> int:
                         store.set_stage(
                             target,
                             retry_stage,
-                            auto_link_at=_retry_at_for_account(account, retry_delay),
+                            auto_link_at=(
+                                _now() + dt.timedelta(seconds=retry_delay)
+                            ).isoformat(),
                         )
             except ai_dialog.ChannelLinkNotConfiguredError as exc:
                 logger.error("Scheduled promo blocked by CHANNEL_LINK: {}", exc)

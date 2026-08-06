@@ -1,5 +1,16 @@
-# Channel DM Bot v1.0.80
+# Channel DM Bot v1.0.81
 
+
+
+## Changes in v1.0.81 - First DM cooldown separated from real dialogs
+
+- PeerFlood and local account cooldowns stop cold First DM work only.
+- A real incoming reply is processed immediately by the same account that owns the dialog.
+- Promo, Q&A, smoothing apology and link-opening help no longer wait for the First DM cooldown.
+- Silence follow-up remains protected by the First DM cooldown because it is an autonomous pre-reply touch.
+- A Telegram FloodWait or PeerFlood during a real dialog creates retry state only for that exact outbox action.
+- Pending inbox, crash-safe outbox and no-cross-account ownership remain preserved.
+- The database is upgraded in place without clearing or replacing /data/bot.db.
 
 ## Changes in v1.0.80 - global pause and PeerFlood loop fix
 
@@ -543,7 +554,7 @@ The Telegram user-session must still exist when cleanup becomes due. The account
 
 ## Quick live test
 
-1. Deploy v1.0.80 over the existing Railway service and mounted volume.
+1. Deploy v1.0.81 over the existing Railway service and mounted volume.
 2. Confirm the new dashboard and all-time First-DM counter.
 3. Send a test First DM and confirm only one routine admin notification.
 4. Continue the dialog and confirm no reply/link/follow-up push notifications appear.
