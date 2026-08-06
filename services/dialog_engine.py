@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import inspect
+import html
 import math
 import random
 import weakref
@@ -143,6 +144,96 @@ def _combined_batch_content_kind(rows: list[dict]) -> str:
     if "text" in kinds:
         return "text"
     return kinds[-1] if kinds else "text"
+
+
+def _legacy_route_name(row: dict, prefix: str) -> str:
+    first = str(row.get(f"{prefix}_first_name") or "").strip()
+    last = str(row.get(f"{prefix}_last_name") or "").strip()
+    return " ".join(part for part in (first, last) if part).strip()
+
+
+def _legacy_route_label(
+    row: dict, prefix: str, user_id: int, *, include_name: bool = True
+) -> str:
+    username = str(row.get(f"{prefix}_username") or "").strip().lstrip("@")
+    name = _legacy_route_name(row, prefix)
+    if username:
+        label = f"@{username}"
+        if include_name and name:
+            label += f" - {name}"
+    else:
+        label = name or "без username"
+    return f"{html.escape(label)} ({int(user_id)})"
+
+
+def _legacy_message_kind_label(row: dict) -> str:
+    kind = str(row.get("message_kind") or "dialog_reply")
+    labels = {
+        dialog_delivery.KIND_PROMO: "реклама после ответа пользователя",
+        dialog_delivery.KIND_SMOOTH_APOLOGY: "автоматическое извинение",
+        dialog_delivery.KIND_LINK_HELP: "помощь по ссылке",
+        dialog_delivery.KIND_FOLLOWUP: "follow-up",
+        dialog_delivery.KIND_QNA: "AI-ответ в существующем диалоге",
+        dialog_delivery.KIND_STOP_CLOSE: "финальный ответ после отказа",
+    }
+    if row.get("source_inbox_id") is not None:
+        return labels.get(kind, "ответ в существующем диалоге")
+    return labels.get(kind, "фоновое сообщение существующего диалога")
+
+
+def _legacy_peerflood_resume_notice(row: dict) -> str:
+    account_id = int(row["account_user_id"])
+    target_id = int(row["target_user_id"])
+    account = _legacy_route_label(
+        row, "account", account_id, include_name=False
+    )
+    target = _legacy_route_label(row, "target", target_id)
+    attempts = max(0, int(row.get("attempts") or 0))
+    kind = html.escape(_legacy_message_kind_label(row))
+    return (
+        "♻️ <b>ДИАЛОГ АВТОМАТИЧЕСКИ ВОССТАНОВЛЕН</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 Аккаунт-отправитель: <b>{account}</b>\n"
+        f"🎯 Получатель: <b>{target}</b>\n"
+        f'🔗 Профиль получателя: <a href="tg://user?id={target_id}">открыть</a>\n'
+        f"📨 Тип сообщения: <b>{kind}</b>\n"
+        f"🔁 Старых PeerFlood-окон: <b>{attempts}</b>\n"
+        "⏳ Следующая попытка: <b>через 5 минут</b>\n"
+        "✅ Автоматические попытки продолжаются без ограничения."
+    )
+
+
+async def resume_legacy_peerflood_manual_reviews_with_notice() -> dict[str, int]:
+    """Resume old capped rows and show the exact sender and recipient to admins."""
+    routes = dialog_delivery.list_legacy_peerflood_manual_reviews()
+    resumed = dialog_delivery.resume_legacy_peerflood_manual_reviews()
+    changed = any(
+        int(resumed.get(key) or 0)
+        for key in ("outbox", "inbox", "background")
+    )
+    if not changed:
+        return resumed
+
+    for route in routes:
+        text = _legacy_peerflood_resume_notice(route)
+        for admin_id in getattr(app_config, "ADMIN_ID_LIST", []):
+            try:
+                await app_config.bot.send_message(
+                    int(admin_id),
+                    text,
+                    parse_mode="html",
+                    link_preview=False,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Legacy PeerFlood resume notice failed admin={} account={} "
+                    "target={} error_type={}",
+                    admin_id,
+                    route.get("account_user_id"),
+                    route.get("target_user_id"),
+                    type(exc).__name__,
+                )
+    return resumed
 
 
 def _global_pre_reply_blocked(

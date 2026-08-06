@@ -77,6 +77,22 @@ async def _background_due_loop(monitor_svc) -> None:
                 type(exc).__name__,
             )
         try:
+            resumed_legacy = (
+                await dialog_engine.resume_legacy_peerflood_manual_reviews_with_notice()
+            )
+            if resumed_legacy.get("outbox") or resumed_legacy.get("inbox"):
+                logger.warning(
+                    "Resumed late legacy PeerFlood rows outbox={} inbox={} background={}",
+                    resumed_legacy.get("outbox"),
+                    resumed_legacy.get("inbox"),
+                    resumed_legacy.get("background"),
+                )
+        except Exception as exc:
+            logger.opt(exception=exc).error(
+                "legacy PeerFlood resume loop failed error_type={}",
+                type(exc).__name__,
+            )
+        try:
             await dialog_engine.recover_ambiguous_dialog_messages()
         except Exception as exc:
             logger.opt(exception=exc).error(
@@ -137,16 +153,6 @@ def run() -> None:
         "enabled" if DIALOG_PEERFLOOD_GUARD_ENABLED else "disabled",
     )
     from services import accounts as accounts_svc
-    from services import dialog_delivery as dialog_delivery_svc
-
-    resumed_legacy = dialog_delivery_svc.resume_legacy_peerflood_manual_reviews()
-    if resumed_legacy.get("outbox"):
-        logger.warning(
-            "Resumed legacy PeerFlood manual-review rows outbox={} inbox={} background={}",
-            resumed_legacy.get("outbox"),
-            resumed_legacy.get("inbox"),
-            resumed_legacy.get("background"),
-        )
 
     repaired_peerflood = accounts_svc.repair_inflated_peerflood_cooldowns()
     for item in repaired_peerflood:
@@ -183,6 +189,17 @@ def run() -> None:
 
         bot.loop.run_until_complete(monitor_svc.start_monitor())
         from services import dialog_engine as dialog_engine_svc
+
+        resumed_legacy = bot.loop.run_until_complete(
+            dialog_engine_svc.resume_legacy_peerflood_manual_reviews_with_notice()
+        )
+        if resumed_legacy.get("outbox") or resumed_legacy.get("inbox"):
+            logger.warning(
+                "Resumed legacy PeerFlood rows outbox={} inbox={} background={}",
+                resumed_legacy.get("outbox"),
+                resumed_legacy.get("inbox"),
+                resumed_legacy.get("background"),
+            )
 
         recovered_outgoing = bot.loop.run_until_complete(
             dialog_engine_svc.recover_ambiguous_dialog_messages()

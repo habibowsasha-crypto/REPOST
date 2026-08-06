@@ -654,6 +654,61 @@ def clear_for_target(target_user_id: int, *, preserve_opt_out_allowed: bool = Fa
             )
 
 
+def list_legacy_peerflood_manual_reviews(*, limit: int = 200) -> list[dict[str, Any]]:
+    """Return distinct v1.0.88 PeerFlood routes still stopped by the old cap."""
+    conn = get_connection()
+    rows = conn.execute(
+        """
+        WITH legacy_routes AS (
+            SELECT o.account_user_id, o.target_user_id,
+                   MAX(COALESCE(o.recovery_attempts, 0)) AS attempts,
+                   MAX(COALESCE(o.message_kind, 'dialog_reply')) AS message_kind,
+                   MAX(o.source_inbox_id) AS source_inbox_id
+              FROM dialog_outbox o
+             WHERE o.status IN ('failed', 'manual_review')
+               AND (
+                    o.last_error LIKE 'manual_review:PeerFlood%'
+                    OR o.recovery_last_error LIKE 'manual_review:PeerFlood%'
+               )
+             GROUP BY o.account_user_id, o.target_user_id
+            UNION ALL
+            SELECT i.account_user_id, i.target_user_id,
+                   0 AS attempts, 'dialog_reply' AS message_kind,
+                   MAX(i.id) AS source_inbox_id
+              FROM dialog_inbox i
+             WHERE i.status='manual_review'
+               AND i.last_error IN (
+                    'peerflood_retry_windows_exhausted',
+                    'peerflood_manual_review_active'
+               )
+             GROUP BY i.account_user_id, i.target_user_id
+        ), distinct_routes AS (
+            SELECT account_user_id, target_user_id,
+                   MAX(attempts) AS attempts,
+                   MAX(message_kind) AS message_kind,
+                   MAX(source_inbox_id) AS source_inbox_id
+              FROM legacy_routes
+             GROUP BY account_user_id, target_user_id
+        )
+        SELECT r.account_user_id, r.target_user_id, r.attempts,
+               r.message_kind, r.source_inbox_id,
+               a.username AS account_username,
+               a.first_name AS account_first_name,
+               a.last_name AS account_last_name,
+               u.username AS target_username,
+               u.first_name AS target_first_name,
+               u.last_name AS target_last_name
+          FROM distinct_routes r
+          LEFT JOIN accounts a ON a.user_id=r.account_user_id
+          LEFT JOIN audience u ON u.user_id=r.target_user_id
+         ORDER BY r.account_user_id, r.target_user_id
+         LIMIT ?
+        """,
+        (max(1, int(limit)),),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def resume_legacy_peerflood_manual_reviews(
     *, delay_seconds: int = 5 * 60
 ) -> dict[str, int]:
@@ -668,42 +723,48 @@ def resume_legacy_peerflood_manual_reviews(
             """
             SELECT target_user_id, account_user_id, source_inbox_id
               FROM dialog_outbox
-             WHERE status=? AND last_error LIKE 'manual_review:PeerFlood%'
+             WHERE status IN (?, 'manual_review')
+               AND (
+                    last_error LIKE 'manual_review:PeerFlood%'
+                    OR recovery_last_error LIKE 'manual_review:PeerFlood%'
+               )
             """,
             (STATUS_FAILED,),
         ).fetchall()
-        if not rows:
-            return {"outbox": 0, "inbox": 0, "background": 0}
 
         outbox_cur = conn.execute(
             """
             UPDATE dialog_outbox
-               SET last_error='PeerFlood', recovery_last_error='PeerFlood',
+               SET status=?, last_error='PeerFlood',
+                   recovery_last_error='PeerFlood',
                    recovery_next_at=?, updated_at=?
-             WHERE status=? AND last_error LIKE 'manual_review:PeerFlood%'
+             WHERE status IN (?, 'manual_review')
+               AND (
+                    last_error LIKE 'manual_review:PeerFlood%'
+                    OR recovery_last_error LIKE 'manual_review:PeerFlood%'
+               )
             """,
-            (retry_at, now, STATUS_FAILED),
+            (STATUS_FAILED, retry_at, now, STATUS_FAILED),
         )
 
-        pairs = {
-            (int(row["account_user_id"]), int(row["target_user_id"]))
-            for row in rows
-            if row["source_inbox_id"] is not None
-        }
-        inbox_count = 0
-        for account_user_id, target_user_id in pairs:
-            cur = conn.execute(
-                """
-                UPDATE dialog_inbox
-                   SET status='pending', processed_at=NULL,
-                       processing_started_at=NULL, updated_at=?,
-                       last_error='resumed_v1_0_89_unbounded_peerflood_retry'
-                 WHERE account_user_id=? AND target_user_id=?
-                   AND status='manual_review'
-                """,
-                (now, account_user_id, target_user_id),
-            )
-            inbox_count += int(cur.rowcount or 0)
+        inbox_cur = conn.execute(
+            """
+            UPDATE dialog_inbox
+               SET status='pending', processed_at=NULL,
+                   processing_started_at=NULL, updated_at=?,
+                   last_error='resumed_v1_0_90_unbounded_peerflood_retry'
+             WHERE status='manual_review'
+               AND last_error IN (
+                    'peerflood_retry_windows_exhausted',
+                    'peerflood_manual_review_active'
+               )
+            """,
+            (now,),
+        )
+        inbox_count = int(inbox_cur.rowcount or 0)
+
+        if not rows and inbox_count == 0:
+            return {"outbox": 0, "inbox": 0, "background": 0}
 
         background_targets = {
             int(row["target_user_id"])
