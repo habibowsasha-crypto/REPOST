@@ -1,4 +1,4 @@
-"""Live monitoring of participating accounts' chats + connected clients for send."""
+"""Live group monitoring plus connected Telegram clients for account work."""
 
 from __future__ import annotations
 
@@ -88,7 +88,7 @@ def get_client(account_user_id: int) -> Optional[TelegramClient]:
 
 
 async def start_monitor() -> None:
-    """Connect all participates=on accounts and attach message handlers."""
+    """Connect every account needed for groups, First DM or active dialogs."""
     global _started
     async with _lock:
         await _sync_clients_unlocked()
@@ -123,7 +123,7 @@ async def stop_monitor() -> None:
 
 
 async def refresh_monitor() -> None:
-    """Re-read DB and reconnect clients (call after participates / chat changes)."""
+    """Re-read DB and reconnect clients after First DM or chat changes."""
     global _started
     async with _lock:
         await _sync_clients_unlocked()
@@ -270,11 +270,12 @@ async def _sync_recent_entity_evidence(
 
 async def _sync_clients_unlocked() -> None:
     """
-    Connect every participates=on account that has a session.
+    Connect every authorized account needed for at least one function.
 
-    Watchable chats are NOT required to stay connected: without a client
-    the dispatcher cannot send first DMs. Group monitoring still filters
-    by is_chat_watchable at event time.
+    A client is required when the account has First DM enabled, owns an open
+    dialog, or has at least one watchable group. Therefore selecting groups
+    automatically keeps group monitoring online even while First DM is
+    manually disabled. Group events still pass through is_chat_watchable.
     """
     from services import dialog_store as dialog_store_svc
 
@@ -283,9 +284,10 @@ async def _sync_clients_unlocked() -> None:
         uid = int(acc["user_id"])
         if accounts_svc.is_reauth_required(acc):
             continue
-        # Disabled accounts stay connected only while their own existing dialogs are open.
+        needs_first_dm_client = bool(acc.get("participates"))
         needs_dialog_client = dialog_store_svc.has_open_for_account(uid)
-        if not acc.get("participates") and not needs_dialog_client:
+        needs_group_monitor = bool(chats_svc.list_watchable_ids(uid))
+        if not (needs_first_dm_client or needs_dialog_client or needs_group_monitor):
             continue
         if not acc.get("session_string"):
             continue
@@ -374,10 +376,10 @@ async def _handle_group(
     if event.out:
         return
 
-    # An account disabled by the admin may finish existing private dialogs,
-    # but it must not collect new group leads.
+    # First DM participation controls only outreach. Group monitoring is
+    # controlled by the account's watchable chat selection.
     acc = accounts_svc.get_account(account_user_id)
-    if not acc or not acc.get("participates"):
+    if not acc or accounts_svc.is_reauth_required(acc):
         return
 
     chat_id = int(event.chat_id)
@@ -561,10 +563,12 @@ async def check_authorization_health(*, force: bool = False) -> int:
 
 
 async def maybe_disconnect_inactive_account(account_user_id: int) -> bool:
-    """Disconnect a disabled account once all of its existing dialogs are closed."""
+    """Disconnect only when no First DM, dialogs or selected groups need a client."""
     uid = int(account_user_id)
     acc = accounts_svc.get_account(uid)
     if not acc or acc.get("participates"):
+        return False
+    if chats_svc.list_watchable_ids(uid):
         return False
     from services import dialog_store as dialog_store_svc
 
