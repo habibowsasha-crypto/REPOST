@@ -382,7 +382,9 @@ async def _attempt_lead_across_accounts(
                 try:
                     from services import spambot as spambot_svc
 
-                    await spambot_svc.on_peer_flood(account_id)
+                    await spambot_svc.on_peer_flood(
+                        account_id, source="first_dm_entity"
+                    )
                 except Exception as exc:
                     logger.error(
                         "SpamBot on_peer_flood failed account={} error_type={}",
@@ -1207,7 +1209,9 @@ async def _send_first_dm(
         try:
             from services import spambot as spambot_svc
 
-            await spambot_svc.on_peer_flood(account_id)
+            await spambot_svc.on_peer_flood(
+                account_id, source="first_dm"
+            )
         except Exception as exc:
             logger.exception("SpamBot on_peer_flood failed: {}", exc)
             pacing.set_paused(account_id, "PeerFlood", paused=True)

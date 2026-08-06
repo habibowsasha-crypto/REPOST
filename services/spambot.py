@@ -60,6 +60,15 @@ def _format_admin_time(iso_or_dt) -> str:
     return local.strftime("%d.%m.%Y %H:%M МСК")
 
 
+def _peerflood_source_text(source: str) -> str:
+    return {
+        "first_dm": "отправка First DM",
+        "first_dm_entity": "подготовка First DM",
+        "dialog": "сообщение в существующем диалоге",
+        "dialog_recovery": "восстановление сообщения существующего диалога",
+    }.get(str(source or "").strip().lower(), "Telegram-отправка аккаунта")
+
+
 def _notify_peerflood(
     label: str,
     seconds: int,
@@ -68,6 +77,8 @@ def _notify_peerflood(
     burst_triggered: bool = False,
     extra_seconds: int = 0,
     spambot_check_started: bool = True,
+    account_first_dm_enabled: bool = True,
+    source: str = "unknown",
 ) -> str:
     from services import runtime as runtime_svc
 
@@ -75,7 +86,8 @@ def _notify_peerflood(
     if burst_triggered:
         burst = (
             "\n🔥 Серия: **5 PeerFlood за 10 минут**"
-            f"\n➕ Дополнительная пауза: **{runtime_svc.format_duration(int(extra_seconds))}**"
+            f"\n➕ Дополнительная пауза: "
+            f"**{runtime_svc.format_duration(int(extra_seconds))}**"
         )
     else:
         burst = f"\n🔁 Серия за 10 минут: **{streak}/5**"
@@ -84,12 +96,19 @@ def _notify_peerflood(
         if spambot_check_started
         else "🤖 SpamBot: **повторная проверка не запускается**"
     )
+    first_dm_line = (
+        "⏸ First DM: **временно остановлены**"
+        if account_first_dm_enabled
+        else "⏸ First DM: **уже отключены вручную**"
+    )
+    source_line = _peerflood_source_text(source)
     return (
         "🚨 **ОБНАРУЖЕН PEERFLOOD**\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
         f"👤 Аккаунт: **{label}**\n"
-        "⏸ First DM: **остановлены**\n"
-        f"⏳ Общая пауза: **{pause}**"
+        f"{first_dm_line}\n"
+        f"💬 Источник PeerFlood: **{source_line}**\n"
+        f"⏳ Telegram-пауза аккаунта: **{pause}**"
         f"{burst}\n"
         f"{spambot_line}"
     )
@@ -100,14 +119,25 @@ def _notify_peerflood_burst(
     *,
     extra_seconds: int,
     until: dt.datetime,
+    account_first_dm_enabled: bool = True,
+    source: str = "unknown",
 ) -> str:
     from services import runtime as runtime_svc
 
+    first_dm_line = (
+        "⏸ First DM: **временно остановлены**"
+        if account_first_dm_enabled
+        else "⏸ First DM: **остаются отключены вручную**"
+    )
+    source_line = _peerflood_source_text(source)
     return (
         "🔥 **СЕРИЯ: 5 PeerFlood за 10 минут**\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
         f"👤 Аккаунт: **{label}**\n"
-        f"➕ Дополнительная пауза: **{runtime_svc.format_duration(int(extra_seconds))}**\n"
+        f"{first_dm_line}\n"
+        f"💬 Источник PeerFlood: **{source_line}**\n"
+        f"➕ Дополнительная пауза: "
+        f"**{runtime_svc.format_duration(int(extra_seconds))}**\n"
         f"⏳ Пауза до: **{_format_admin_time(until)}**\n"
         "🔁 Дополнительная пауза применена один раз для текущего инцидента."
     )
@@ -296,14 +326,19 @@ def _upsert_state(
         )
 
 
-async def on_peer_flood(account_user_id: int) -> None:
+async def on_peer_flood(
+    account_user_id: int,
+    *,
+    source: str = "unknown",
+) -> None:
     """
     PeerFlood from Telegram on DM send.
 
     Important: @SpamBot "free" != no PeerFlood. PeerFlood is a cold-DM rate limit.
     Every real exception is counted. Repeated events during an active ordinary
     cooldown are debounced, except the fifth event extends that cooldown by the
-    separately configured extra time.
+    separately configured extra time. The source is used only for truthful admin
+    wording and does not change pause behavior.
     """
     account_user_id = int(account_user_id)
     from services import runtime as runtime_svc
@@ -318,6 +353,9 @@ async def on_peer_flood(account_user_id: int) -> None:
             repair.get("cleared"),
         )
     acc = accounts_svc.get_account(account_user_id)
+    account_first_dm_enabled = (
+        True if acc is None else bool(acc.get("participates"))
+    )
     st = get_state(account_user_id) or {}
     st_status = str(st.get("status") or "")
     previous_peerflood_at = _parse_iso((acc or {}).get("peerflood_last_at"))
@@ -379,6 +417,8 @@ async def on_peer_flood(account_user_id: int) -> None:
                         label,
                         extra_seconds=extra_seconds,
                         until=extended_until,
+                        account_first_dm_enabled=account_first_dm_enabled,
+                        source=source,
                     )
                 )
                 logger.warning(
@@ -453,6 +493,8 @@ async def on_peer_flood(account_user_id: int) -> None:
                 burst_triggered=burst_triggered,
                 extra_seconds=extra_seconds,
                 spambot_check_started=True,
+                account_first_dm_enabled=account_first_dm_enabled,
+                source=source,
             )
         )
     else:

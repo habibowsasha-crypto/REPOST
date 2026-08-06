@@ -889,7 +889,9 @@ async def _send_prepared_action(
         try:
             from services import spambot as spambot_svc
 
-            await spambot_svc.on_peer_flood(account_user_id)
+            await spambot_svc.on_peer_flood(
+                account_user_id, source="dialog"
+            )
         except Exception as sp_exc:
             logger.exception("SpamBot from scheduled dialog: {}", sp_exc)
             pacing.set_paused(account_user_id, "PeerFlood", paused=True)
@@ -1043,7 +1045,9 @@ async def _reconcile_prepared_action(row: dict) -> bool:
             try:
                 from services import spambot as spambot_svc
 
-                await spambot_svc.on_peer_flood(account)
+                await spambot_svc.on_peer_flood(
+                    account, source="dialog_recovery"
+                )
             except Exception as sp_exc:
                 logger.warning(
                     "SpamBot from dialog recovery failed account={} error_type={}",
