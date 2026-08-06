@@ -472,22 +472,27 @@ def _format_dashboard_wait(seconds: float) -> str:
 
 
 def dashboard_account_line(acc: dict[str, Any]) -> str:
-    """Compact two-line account status block for the main dashboard."""
+    """Compact entity-aware account status block for the main dashboard."""
     from services import dialog_store as dialog_store_svc
     from services import pacing as pacing_svc
+    from services import queue as queue_svc
 
+    account_id = int(acc["user_id"])
     label = format_account_label(acc, include_id=False)
     if len(label) > 24:
         label = label[:23] + "…"
-    dialogs = dialog_store_svc.count_open_for_account(int(acc["user_id"]))
-    retention_waiting = dialog_store_svc.count_retention_waiting_for_account(
-        int(acc["user_id"])
-    )
+    dialogs = dialog_store_svc.count_open_for_account(account_id)
+    available = queue_svc.count_available_for_account(account_id)
     participates = bool(acc.get("participates"))
     paused = bool(acc.get("is_paused"))
 
     if is_reauth_required(acc):
-        return f"🔴 **{label}**\n└ Требуется повторный вход · диалогов {dialogs}"
+        return (
+            f"🔴 **{label}**\n"
+            f"├ First DM: Требуется повторный вход\n"
+            f"├ Доступно для First DM: **{available}**\n"
+            f"└ Закреплено диалогов: **{dialogs}**"
+        )
 
     if paused:
         reason = (acc.get("pause_reason") or "пауза").strip()
@@ -499,20 +504,20 @@ def dashboard_account_line(acc: dict[str, Any]) -> str:
             reason_s = reason[:22]
         left = format_cooldown_left(acc)
         detail = f"{reason_s} · ещё {left.lstrip('~')}" if left else reason_s
-        return f"🔴 **{label}**\n└ {detail} · диалогов {dialogs}"
+        return (
+            f"🔴 **{label}**\n"
+            f"├ First DM: {detail}\n"
+            f"├ Доступно для First DM: **{available}**\n"
+            f"└ Закреплено диалогов: **{dialogs}**"
+        )
 
     if not participates:
-        if dialogs:
-            return (
-                f"🟡 **{label}**\n"
-                f"└ First DM отключены · завершает диалогов {dialogs}"
-            )
-        if retention_waiting:
-            return (
-                f"🟡 **{label}**\n"
-                f"└ First DM отключены · очистка {retention_waiting}"
-            )
-        return f"🟡 **{label}**\n└ First DM отключены · диалогов 0"
+        return (
+            f"🟡 **{label}**\n"
+            f"├ First DM отключены\n"
+            f"├ Доступно для First DM: **{available}**\n"
+            f"└ Закреплено диалогов: **{dialogs}**"
+        )
 
     ready, reason = pacing_svc.account_is_send_ready(acc)
     account_wait = pacing_svc.seconds_until_account_ready(acc)
@@ -532,7 +537,9 @@ def dashboard_account_line(acc: dict[str, Any]) -> str:
 
     return (
         f"🟢 **{label}**\n"
-        f"├ First DM включены · диалогов {dialogs}\n"
+        f"├ First DM включены\n"
+        f"├ Доступно для First DM: **{available}**\n"
+        f"├ Закреплено диалогов: **{dialogs}**\n"
         f"└ {detail}"
     )
 

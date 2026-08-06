@@ -23,7 +23,11 @@ from services.ui import (
 
 
 def queue_screen_text() -> str:
-    pending = queue_svc.count_by_status(queue_svc.STATUS_PENDING)
+    availability = queue_svc.dashboard_availability_counts()
+    pending = availability["total_pending"]
+    available_enabled = availability["available_enabled"]
+    waiting_account_enable = availability["waiting_account_enable"]
+    no_available_account = availability["no_available_account"]
     claimed = queue_svc.count_by_status(queue_svc.STATUS_CLAIMED)
     sent_today = queue_svc.count_first_dm_today()
     sent_total = queue_svc.count_first_dm_total()
@@ -59,7 +63,10 @@ def queue_screen_text() -> str:
         "📬",
         "Очередь First DM",
         join(
-            f"├ Ждут сообщения: **{pending}**",
+            f"├ Уникальных пользователей в очереди: **{pending}**",
+            f"├ Доступны включённым аккаунтам: **{available_enabled}**",
+            f"├ Ждут включения аккаунта: **{waiting_account_enable}**",
+            f"├ Нет доступного аккаунта: **{no_available_account}**",
             f"├ Сейчас отправляется: **{claimed}**",
             f"├ Отправлено сегодня: **{sent_today}**",
             f"├ Отправлено всего: **{sent_total}**",

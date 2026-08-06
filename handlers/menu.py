@@ -19,6 +19,7 @@ from config import (
     DM_DAILY_LIMIT_PER_ACCOUNT,
     DM_GLOBAL_SPACING_MAX,
     DM_GLOBAL_SPACING_MIN,
+    DIALOG_FLOW_VARIANT,
     OPENAI_API_KEY,
     SPAMBOT_AUTO_RESUME,
     TELEGRAM_DIALOG_DELETE_DAYS,
@@ -98,7 +99,11 @@ def _dashboard_text() -> str:
             "Продолжаются только реальные диалоги после входящего сообщения"
         )
 
-    pending = queue_svc.count_by_status(queue_svc.STATUS_PENDING)
+    availability = queue_svc.dashboard_availability_counts()
+    pending = availability["total_pending"]
+    available_enabled = availability["available_enabled"]
+    waiting_account_enable = availability["waiting_account_enable"]
+    no_available_account = availability["no_available_account"]
     claimed = queue_svc.count_by_status(queue_svc.STATUS_CLAIMED)
     first_today = queue_svc.count_first_dm_today()
     first_total = queue_svc.count_first_dm_total()
@@ -147,14 +152,18 @@ def _dashboard_text() -> str:
         status_title,
         status_hint,
         "",
-        "📬 **ОЧЕРЕДЬ**",
-        f"├ Ждут сообщения: **{pending}**",
+        "📬 **FIRST DM**",
+        f"├ Уникальных пользователей в очереди: **{pending}**",
+        f"├ Доступны включённым аккаунтам: **{available_enabled}**",
+        f"├ Ждут включения аккаунта: **{waiting_account_enable}**",
+        f"├ Нет доступного аккаунта: **{no_available_account}**",
         f"├ Сейчас отправляется: **{claimed}**",
         f"├ Отправлено сегодня: **{first_today}**",
         f"└ Отправлено всего: **{first_total}**",
         DIV,
         f"👤 **АККАУНТЫ · {account_count}**",
         acc_block,
+        "ℹ️ Один пользователь может быть доступен нескольким аккаунтам, но First DM отправляется только один раз.",
         *([auth_warning] if auth_warning else []),
         DIV,
         "💬 **ДИАЛОГИ**",
@@ -165,6 +174,7 @@ def _dashboard_text() -> str:
         link_line,
         ai_line,
         f"🧲 First DM: `{FIRST_DM_STYLE}`",
+        f"💬 Вариант диалога: `{DIALOG_FLOW_VARIANT}`",
         monitor_line,
     )
 
@@ -267,6 +277,7 @@ async def cb_settings(event: events.CallbackQuery.Event) -> None:
             kv("После PeerFlood", pf, icon="⚠️"),
             kv("AI", ai, icon="🤖"),
             kv("First DM", FIRST_DM_STYLE, icon="🧲"),
+            kv("Вариант диалога", DIALOG_FLOW_VARIANT, icon="💬"),
             f"🔗 `{link_short}`",
             f"🗑 Telegram {TELEGRAM_DIALOG_DELETE_DAYS}д · база {LOCAL_DIALOG_TEXT_RETENTION_DAYS}д",
         ),

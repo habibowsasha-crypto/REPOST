@@ -1,6 +1,24 @@
-# Channel DM Bot v1.0.81
+# Channel DM Bot v1.0.83
 
 
+## v1.0.83 - entity-aware administrator dashboard
+
+- The shared First DM queue now shows unique users only once.
+- The dashboard separately shows users available to enabled accounts, users waiting for an account to be enabled and users with no available account.
+- Every account block shows how many pending users are available to that exact account.
+- The confusing `Только этот аккаунт видит` metric was not added.
+- The dashboard explicitly explains that one user may be available to several accounts, but receives only one First DM.
+- A claimed or sent user disappears from every account availability counter immediately.
+- First DM routing, duplicate protection, dialog ownership, pacing, PeerFlood, Variant 3 and the database schema are unchanged.
+
+## v1.0.82 - selectable dialog Variant 3
+
+- Added `DIALOG_FLOW_VARIANT=1|2|3` without changing the default production flow.
+- Variant 3 puts the approved short opening hint directly under the promo link.
+- Variant 3 sends the smoothing apology as the only later automatic message.
+- Detailed link-opening help is sent only after a real user reports a link problem.
+- First DM style, pacing, refusals, opt-out, account ownership and the five-message cap are unchanged.
+- Railway value for the approved mode: `DIALOG_FLOW_VARIANT=3`.
 
 ## Changes in v1.0.81 - First DM cooldown separated from real dialogs
 

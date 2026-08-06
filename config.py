@@ -79,6 +79,20 @@ if FIRST_DM_STYLE not in {"magnet", "short_hook", "legacy"}:
         f"got {FIRST_DM_STYLE!r}"
     )
 
+# Post-reply dialog flow variant.
+# - 1: full automatic path: promo, apology, detailed link help
+# - 2: short hint under the promo link, apology, detailed help only on request
+# - 3: precise panel hint under the promo link, apology, detailed help only on request
+try:
+    DIALOG_FLOW_VARIANT: int = int(config("DIALOG_FLOW_VARIANT", default="1"))
+except (TypeError, ValueError) as exc:
+    raise RuntimeError("DIALOG_FLOW_VARIANT must be exactly 1, 2 or 3") from exc
+if DIALOG_FLOW_VARIANT not in {1, 2, 3}:
+    raise RuntimeError(
+        "DIALOG_FLOW_VARIANT must be exactly 1, 2 or 3; "
+        f"got {DIALOG_FLOW_VARIANT!r}"
+    )
+
 # ---------------------------------------------------------------------------
 # Pacing (seconds unless noted)
 # ---------------------------------------------------------------------------

@@ -4,8 +4,9 @@ Approved funnel:
 1. First DM is already sent by the existing First DM module.
 2. Any allowed user reaction starts one varied promo with the exact CHANNEL_LINK.
 3. One varied smoothing apology is sent after the configured delay.
-4. One varied link-opening instruction is sent after the next configured delay.
-5. One remaining outgoing slot may answer the user's own follow-up message.
+4. Variant 1 sends automatic detailed link help. Variants 2 and 3 keep a short
+   opening hint under the promo link and send detailed help only after a real request.
+5. Remaining outgoing slots answer the user's own follow-up messages.
 6. The absolute budget is five outgoing messages including First DM.
 
 Voice notes, stickers, GIFs, photos, videos and emoji-only messages are always treated
@@ -29,6 +30,7 @@ from config import (
     AI_REQUEST_TIMEOUT_SECONDS,
     CHANNEL_LINK,
     CHANNEL_PITCH,
+    DIALOG_FLOW_VARIANT,
     OPENAI_API_KEY,
 )
 from services import phrases as phrases_svc
@@ -135,6 +137,17 @@ _LINK_REQUEST_RE = re.compile(
     r"хочу\s+посмотреть|где\s+канал|где\s+ссылка)(\s|$)",
     re.IGNORECASE,
 )
+_LINK_OPEN_PROBLEM_RE = re.compile(
+    r"(?:"
+    r"(?:ссылк\w*|канал\w*).{0,80}(?:не\s+(?:откры\w*|работ\w*|"
+    r"пуска\w*|нажим\w*|получ\w*)|ошиб\w*|заблок\w*)"
+    r"|(?:не\s+могу|не\s+получ\w*|не\s+выходит|не\s+откры\w*|"
+    r"не\s+работ\w*|не\s+пуска\w*|не\s+нажим\w*).{0,80}"
+    r"(?:ссылк\w*|канал\w*|перейти|зайти)"
+    r"|как.{0,30}(?:открыть|перейти|зайти).{0,30}(?:ссылк\w*|канал\w*)"
+    r")",
+    re.IGNORECASE,
+)
 
 _REQUIRED_SOFTWARE_RE = re.compile(r"(софт|программ)", re.IGNORECASE)
 _REQUIRED_COPY_RE = re.compile(r"(копир|перенос|дублир|подхватыва|собира|попада)", re.IGNORECASE)
@@ -212,6 +225,14 @@ _PROMO_BENEFITS = [
     "посмотри, возможно там будет что-то полезное для твоих сделок",
     "можешь глянуть, вдруг найдётся подходящая торговая идея",
 ]
+
+_INLINE_LINK_HELP_BY_VARIANT = {
+    2: "Не открылась ссылка? Закрой панель сверху над чатом и нажми ещё раз.",
+    3: (
+        "Если ссылка не откроется - закрой крестиком панель "
+        "«Заблокировать / Добавить» сверху над чатом и нажми на ссылку ещё раз."
+    ),
+}
 
 _SMOOTHING_FALLBACKS = [
     "Сорян, не хотел навязываться. Просто делюсь, вдруг пригодится тебе.",
@@ -319,8 +340,19 @@ def _strip_bad_dashes(text: str) -> str:
     return out.strip()
 
 
-def _enforce_admin_link(text: str, *, include_link: bool) -> str:
-    """Remove every model URL and optionally append the exact admin link once."""
+def inline_link_help_text(variant: int | None = None) -> str:
+    """Return the approved short hint placed under the promo link."""
+    selected = DIALOG_FLOW_VARIANT if variant is None else int(variant)
+    return _strip_bad_dashes(_INLINE_LINK_HELP_BY_VARIANT.get(selected, ""))
+
+
+def _enforce_admin_link(
+    text: str,
+    *,
+    include_link: bool,
+    inline_help: str = "",
+) -> str:
+    """Remove model URLs and optionally append the exact admin link and hint."""
     cleaned = _URL_RE.sub("", text or "")
     cleaned = _TELEGRAM_HANDLE_RE.sub("", cleaned)
     cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
@@ -329,6 +361,9 @@ def _enforce_admin_link(text: str, *, include_link: bool) -> str:
     if not include_link:
         return cleaned
     link = configured_channel_link()
+    hint = _strip_bad_dashes(inline_help)
+    if hint:
+        return f"{cleaned}\n{link}\n\n{hint}".strip()
     return f"{cleaned}\n{link}".strip()
 
 
@@ -383,6 +418,13 @@ def is_soft_decline(text: str) -> bool:
 
 def is_link_request(text: str) -> bool:
     return local_category(text) == CATEGORY_LINK_REQUEST
+
+
+def is_link_open_problem(text: str, content_kind: str = "text") -> bool:
+    """Return True only for a real user problem opening the promo link."""
+    if str(content_kind or "text") != "text":
+        return False
+    return bool(_LINK_OPEN_PROBLEM_RE.search(str(text or "").strip()))
 
 
 async def classify_user_message(
@@ -682,7 +724,11 @@ async def generate_promo(
                 if is_too_similar(clean, recent, threshold=0.82):
                     logger.warning("Promo too similar attempt={} text={!r}", attempt + 1, clean[:140])
                     continue
-                return _enforce_admin_link(clean, include_link=True)
+                return _enforce_admin_link(
+                    clean,
+                    include_link=True,
+                    inline_help=inline_link_help_text(),
+                )
             except ChannelLinkNotConfiguredError:
                 raise
             except Exception as exc:
@@ -690,7 +736,11 @@ async def generate_promo(
 
     candidates = [item for item in _build_local_promo_candidates(category) if _promo_ok(item)]
     fallback = _pick_unique_fallback(candidates, recent, threshold=0.82)
-    return _enforce_admin_link(fallback, include_link=True)
+    return _enforce_admin_link(
+        fallback,
+        include_link=True,
+        inline_help=inline_link_help_text(),
+    )
 
 
 def _apology_ok(text: str) -> bool:

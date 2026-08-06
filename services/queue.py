@@ -490,6 +490,113 @@ def count_by_status(status: str | None = None) -> int:
     return int(row["c"] if row else 0)
 
 
+def count_available_for_account(account_user_id: int) -> int:
+    """Pending unique targets this exact account may still try for First DM.
+
+    The same target may be counted for more than one account when each account
+    owns its own Telegram entity evidence. The shared lead row still guarantees
+    that only one First DM can be claimed and sent.
+    """
+    conn = get_connection()
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS c
+          FROM leads l
+         WHERE l.status=?
+           AND EXISTS (
+                SELECT 1
+                  FROM lead_account_entities e
+                 WHERE e.target_user_id=l.target_user_id
+                   AND e.account_user_id=?
+           )
+           AND NOT EXISTS (
+                SELECT 1
+                  FROM lead_account_failures f
+                 WHERE f.target_user_id=l.target_user_id
+                   AND f.account_user_id=?
+                   AND f.failure_kind='no_entity'
+           )
+        """,
+        (STATUS_PENDING, int(account_user_id), int(account_user_id)),
+    ).fetchone()
+    return int(row["c"] if row else 0)
+
+
+def dashboard_availability_counts() -> dict[str, int]:
+    """Partition the unique pending queue by currently known account access.
+
+    - available_enabled: at least one enabled authorized account owns usable
+      entity evidence for the target.
+    - waiting_account_enable: no enabled owner exists, but a disabled authorized
+      account owns usable entity evidence and can participate after it is enabled.
+    - no_available_account: no currently usable account owns entity evidence.
+
+    These are read-only dashboard diagnostics. They do not probe Telegram, alter
+    queue ownership or change dispatch behavior.
+    """
+    conn = get_connection()
+    row = conn.execute(
+        """
+        WITH pending_access AS (
+            SELECT
+                l.target_user_id,
+                EXISTS (
+                    SELECT 1
+                      FROM lead_account_entities e
+                      JOIN accounts a ON a.user_id=e.account_user_id
+                     WHERE e.target_user_id=l.target_user_id
+                       AND a.participates=1
+                       AND TRIM(COALESCE(a.session_string, ''))<>''
+                       AND COALESCE(a.auth_status, 'unknown')<>'reauth_required'
+                       AND NOT EXISTS (
+                            SELECT 1
+                              FROM lead_account_failures f
+                             WHERE f.target_user_id=l.target_user_id
+                               AND f.account_user_id=e.account_user_id
+                               AND f.failure_kind='no_entity'
+                       )
+                ) AS enabled_owner,
+                EXISTS (
+                    SELECT 1
+                      FROM lead_account_entities e
+                      JOIN accounts a ON a.user_id=e.account_user_id
+                     WHERE e.target_user_id=l.target_user_id
+                       AND TRIM(COALESCE(a.session_string, ''))<>''
+                       AND COALESCE(a.auth_status, 'unknown')<>'reauth_required'
+                       AND NOT EXISTS (
+                            SELECT 1
+                              FROM lead_account_failures f
+                             WHERE f.target_user_id=l.target_user_id
+                               AND f.account_user_id=e.account_user_id
+                               AND f.failure_kind='no_entity'
+                       )
+                ) AS usable_owner
+              FROM leads l
+             WHERE l.status=?
+        )
+        SELECT
+            COUNT(*) AS total_pending,
+            COALESCE(SUM(CASE WHEN enabled_owner=1 THEN 1 ELSE 0 END), 0)
+                AS available_enabled,
+            COALESCE(SUM(CASE
+                WHEN enabled_owner=0 AND usable_owner=1 THEN 1 ELSE 0 END), 0)
+                AS waiting_account_enable,
+            COALESCE(SUM(CASE WHEN usable_owner=0 THEN 1 ELSE 0 END), 0)
+                AS no_available_account
+          FROM pending_access
+        """,
+        (STATUS_PENDING,),
+    ).fetchone()
+    if row is None:
+        return {
+            "total_pending": 0,
+            "available_enabled": 0,
+            "waiting_account_enable": 0,
+            "no_available_account": 0,
+        }
+    return {key: int(row[key] or 0) for key in row.keys()}
+
+
 def list_recent(limit: int = 15, status: str | None = STATUS_PENDING) -> list[dict[str, Any]]:
     conn = get_connection()
     if status:
