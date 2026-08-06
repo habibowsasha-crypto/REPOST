@@ -253,6 +253,16 @@ def init_db() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS dialog_peerflood_account_gates (
+                account_user_id INTEGER PRIMARY KEY,
+                blocked_until TEXT NOT NULL,
+                probe_claim_until TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS peerflood_hits (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 account_user_id INTEGER NOT NULL,

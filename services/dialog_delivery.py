@@ -486,6 +486,38 @@ def mark_failed_with_backoff(
     return retry_at
 
 
+def defer_prepared_until(
+    target_user_id: int,
+    action_kind: str,
+    error: str,
+    *,
+    retry_at: str,
+) -> bool:
+    """Defer a prepared row without counting a Telegram delivery attempt."""
+    now = _now_iso()
+    conn = get_connection()
+    with db_lock(), conn:
+        cur = conn.execute(
+            """
+            UPDATE dialog_outbox
+               SET status=?, last_error=?, updated_at=?,
+                   recovery_next_at=?, recovery_last_error=?
+             WHERE target_user_id=? AND action_kind=? AND status=?
+            """,
+            (
+                STATUS_FAILED,
+                str(error)[:500],
+                now,
+                str(retry_at),
+                str(error)[:500],
+                int(target_user_id),
+                str(action_kind),
+                STATUS_PREPARED,
+            ),
+        )
+    return bool(int(cur.rowcount or 0))
+
+
 def retry_not_before(target_user_id: int, action_kind: str) -> str | None:
     row = get(target_user_id, action_kind)
     value = str((row or {}).get("recovery_next_at") or "")

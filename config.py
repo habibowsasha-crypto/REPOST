@@ -144,6 +144,14 @@ DIALOG_PEERFLOOD_GUARD_ENABLED: bool = config(
     "DIALOG_PEERFLOOD_GUARD_ENABLED", default="true"
 ).lower() in {"1", "true", "yes", "on"}
 
+# Optional account-wide serialization for established-dialog retries after
+# PeerFlood. It is effective only while DIALOG_PEERFLOOD_GUARD_ENABLED is true.
+# true  - one probe send per account after each full five-minute gate window.
+# false - keep the per-dialog retry behavior from v1.0.90.
+DIALOG_PEERFLOOD_ACCOUNT_GATE_ENABLED: bool = config(
+    "DIALOG_PEERFLOOD_ACCOUNT_GATE_ENABLED", default="true"
+).lower() in {"1", "true", "yes", "on"}
+
 FLOODWAIT_EXTRA_SECONDS: int = int(config("FLOODWAIT_EXTRA_SECONDS", default="45"))
 
 # ---------------------------------------------------------------------------

@@ -11,6 +11,7 @@ from config import (
     ADMIN_ID_LIST,
     BOT_TOKEN,
     DB_PATH,
+    DIALOG_PEERFLOOD_ACCOUNT_GATE_ENABLED,
     DIALOG_PEERFLOOD_GUARD_ENABLED,
     LOG_LEVEL,
     app_version,
@@ -151,6 +152,15 @@ def run() -> None:
     logger.info(
         "Dialog PeerFlood guard: {} (retry every 5 minutes, unlimited)",
         "enabled" if DIALOG_PEERFLOOD_GUARD_ENABLED else "disabled",
+    )
+    logger.info(
+        "Dialog PeerFlood account gate: {} (one probe every 5 minutes per account)",
+        (
+            "enabled"
+            if DIALOG_PEERFLOOD_GUARD_ENABLED
+            and DIALOG_PEERFLOOD_ACCOUNT_GATE_ENABLED
+            else "disabled"
+        ),
     )
     from services import accounts as accounts_svc
 

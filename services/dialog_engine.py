@@ -30,6 +30,7 @@ from services import ai_dialog
 from services import dialog_inbox
 from services import dialog_store as store
 from services import dialog_delivery
+from services import dialog_peerflood_gate
 from services import first_dm_delivery
 from services import monitor as monitor_svc
 from services import opt_out as opt_out_svc
@@ -111,6 +112,8 @@ def _dialog_peerflood_guard_enabled() -> bool:
 def _peerflood_guard_active(account_user_id: int) -> bool:
     if not _dialog_peerflood_guard_enabled():
         return False
+    if dialog_peerflood_gate.wait_retry_at(account_user_id) is not None:
+        return True
     from services import accounts as accounts_svc
 
     account = accounts_svc.get_account(int(account_user_id)) or {}
@@ -123,9 +126,11 @@ def _peerflood_guard_active(account_user_id: int) -> bool:
 
 def _peerflood_guard_retry_at(account_user_id: int) -> str:
     # A dialog retry always waits a full five minutes after the latest failed
-    # Telegram attempt. The account cooldown still blocks earlier sends, but it
-    # never shortens this dialog-specific recovery interval.
-    _ = int(account_user_id)
+    # Telegram attempt. An active account gate exposes its shared deadline so
+    # buffered incoming messages do not trigger extra AI work inside the window.
+    shared_retry_at = dialog_peerflood_gate.wait_retry_at(account_user_id)
+    if shared_retry_at:
+        return shared_retry_at
     return (_now() + dt.timedelta(seconds=_DIALOG_PEERFLOOD_RETRY_SECONDS)).isoformat()
 
 
@@ -1069,12 +1074,45 @@ async def _send_prepared_action(
     if client is None or not client.is_connected():
         dialog_delivery.mark_failed(target_user_id, action_kind, "client_unavailable")
         return "retry"
+
+    gate_decision = dialog_peerflood_gate.before_send(account_user_id)
+    gate_mode = str(gate_decision.get("mode") or "normal")
+    gate_probe = gate_mode == "probe"
+    if gate_mode == "wait":
+        retry_at = str(
+            gate_decision.get("retry_at")
+            or _peerflood_guard_retry_at(account_user_id)
+        )
+        dialog_delivery.defer_prepared_until(
+            target_user_id,
+            action_kind,
+            "PeerFlood",
+            retry_at=retry_at,
+        )
+        logger.info(
+            "Dialog send held by account PeerFlood gate account={} target={} "
+            "kind={} retry_at={}",
+            account_user_id,
+            target_user_id,
+            message_kind,
+            retry_at,
+        )
+        return "peerflood"
+    if gate_probe:
+        logger.info(
+            "Dialog PeerFlood account probe claimed account={} target={} kind={}",
+            account_user_id,
+            target_user_id,
+            message_kind,
+        )
     try:
         identity = _load_dialog_identity(target_user_id)
         entity = await _resolve_dialog_entity(
             client, account_user_id, target_user_id, identity
         )
         if entity is None:
+            if gate_probe:
+                dialog_peerflood_gate.release_probe(account_user_id)
             dialog_delivery.mark_failed(
                 target_user_id, action_kind, "entity_unavailable_before_send"
             )
@@ -1090,6 +1128,8 @@ async def _send_prepared_action(
             await _cleanup_disabled_account(account_user_id)
             return "failed"
         if opt_out_svc.is_opted_out(target_user_id) and not allow_opt_out:
+            if gate_probe:
+                dialog_peerflood_gate.release_probe(account_user_id)
             dialog_delivery.mark_failed(target_user_id, action_kind, "target_opted_out")
             store.close_for_opt_out(target_user_id)
             return "failed"
@@ -1112,10 +1152,23 @@ async def _send_prepared_action(
                 target_user_id,
             )
             return "ambiguous"
+        if gate_probe:
+            dialog_peerflood_gate.mark_probe_success(account_user_id)
+            logger.info(
+                "Dialog PeerFlood account gate opened after successful probe "
+                "account={} target={} kind={}",
+                account_user_id,
+                target_user_id,
+                message_kind,
+            )
         await _cleanup_disabled_account(account_user_id)
         return "sent"
     except FloodWaitError as exc:
         seconds = int(getattr(exc, "seconds", 60) or 60)
+        if gate_probe:
+            dialog_peerflood_gate.activate(
+                account_user_id, delay_seconds=seconds
+            )
         # Keep the account cooldown for First DM, but retry only this dialog action
         # after Telegram's explicit wait. Other real dialogs are not globally held.
         pacing.apply_floodwait(account_user_id, seconds)
@@ -1127,6 +1180,16 @@ async def _send_prepared_action(
         )
         return "retry"
     except PeerFloodError:
+        gate_until = dialog_peerflood_gate.activate(account_user_id)
+        if gate_until:
+            logger.warning(
+                "Dialog PeerFlood account gate closed account={} target={} "
+                "kind={} retry_at={}",
+                account_user_id,
+                target_user_id,
+                message_kind,
+                gate_until,
+            )
         try:
             from services import spambot as spambot_svc
 
@@ -1168,6 +1231,8 @@ async def _send_prepared_action(
             return "peerflood"
         return "retry"
     except (UserPrivacyRestrictedError, UserIsBlockedError, ChatWriteForbiddenError):
+        if gate_probe:
+            dialog_peerflood_gate.mark_probe_success(account_user_id)
         dialog_delivery.mark_failed(target_user_id, action_kind, "privacy_or_blocked")
         store.set_stage(target_user_id, store.STAGE_CLOSED, clear_auto_link=True)
         store.mark_contact_completed(target_user_id)
