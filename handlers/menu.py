@@ -87,10 +87,16 @@ def _dashboard_text() -> str:
     running = bool(wst.get("enabled") and wst.get("loop_running"))
     if running:
         status_title = "🟢 **FIRST DM РАБОТАЮТ**"
-        status_hint = "Новые сообщения отправляются\nАктивные диалоги продолжаются всегда"
+        status_hint = (
+            "Новые First DM отправляются\n"
+            "Реальные диалоги после входящего ответа продолжаются"
+        )
     else:
         status_title = "⏸ **FIRST DM НА ПАУЗЕ**"
-        status_hint = "Новые сообщения из очереди не отправляются\nАктивные диалоги продолжаются всегда"
+        status_hint = (
+            "Новые First DM и все касания до первого ответа остановлены\n"
+            "Продолжаются только реальные диалоги после входящего сообщения"
+        )
 
     pending = queue_svc.count_by_status(queue_svc.STATUS_PENDING)
     claimed = queue_svc.count_by_status(queue_svc.STATUS_CLAIMED)
@@ -955,7 +961,8 @@ async def cb_help(event: events.CallbackQuery.Event) -> None:
         ),
         join(
             "На главном экране - живые цифры очереди.",
-            "Пауза останавливает только новые First DM. Активные диалоги продолжаются.",
+            "Активные диалоги продолжаются всегда после реального входящего ответа.",
+            "Пауза останавливает новые First DM и все автономные касания до первого ответа.",
         ),
     )
     await render_menu(event, text, [back_home_row()])

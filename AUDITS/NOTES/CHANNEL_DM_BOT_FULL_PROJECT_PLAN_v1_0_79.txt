@@ -1,0 +1,18 @@
+HISTORICAL NOTICE
+- This v1.0.79 document is superseded by the v1.0.80 reports in the same directory.
+
+CHANNEL DM BOT FULL PROJECT PLAN v1.0.79
+
+CURRENT VERSION
+- 1.0.79
+
+FIRST DM PAUSE RULE
+- The global pause stops only new First DM from the shared queue.
+- Group monitoring continues.
+- Existing dialogs continue.
+- After SpamBot confirms an account is free and the approved cooldown has elapsed, active dialogs are unblocked even while First DM remains globally paused.
+- Future First DM still respects next_send_at and cannot send while the global worker is disabled.
+
+NEXT PRODUCTION CHECK
+- Confirm an incoming reply is answered while the main menu shows FIRST DM НА ПАУЗЕ.
+- Confirm a real PeerFlood still defers the dialog safely and later retries it.

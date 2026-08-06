@@ -25,6 +25,7 @@ STATUS_IDLE = "idle"
 STATUS_CHECKING = "checking"
 STATUS_LIMITED = "limited"
 STATUS_FREE_PENDING = "free_pending_resume"
+STATUS_RESUMING = "resuming"
 STATUS_ERROR = "error"
 
 _SPAMBOT = "SpamBot"
@@ -94,6 +95,24 @@ def _notify_peerflood(
     )
 
 
+def _notify_peerflood_burst(
+    label: str,
+    *,
+    extra_seconds: int,
+    until: dt.datetime,
+) -> str:
+    from services import runtime as runtime_svc
+
+    return (
+        "🔥 **СЕРИЯ: 5 PeerFlood за 10 минут**\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 Аккаунт: **{label}**\n"
+        f"➕ Дополнительная пауза: **{runtime_svc.format_duration(int(extra_seconds))}**\n"
+        f"⏳ Пауза до: **{_format_admin_time(until)}**\n"
+        "🔁 Дополнительная пауза применена один раз для текущего инцидента."
+    )
+
+
 def _notify_free_manual(label: str) -> str:
     return (
         "🟢 **SPAMBOT: ОГРАНИЧЕНИЙ НЕТ**\n"
@@ -150,13 +169,13 @@ def _notify_resumed(
     )
     if global_first_dm_paused:
         return (
-            "✅ **ПАУЗА АККАУНТА СНЯТА**\n"
+            "✅ **ТРАНСПОРТНАЯ ПАУЗА АККАУНТА СНЯТА**\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
             f"👤 Аккаунт: **{label}**\n"
             f"🔄 Снятие: **{src}**\n"
             "⏸ Общая рассылка First DM остаётся на паузе.\n"
-            "💬 Новые First DM не отправляются."
-            f"{protective}"
+            "🛑 Новые First DM, silence follow-up и другие касания до первого ответа остановлены.\n"
+            "💬 Продолжаются только реальные диалоги после входящего сообщения пользователя."
         )
     return (
         "▶️ **FIRST DM АККАУНТА ВОЗОБНОВЛЕНЫ**\n"
@@ -340,13 +359,10 @@ async def on_peer_flood(account_user_id: int) -> None:
                     )
                 label = _account_label(account_user_id)
                 await notify_admins(
-                    _notify_peerflood(
+                    _notify_peerflood_burst(
                         label,
-                        max(1, int((extended_until - _now()).total_seconds())),
-                        streak=streak,
-                        burst_triggered=True,
                         extra_seconds=extra_seconds,
-                        spambot_check_started=False,
+                        until=extended_until,
                     )
                 )
                 logger.warning(
@@ -412,16 +428,23 @@ async def on_peer_flood(account_user_id: int) -> None:
             next_check_at=(_now() + dt.timedelta(hours=12)).isoformat(),
             limited_until=None,
         )
-    await notify_admins(
-        _notify_peerflood(
-            label,
-            seconds,
-            streak=streak,
-            burst_triggered=burst_triggered,
-            extra_seconds=extra_seconds,
-            spambot_check_started=not suppress_repeat_check,
+    if not suppress_repeat_check:
+        await notify_admins(
+            _notify_peerflood(
+                label,
+                seconds,
+                streak=streak,
+                burst_triggered=burst_triggered,
+                extra_seconds=extra_seconds,
+                spambot_check_started=True,
+            )
         )
-    )
+    else:
+        logger.info(
+            "Repeated PeerFlood admin notification suppressed account={} series={}/5",
+            account_user_id,
+            streak,
+        )
     if suppress_repeat_check:
         # The first real PeerFlood in the rolling series already started a
         # SpamBot check. Repeating /start for every later hit adds noise and can
@@ -775,69 +798,105 @@ async def _apply_parse(
     )
 
 
-async def resume_account(account_user_id: int, *, source: str = "manual") -> None:
-    """Clear PeerFlood pause and mark SpamBot idle.
+async def resume_account(account_user_id: int, *, source: str = "manual") -> bool:
+    """Clear one transport pause exactly once and mark SpamBot idle.
 
-    Manual resume is an explicit administrator override and may send immediately.
-    Every automatic SpamBot resume creates a fresh normal 2-7 minute First DM
-    interval (or the current configured per-account interval). Telegram cooldown
-    is cleared separately so existing dialogs can continue immediately.
+    Returns True only when a real persisted state transition occurred. The global
+    First DM switch remains authoritative for every pre-reply autonomous action.
     """
     account_user_id = int(account_user_id)
-    pacing.set_paused(account_user_id, "", paused=False)
-    clear_next = source == "manual"
-    next_first_dm_at: str | None = None
     now = _now()
-    if not clear_next:
-        acc = accounts_svc.get_account(account_user_id) or {}
-        delay_seconds = pacing.random_account_interval_seconds(acc)
-        protective = now + dt.timedelta(seconds=delay_seconds)
-        existing_next = _parse_iso(acc.get("next_send_at"))
-        if existing_next and existing_next > protective:
-            protective = existing_next
-        next_first_dm_at = protective.isoformat()
-
     conn = get_connection()
     with db_lock(), conn:
-        if clear_next:
-            conn.execute(
-                """
-                UPDATE accounts
-                   SET is_paused=0,
-                       pause_reason=NULL,
-                       cooldown_until=NULL,
-                       next_send_at=NULL,
-                       peerflood_burst_applied_at=NULL,
-                       updated_at=?
-                 WHERE user_id=?
-                """,
-                (now.isoformat(), account_user_id),
+        acc = conn.execute(
+            """
+            SELECT is_paused, pause_reason, cooldown_until, next_send_at,
+                   COALESCE(auth_status, 'unknown') AS auth_status,
+                   dm_interval_min_sec, dm_interval_max_sec
+              FROM accounts WHERE user_id=?
+            """,
+            (account_user_id,),
+        ).fetchone()
+        if not acc:
+            return False
+        if str(acc["auth_status"] or "unknown") == account_auth.AUTH_REAUTH_REQUIRED:
+            logger.warning(
+                "SpamBot resume ignored for authorization-lost account={}",
+                account_user_id,
             )
-        else:
-            conn.execute(
-                """
-                UPDATE accounts
-                   SET is_paused=0,
-                       pause_reason=NULL,
-                       cooldown_until=NULL,
-                       next_send_at=?,
-                       peerflood_burst_applied_at=NULL,
-                       updated_at=?
-                 WHERE user_id=?
-                """,
-                (
-                    next_first_dm_at,
-                    now.isoformat(),
-                    account_user_id,
-                ),
+            return False
+        state = conn.execute(
+            "SELECT status FROM spambot_state WHERE account_user_id=?",
+            (account_user_id,),
+        ).fetchone()
+        state_status = str(state["status"] or STATUS_IDLE) if state else STATUS_IDLE
+        transitioned = bool(
+            int(acc["is_paused"] or 0)
+            or acc["cooldown_until"]
+            or acc["pause_reason"]
+        )
+        if not transitioned:
+            if state_status != STATUS_IDLE:
+                conn.execute(
+                    """
+                    UPDATE spambot_state
+                       SET status=?, last_reply=?, next_check_at=NULL,
+                           limited_until=NULL, updated_at=?
+                     WHERE account_user_id=?
+                    """,
+                    (
+                        STATUS_IDLE,
+                        f"duplicate_resume_suppressed:{source}",
+                        now.isoformat(),
+                        account_user_id,
+                    ),
+                )
+            logger.info(
+                "Duplicate SpamBot resume suppressed account={} source={}",
+                account_user_id,
+                source,
             )
-    _upsert_state(
-        account_user_id,
-        status=STATUS_IDLE,
-        last_reply=f"resumed:{source}",
-        next_check_at=None,
-        limited_until=None,
-    )
+            return False
+
+        clear_next = source == "manual"
+        next_first_dm_at: str | None = None
+        if not clear_next:
+            delay_seconds = pacing.random_account_interval_seconds(dict(acc))
+            protective = now + dt.timedelta(seconds=delay_seconds)
+            existing_next = _parse_iso(acc["next_send_at"])
+            if existing_next and existing_next > protective:
+                protective = existing_next
+            next_first_dm_at = protective.isoformat()
+
+        conn.execute(
+            """
+            UPDATE accounts
+               SET is_paused=0,
+                   pause_reason=NULL,
+                   cooldown_until=NULL,
+                   next_send_at=?,
+                   peerflood_burst_applied_at=NULL,
+                   updated_at=?
+             WHERE user_id=?
+            """,
+            (None if clear_next else next_first_dm_at, now.isoformat(), account_user_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO spambot_state(
+                account_user_id, status, last_reply, next_check_at,
+                limited_until, updated_at
+            ) VALUES (?, ?, ?, NULL, NULL, ?)
+            ON CONFLICT(account_user_id) DO UPDATE SET
+                status=excluded.status,
+                last_reply=excluded.last_reply,
+                next_check_at=NULL,
+                limited_until=NULL,
+                updated_at=excluded.updated_at
+            """,
+            (account_user_id, STATUS_IDLE, f"resumed:{source}", now.isoformat()),
+        )
+
     logger.info(
         "Account {} resumed ({}) next_first_dm_at={}",
         account_user_id,
@@ -857,10 +916,36 @@ async def resume_account(account_user_id: int, *, source: str = "manual") -> Non
         await monitor_svc.refresh_monitor()
     except Exception as exc:
         logger.warning("monitor refresh after resume: {}", exc)
+    return True
+
+
+def _claim_due_resume(account_user_id: int) -> bool:
+    """Atomically claim one FREE_PENDING row for crash-safe resume."""
+    now = _now()
+    retry_at = (now + dt.timedelta(minutes=5)).isoformat()
+    conn = get_connection()
+    with db_lock(), conn:
+        cur = conn.execute(
+            """
+            UPDATE spambot_state
+               SET status=?, next_check_at=?, updated_at=?
+             WHERE account_user_id=? AND status=?
+               AND next_check_at IS NOT NULL AND next_check_at<=?
+            """,
+            (
+                STATUS_RESUMING,
+                retry_at,
+                now.isoformat(),
+                int(account_user_id),
+                STATUS_FREE_PENDING,
+                now.isoformat(),
+            ),
+        )
+        return int(cur.rowcount or 0) == 1
 
 
 async def process_due_checks() -> int:
-    """Run due SpamBot checks / pending resumes. Returns actions count."""
+    """Run due SpamBot checks and idempotent pending resumes."""
     conn = get_connection()
     now = _now_iso()
     rows = conn.execute(
@@ -880,20 +965,27 @@ async def process_due_checks() -> int:
             if not SPAMBOT_AUTO_RESUME:
                 continue
             acc = accounts_svc.get_account(uid)
+            if accounts_svc.is_reauth_required(acc):
+                _upsert_state(uid, status=STATUS_IDLE, next_check_at=None)
+                continue
             cooldown = _parse_iso((acc or {}).get("cooldown_until"))
             if cooldown and cooldown > _now():
-                # push next_check to cooldown so we do not spin
                 _upsert_state(
                     uid,
                     status=STATUS_FREE_PENDING,
                     next_check_at=cooldown.isoformat(),
                 )
                 continue
-            await resume_account(uid, source="spambot_auto")
-            actions += 1
+            if not _claim_due_resume(uid):
+                continue
+            if await resume_account(uid, source="spambot_auto"):
+                actions += 1
+            continue
+        if status == STATUS_RESUMING:
+            if await resume_account(uid, source="spambot_auto"):
+                actions += 1
             continue
         if status == STATUS_CHECKING:
-            # Stuck CHECKING past next_check_at → re-check once (prior run may have crashed).
             await check_account(uid, force=True)
             actions += 1
             continue
@@ -901,7 +993,6 @@ async def process_due_checks() -> int:
             await check_account(uid, force=True)
             actions += 1
             continue
-        # idle or unknown: clear stale next_check
         _upsert_state(uid, status=status or STATUS_IDLE, next_check_at=None)
     return actions
 

@@ -94,6 +94,27 @@ def _retry_at_for_account(account_user_id: int, fallback_seconds: int) -> str:
     return (_now() + dt.timedelta(seconds=delay)).isoformat()
 
 
+_FOLLOWUP_PEERFLOOD_RETRY_SECONDS = 6 * 60 * 60
+
+
+def _global_pre_reply_blocked(
+    account_user_id: int,
+    target_user_id: int,
+    prepared_row: dict | None = None,
+) -> bool:
+    """Block autonomous pre-reply delivery while global First DM is paused."""
+    from services import runtime as runtime_svc
+
+    if not runtime_svc.is_worker_state_initialized():
+        return False
+    if runtime_svc.is_worker_enabled():
+        return False
+    row = prepared_row or {}
+    if row.get("source_inbox_id") is not None:
+        return False
+    return not store.has_incoming_reply(target_user_id, account_user_id)
+
+
 async def on_first_dm_sent(target_user_id: int, account_user_id: int, text: str) -> None:
     store.create_after_first_dm(target_user_id, account_user_id, text)
 
@@ -672,6 +693,39 @@ async def _send_prepared_action(
 ) -> str:
     """Return sent | failed | ambiguous after a durable prepare."""
     prepared_row = dialog_delivery.get(target_user_id, action_kind) or {}
+    message_kind = str(
+        prepared_row.get("message_kind") or str(action_kind).split(":", 1)[0]
+    )
+    if message_kind == dialog_delivery.KIND_FOLLOWUP and store.has_incoming_reply(
+        target_user_id, account_user_id
+    ):
+        dialog_delivery.mark_failed(
+            target_user_id, action_kind, "incoming_reply_exists"
+        )
+        store.set_stage(
+            target_user_id, store.STAGE_WAITING_REPLY, clear_auto_link=True
+        )
+        logger.info(
+            "Silence follow-up cancelled after durable incoming reply "
+            "account={} target={}",
+            account_user_id,
+            target_user_id,
+        )
+        return "blocked"
+    if _global_pre_reply_blocked(
+        account_user_id, target_user_id, prepared_row
+    ):
+        dialog_delivery.mark_failed(
+            target_user_id, action_kind, "global_pause_pre_reply_blocked"
+        )
+        logger.info(
+            "Pre-reply autonomous delivery blocked by global pause "
+            "kind={} account={} target={}",
+            message_kind,
+            account_user_id,
+            target_user_id,
+        )
+        return "blocked"
     original_text = str(prepared_row.get("text") or text or "")
     clean_text = ai_dialog.sanitize_post_first_dm_text(original_text)
     if not clean_text:
@@ -781,6 +835,20 @@ async def _send_prepared_action(
         except Exception as sp_exc:
             logger.exception("SpamBot from scheduled dialog: {}", sp_exc)
             pacing.set_paused(account_user_id, "PeerFlood", paused=True)
+        if message_kind == dialog_delivery.KIND_FOLLOWUP:
+            retry_at = dialog_delivery.mark_failed_with_backoff(
+                target_user_id,
+                action_kind,
+                "PeerFlood",
+                delay_seconds=_FOLLOWUP_PEERFLOOD_RETRY_SECONDS,
+            )
+            logger.warning(
+                "Silence follow-up held after PeerFlood account={} target={} retry_at={}",
+                account_user_id,
+                target_user_id,
+                retry_at,
+            )
+            return "peerflood"
         dialog_delivery.mark_failed(target_user_id, action_kind, "PeerFlood")
         return "retry"
     except (UserPrivacyRestrictedError, UserIsBlockedError, ChatWriteForbiddenError):
@@ -1042,6 +1110,17 @@ async def recover_ambiguous_dialog_messages() -> int:
     recovered = 0
     rows = dialog_delivery.list_stale_prepared(older_than_seconds=90, limit=100)
     for row in rows:
+        account = int(row["account_user_id"])
+        target = int(row["target_user_id"])
+        if _global_pre_reply_blocked(account, target, row):
+            logger.info(
+                "Prepared pre-reply action held by global pause kind={} "
+                "account={} target={}",
+                row.get("message_kind") or row.get("action_kind"),
+                account,
+                target,
+            )
+            continue
         if await _reconcile_prepared_action(row):
             recovered += 1
     return recovered
@@ -1058,7 +1137,7 @@ async def process_due_auto_links(limit: int = 25) -> int:
     automatic path is promo -> apology -> link-opening instruction. Existing dialogs
     continue even when new First DM sending is paused.
     """
-    # Main-menu pause stops only new First DM. Existing dialogs continue.
+    # Existing dialogs continue only after a durable incoming reply.
     due = store.list_due_auto_links(limit=max(1, int(limit)))
     sent_count = 0
     for due_row in due:
@@ -1078,6 +1157,15 @@ async def process_due_auto_links(limit: int = 25) -> int:
             try:
                 current = store.get_dialog(target)
                 if not current or current.get("stage") == store.STAGE_CLOSED:
+                    continue
+                if _global_pre_reply_blocked(account, target, current):
+                    logger.warning(
+                        "Scheduled post-reply action held without durable incoming proof "
+                        "account={} target={} stage={}",
+                        account,
+                        target,
+                        current.get("stage"),
+                    )
                     continue
                 cooldown = _account_cooldown_seconds(account)
                 if cooldown > 0:
@@ -1282,13 +1370,33 @@ async def process_due_auto_links(limit: int = 25) -> int:
     return sent_count
 
 async def process_due_followups(limit: int = 50) -> int:
-    """Send one crash-safe silence follow-up after the First DM."""
+    """Send one crash-safe silence follow-up after the First DM.
+
+    The global First DM switch also controls every autonomous pre-reply touch.
+    Real incoming dialogs are processed by the durable inbox path instead.
+    """
+    from services import runtime as runtime_svc
+
+    if not runtime_svc.is_worker_enabled():
+        return 0
+
     due = store.list_due_followups(limit=max(1, int(limit)))
     n = 0
     for d in due:
         target = int(d["target_user_id"])
         account = int(d["account_user_id"])
         outgoing = int(d.get("outgoing_count") or 0)
+        if store.has_incoming_reply(target, account):
+            store.set_stage(
+                target, store.STAGE_WAITING_REPLY, clear_auto_link=True
+            )
+            logger.info(
+                "Silence follow-up cancelled because incoming reply already exists "
+                "account={} target={}",
+                account,
+                target,
+            )
+            continue
         if opt_out_svc.is_opted_out(target):
             store.close_for_opt_out(target)
             await _cleanup_disabled_account(account)
@@ -1313,17 +1421,44 @@ async def process_due_followups(limit: int = 50) -> int:
         async with lock:
             _inflight.add(key)
             try:
+                if not runtime_svc.is_worker_enabled():
+                    return n
                 text = ai_dialog.followup_silence_text()
                 if not dialog_delivery.prepare(
                     target, account, dialog_delivery.KIND_FOLLOWUP, text
                 ):
+                    retry_at = dialog_delivery.retry_not_before(
+                        target, dialog_delivery.KIND_FOLLOWUP
+                    )
+                    if retry_at:
+                        store.set_stage(
+                            target,
+                            store.STAGE_WAITING_REPLY,
+                            auto_link_at=retry_at,
+                        )
                     continue
                 result = await _send_prepared_action(
                     account, target, dialog_delivery.KIND_FOLLOWUP, text
                 )
                 if result == "sent":
                     n += 1
-                    logger.info("Silence follow-up sent target={} account={}", target, account)
+                    logger.info(
+                        "Silence follow-up sent target={} account={}", target, account
+                    )
+                elif result == "peerflood":
+                    retry_at = dialog_delivery.retry_not_before(
+                        target, dialog_delivery.KIND_FOLLOWUP
+                    ) or (
+                        _now()
+                        + dt.timedelta(seconds=_FOLLOWUP_PEERFLOOD_RETRY_SECONDS)
+                    ).isoformat()
+                    current = store.get_dialog(target)
+                    if current and current.get("stage") != store.STAGE_CLOSED:
+                        store.set_stage(
+                            target,
+                            store.STAGE_WAITING_REPLY,
+                            auto_link_at=retry_at,
+                        )
                 elif result in {"failed", "retry", "cooldown"}:
                     current = store.get_dialog(target)
                     if current and current.get("stage") != store.STAGE_CLOSED:

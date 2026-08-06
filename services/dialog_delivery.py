@@ -143,13 +143,17 @@ def prepare(
 
         existing = conn.execute(
             """
-            SELECT status FROM dialog_outbox
+            SELECT status, recovery_next_at FROM dialog_outbox
              WHERE target_user_id=? AND action_kind=?
             """,
             (target, action_key),
         ).fetchone()
         if existing and str(existing["status"]) in {STATUS_PREPARED, STATUS_SENT}:
             return False
+        if existing and str(existing["status"]) == STATUS_FAILED:
+            retry_at = str(existing["recovery_next_at"] or "")
+            if retry_at and retry_at > now:
+                return False
 
         purge_due = (
             _now() + dt.timedelta(days=LOCAL_DIALOG_TEXT_RETENTION_DAYS)
@@ -431,7 +435,8 @@ def mark_failed(target_user_id: int, action_kind: str, error: str) -> None:
         conn.execute(
             """
             UPDATE dialog_outbox
-               SET status=?, last_error=?, updated_at=?
+               SET status=?, last_error=?, updated_at=?,
+                   recovery_next_at=NULL, recovery_last_error=NULL
              WHERE target_user_id=? AND action_kind=? AND status=?
             """,
             (
@@ -443,6 +448,46 @@ def mark_failed(target_user_id: int, action_kind: str, error: str) -> None:
                 STATUS_PREPARED,
             ),
         )
+
+
+def mark_failed_with_backoff(
+    target_user_id: int,
+    action_kind: str,
+    error: str,
+    *,
+    delay_seconds: int,
+) -> str:
+    """Fail one prepared action and persist a retry-not-before timestamp."""
+    now = _now()
+    retry_at = (now + dt.timedelta(seconds=max(1, int(delay_seconds)))).isoformat()
+    conn = get_connection()
+    with db_lock(), conn:
+        conn.execute(
+            """
+            UPDATE dialog_outbox
+               SET status=?, last_error=?, updated_at=?,
+                   recovery_attempts=COALESCE(recovery_attempts, 0) + 1,
+                   recovery_next_at=?, recovery_last_error=?
+             WHERE target_user_id=? AND action_kind=? AND status=?
+            """,
+            (
+                STATUS_FAILED,
+                str(error)[:500],
+                now.isoformat(),
+                retry_at,
+                str(error)[:500],
+                int(target_user_id),
+                str(action_kind),
+                STATUS_PREPARED,
+            ),
+        )
+    return retry_at
+
+
+def retry_not_before(target_user_id: int, action_kind: str) -> str | None:
+    row = get(target_user_id, action_kind)
+    value = str((row or {}).get("recovery_next_at") or "")
+    return value or None
 
 
 def get(target_user_id: int, action_kind: str) -> dict[str, Any] | None:

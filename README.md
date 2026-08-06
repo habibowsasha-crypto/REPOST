@@ -1,5 +1,18 @@
-# Channel DM Bot v1.0.79
+# Channel DM Bot v1.0.80
 
+
+## Changes in v1.0.80 - global pause and PeerFlood loop fix
+
+- Global First DM pause blocks new First DM and every autonomous pre-reply touch, including silence follow-up.
+- Only dialogs with durable incoming user evidence continue while the global pause is active.
+- The send boundary and ambiguous-outbox recovery repeat the same gate, preventing scheduler and restart races.
+- A PeerFlood caused by silence follow-up creates a persistent 6-hour hold for that exact follow-up.
+- Repeated PeerFlood inside one incident no longer creates repeated main administrator notifications or repeated SpamBot checks.
+- SpamBot resume is transactionally claimed and idempotent. Duplicate or stale resume rows do not create another resume notification.
+- Pending inbox rows, crash-safe outbox records, account ownership, opt-out and the approved dialog funnel remain intact.
+- Startup migration repairs old prepared pre-reply follow-ups and stale FREE_PENDING or RESUMING rows without clearing the database.
+
+This section supersedes the v1.0.79 statement that every existing dialog continues during global pause. A dialog continues only after a real incoming user message is durably recorded.
 
 ## Changes in v1.0.79 - active dialogs continue during First DM pause
 
@@ -487,8 +500,8 @@ Routine admin notifications are sent only for a successful First DM. Important s
 
 ## Confirmed project rules preserved
 
-- Main-menu pause stops only new First DM from the queue.
-- Existing dialogs continue during the pause.
+- Main-menu pause stops new First DM and all autonomous touches before the first incoming reply.
+- Only dialogs with a durably recorded incoming user message continue during the pause.
 - A disabled account finishes its own active dialogs and receives no new leads.
 - Dialogs are not transferred between accounts.
 - Only First DM counts toward First-DM limits and pacing.
@@ -530,7 +543,7 @@ The Telegram user-session must still exist when cleanup becomes due. The account
 
 ## Quick live test
 
-1. Deploy v1.0.72 over the existing volume/database.
+1. Deploy v1.0.80 over the existing Railway service and mounted volume.
 2. Confirm the new dashboard and all-time First-DM counter.
 3. Send a test First DM and confirm only one routine admin notification.
 4. Continue the dialog and confirm no reply/link/follow-up push notifications appear.
@@ -546,7 +559,7 @@ pip install -r requirements.txt
 pytest -q
 ```
 
-The release archive includes the full project plan, patch report and test report under `Аудиты/Мысли/`. Real Telegram delivery and revoke behavior must still be checked by the owner on test accounts.
+The release archive includes the full project plan, patch report and test report under `AUDITS/NOTES/`. Real Telegram delivery and revoke behavior must still be checked by the owner on test accounts.
 
 ## Security note
 

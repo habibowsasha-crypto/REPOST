@@ -1,7 +1,7 @@
 """Start / pause dispatcher worker UI - unified style.
 
-Pause stops only new First DM from the queue.
-Active dialogs and group monitoring continue.
+Pause stops new First DM and every autonomous touch before the first reply.
+Only dialogs proven by an incoming user message continue.
 """
 
 from __future__ import annotations
@@ -43,8 +43,9 @@ def _worker_body() -> str:
         kv("Мониторинг (очередь)", f"{mon['connected_count']} акк.", icon="📡"),
         kv("Pending", str(pending), icon="⏳"),
         "",
-        "Пауза = нет новых First DM из очереди.",
-        "Активные диалоги и сбор пользователей продолжаются.",
+        "Пауза = нет новых First DM и silence follow-up до первого ответа.",
+        "Продолжаются только реальные диалоги после входящего сообщения.",
+        "Сбор пользователей и мониторинг чатов продолжаются.",
     )
 
 

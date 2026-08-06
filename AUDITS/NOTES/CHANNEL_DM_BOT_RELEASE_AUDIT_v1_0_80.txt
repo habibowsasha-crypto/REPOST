@@ -1,0 +1,53 @@
+CHANNEL DM BOT RELEASE AUDIT v1.0.80
+
+SCOPE CONTROL
+- Source base verified against the supplied PROJECT_SOURCE v1.0.79 archive.
+- Production code changes are limited to the target modules and direct release dependencies named in HANDOFF.md.
+- No v1.0.81 change is included.
+
+FUNCTIONAL SAFETY
+- Global pause blocks due silence follow-up before due-row selection.
+- Global pause is rechecked inside the dialog lock.
+- The final send boundary blocks a prepared autonomous pre-reply action if pause changes during a race.
+- Ambiguous outbox recovery applies the same gate.
+- Real incoming dialogs continue only with durable inbox or compatible history evidence for the original account.
+- Pending inbox and inbox-linked prepared outbox records remain preserved.
+- PeerFlood from silence follow-up receives a persistent retry hold.
+- Repeated PeerFlood main notification and SpamBot check are deduplicated.
+- Resume transition is transactional and duplicate resume notification is suppressed.
+- Authorization-lost accounts remain excluded.
+
+DATABASE
+- Migration source state: v1.0.79 temporary SQLite database.
+- v1.0.80 migration run count during audit: two.
+- Migration row count after repeated initialization: one.
+- PRAGMA integrity_check: ok.
+- Global worker pause value preserved.
+- Existing account, dialog and inbox rows preserved.
+- Old prepared source-less follow-up changed to safe failed hold state.
+- Prepared action linked to a real incoming inbox row preserved.
+- No database clearing, replacement or destructive reset is required.
+
+CODE AND TEST GATES
+- Full pytest from working tree: 293 passed.
+- Full pytest from clean extracted release: 293 passed.
+- Python AST parse and compile: PASS.
+- compileall with external pycache directory: PASS.
+- Production import check: 42 modules imported.
+- Dependency pins: PASS.
+- ruff and mypy: SKIP because the exact pinned versions were unavailable in the package mirror.
+
+RELEASE HYGIENE
+- ZIP decompression test: PASS.
+- ZIP traversal check: PASS.
+- ZIP symlink check: PASS.
+- ASCII-only paths: PASS.
+- Normal short hyphen policy: PASS.
+- Embedded-secret pattern scan: PASS.
+- No .env, SQLite database, Telegram session, production log, cache or __pycache__ in ZIP.
+- Working tree and clean extracted release content comparison: PASS.
+
+LIVE VERIFICATION LIMIT
+- Local tests did not send messages through a real Telegram user account.
+- Local tests did not deploy to the owner's Railway service or open the production database.
+- One controlled Railway production verification and log review is still required after deployment.

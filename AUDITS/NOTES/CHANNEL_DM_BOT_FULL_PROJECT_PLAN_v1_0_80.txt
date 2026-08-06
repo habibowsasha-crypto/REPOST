@@ -1,0 +1,62 @@
+CHANNEL DM BOT FULL PROJECT PLAN v1.0.80
+
+CURRENT RELEASE
+- Version: 1.0.80.
+- Base: confirmed PROJECT_SOURCE v1.0.79.
+- Scope: global pause pre-reply safety, PeerFlood loop break and idempotent notifications.
+- No v1.0.81 work is included.
+
+AUTHORITATIVE GLOBAL PAUSE RULE
+- Global pause stops every new First DM.
+- Global pause stops silence follow-up and every other autonomous touch before the person's first incoming reply.
+- A dialog may continue during global pause only after a real incoming user message is durably recorded for that target and owning account.
+- Pending incoming messages count as durable evidence before AI processing, so a restart does not lose the right to continue the real dialog.
+- Group monitoring and lead collection continue.
+
+PEERFLOOD RULE
+- A real PeerFlood still applies the approved account cooldown.
+- One incident starts one SpamBot check and one main administrator notification.
+- Repeated PeerFlood during the same rolling incident does not restart SpamBot or repeat the main notification.
+- The approved fifth-hit extension remains separate and may notify once.
+- A PeerFlood from silence follow-up places that exact action on a persistent 6-hour hold.
+- SpamBot free status cannot override the global pre-reply pause.
+
+RESUME RULE
+- Automatic resume is atomically claimed.
+- Resume clears only the transport pause and SpamBot state.
+- Global First DM pause remains authoritative.
+- Duplicate or stale resume transitions do not create repeated notifications.
+- Reauthorization-required accounts are not resumed automatically.
+
+DURABILITY AND OWNERSHIP
+- The existing SQLite database is migrated in place.
+- The database must not be cleared.
+- Pending inbox rows are preserved.
+- Crash-safe outbox records are preserved and reconciled.
+- A dialog stays assigned to the account that sent its First DM.
+- No cross-account dialog transfer is allowed.
+
+UNCHANGED APPROVED PRODUCT RULES
+- First DM intervals, daily limits and global spacing.
+- short_hook wording and validation.
+- magnet and legacy First DM modes.
+- Promo, smoothing apology and link-opening instruction sequence.
+- Five-message outgoing maximum.
+- Calm refusal, aggressive refusal and stop-request routing.
+- Global opt-out.
+- Non-text input behavior.
+- Phrase uniqueness and retention behavior.
+
+RAILWAY PRODUCTION CHECK
+- Deploy v1.0.80 over the existing service and mounted /data volume.
+- Do not delete or recreate /data/bot.db.
+- Confirm startup logs show version 1.0.80 and successful database initialization.
+- Keep global First DM paused for the first verification window.
+- Confirm no silence follow-up is sent to users who have not replied.
+- Send one controlled incoming reply to an existing dialog and confirm that same owning account continues the dialog.
+- Confirm no duplicate PeerFlood or resume notification appears for one incident.
+- Confirm pending queue count and historical statistics remain present.
+
+NEXT VERSION
+- Do not start v1.0.81 automatically.
+- Any further change requires a new explicit task and must build from this confirmed v1.0.80 archive and SHA-256.

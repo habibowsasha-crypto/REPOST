@@ -1,0 +1,39 @@
+CHANNEL DM BOT PATCH REPORT v1.0.80
+
+BASE
+- Built strictly from PROJECT_SOURCE v1.0.79 in the supplied single handoff archive.
+- Database clearing is not required and must not be performed.
+- Release version is exactly 1.0.80.
+
+ROOT CAUSE
+- The global First DM switch gated the First DM queue but did not gate due silence follow-up work.
+- A silence follow-up could therefore send to a person who had never replied while the administrator believed First DM activity was paused.
+- PeerFlood then entered SpamBot free and automatic resume, after which the same autonomous action could be attempted again.
+- Repeated PeerFlood and resume transitions could also repeat administrator notifications.
+
+FIXED
+- process_due_followups returns before querying due rows when the global worker is paused.
+- The worker rechecks the pause inside the per-dialog lock before preparing an outbox row.
+- The final send boundary blocks every source-less autonomous pre-reply action during explicit global pause.
+- Ambiguous prepared-message recovery applies the same global pre-reply gate.
+- Due promo, apology and link-help actions may continue during global pause only when durable incoming evidence exists for the same target and owning account.
+- Durable incoming evidence uses dialog_inbox first and retained dialog history only as a compatibility fallback.
+- A silence follow-up that receives PeerFlood is failed with a persistent 6-hour retry-not-before timestamp.
+- Repeated PeerFlood inside the same ten-minute incident suppresses repeated main notifications and repeated SpamBot checks.
+- The fifth PeerFlood escalation remains active and emits one separate extension notification.
+- SpamBot automatic resume uses an atomic FREE_PENDING to RESUMING claim.
+- Account resume and SpamBot state reset commit in one SQLite transaction.
+- Duplicate or stale resume attempts normalize state without another administrator notification.
+- Accounts requiring reauthorization are excluded from automatic resume.
+- The v1.0.80 startup migration holds old prepared silence follow-ups and normalizes stale FREE_PENDING or RESUMING states when the global worker is paused.
+- The migration is idempotent and does not delete the database, pending inbox rows, sent outbox history, dialogs, contacts or statistics.
+
+PRESERVED
+- Pending dialog inbox survives restart and remains assigned to the original account.
+- Crash-safe outbox prepare, reconcile and commit behavior remains enabled.
+- Dialogs are never transferred between Telegram accounts.
+- Approved First DM intervals, global spacing, daily limits and PeerFlood ranges are unchanged.
+- short_hook, magnet and legacy First DM rules are unchanged.
+- Promo, apology, link-help, Q&A, refusal, aggressive refusal, opt-out and maximum outgoing rules are unchanged.
+- Non-text incoming messages remain neutral or positive and continue the approved advertising branch.
+- Group monitoring and lead collection continue during global First DM pause.

@@ -913,6 +913,96 @@ def init_db() -> None:
             """
         )
 
+        # v1.0.80 keeps global pause authoritative for every pre-reply
+        # autonomous touch while still unblocking durable incoming dialogs. It
+        # also normalizes old FREE_PENDING rows without emitting startup notices.
+        migration_name = "v1_0_80_global_pause_pre_reply_loop_fix"
+        applied = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE name=?",
+            (migration_name,),
+        ).fetchone()
+        if not applied:
+            worker_row = conn.execute(
+                "SELECT value FROM runtime_meta WHERE key='dm_worker_enabled'"
+            ).fetchone()
+            worker_enabled = bool(
+                worker_row
+                and str(worker_row["value"] or "").strip().lower()
+                in {"1", "true", "yes", "on"}
+            )
+            if not worker_enabled:
+                next_first_dm_at = conn.execute(
+                    "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+120 seconds') AS value"
+                ).fetchone()["value"]
+                conn.execute(
+                    """
+                    UPDATE dialog_outbox
+                       SET status='failed',
+                           last_error='v1.0.80_global_pause_pre_reply_hold',
+                           recovery_next_at=NULL,
+                           recovery_last_error=NULL,
+                           updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     WHERE status='prepared'
+                       AND COALESCE(message_kind, action_kind)='followup'
+                       AND source_inbox_id IS NULL
+                       AND NOT EXISTS (
+                           SELECT 1
+                             FROM dialog_inbox i
+                             JOIN dialogs d
+                               ON d.target_user_id=dialog_outbox.target_user_id
+                            WHERE i.target_user_id=dialog_outbox.target_user_id
+                              AND i.account_user_id=dialog_outbox.account_user_id
+                              AND (d.first_dm_at IS NULL
+                                   OR julianday(i.received_at)>=julianday(d.first_dm_at))
+                       )
+                    """
+                )
+                conn.execute(
+                    """
+                    UPDATE accounts
+                       SET is_paused=0,
+                           pause_reason=NULL,
+                           cooldown_until=NULL,
+                           next_send_at=CASE
+                               WHEN next_send_at IS NOT NULL
+                                AND julianday(next_send_at) > julianday(?)
+                               THEN next_send_at
+                               ELSE ?
+                           END,
+                           peerflood_burst_applied_at=NULL,
+                           updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     WHERE COALESCE(auth_status, 'unknown')!='reauth_required'
+                       AND user_id IN (
+                           SELECT account_user_id
+                             FROM spambot_state
+                            WHERE status IN ('free_pending_resume', 'resuming')
+                       )
+                    """,
+                    (next_first_dm_at, next_first_dm_at),
+                )
+                conn.execute(
+                    """
+                    UPDATE spambot_state
+                       SET status='idle',
+                           last_reply='resumed:v1.0.80_dialog_unblock',
+                           next_check_at=NULL,
+                           limited_until=NULL,
+                           updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     WHERE status IN ('free_pending_resume', 'resuming')
+                       AND account_user_id IN (
+                           SELECT user_id FROM accounts
+                            WHERE COALESCE(auth_status, 'unknown')!='reauth_required'
+                       )
+                    """
+                )
+            conn.execute(
+                """
+                INSERT INTO schema_migrations(name, applied_at)
+                VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                """,
+                (migration_name,),
+            )
+
         # v1.0.66 restores the approved rule: a calm refusal is not terminal and may
         # still receive the promo. Cancel any unsent v1.0.65 soft-close action so a
         # restart cannot deliver the obsolete close and terminate the dialog.

@@ -132,6 +132,64 @@ def create_after_first_dm(target_user_id: int, account_user_id: int, first_text:
         )
 
 
+def has_incoming_reply(
+    target_user_id: int,
+    account_user_id: int | None = None,
+) -> bool:
+    """Return durable proof that the current dialog received a user reply.
+
+    The inbox row is written before processing, so pending messages count and the
+    proof survives restarts. History is a compatibility fallback for older rows.
+    """
+    target = int(target_user_id)
+    dialog = get_dialog(target)
+    if not dialog:
+        return False
+    owner = int(dialog.get("account_user_id") or 0)
+    if account_user_id is not None and owner != int(account_user_id):
+        return False
+    first_dm_at = str(dialog.get("first_dm_at") or "")
+    conn = get_connection()
+    params: list[Any] = [target, owner]
+    received_filter = ""
+    if first_dm_at:
+        received_filter = " AND julianday(received_at)>=julianday(?)"
+        params.append(first_dm_at)
+    row = conn.execute(
+        f"""
+        SELECT 1 FROM dialog_inbox
+         WHERE target_user_id=? AND account_user_id=?{received_filter}
+         LIMIT 1
+        """,
+        tuple(params),
+    ).fetchone()
+    if row is not None:
+        return True
+
+    first_dt: dt.datetime | None = None
+    if first_dm_at:
+        try:
+            first_dt = dt.datetime.fromisoformat(first_dm_at.replace("Z", "+00:00"))
+            if first_dt.tzinfo is None:
+                first_dt = first_dt.replace(tzinfo=dt.timezone.utc)
+        except (TypeError, ValueError):
+            first_dt = None
+    for item in dialog.get("history") or []:
+        if not isinstance(item, dict) or str(item.get("role") or "") != "user":
+            continue
+        if first_dt is None:
+            return True
+        try:
+            item_dt = dt.datetime.fromisoformat(str(item.get("at") or "").replace("Z", "+00:00"))
+            if item_dt.tzinfo is None:
+                item_dt = item_dt.replace(tzinfo=dt.timezone.utc)
+        except (TypeError, ValueError):
+            continue
+        if item_dt >= first_dt:
+            return True
+    return False
+
+
 def append_history(target_user_id: int, role: str, text: str) -> None:
     conn = get_connection()
     with db_lock(), conn:

@@ -58,6 +58,11 @@ def is_worker_enabled() -> bool:
     return val.lower() in {"1", "true", "yes", "on"}
 
 
+def is_worker_state_initialized() -> bool:
+    """Return whether the global First DM switch has a persisted value."""
+    return _get(KEY_WORKER) is not None
+
+
 def set_worker_enabled(enabled: bool) -> None:
     _set(KEY_WORKER, "1" if enabled else "0")
 
