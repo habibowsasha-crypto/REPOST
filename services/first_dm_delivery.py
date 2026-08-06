@@ -6,8 +6,9 @@ import datetime as dt
 import json
 from typing import Any
 
-from config import LOCAL_DIALOG_TEXT_RETENTION_DAYS, TELEGRAM_DIALOG_DELETE_DAYS
+from config import LOCAL_DIALOG_TEXT_RETENTION_DAYS
 from db.schema import db_lock, get_connection
+from services import dialog_retention_policy
 from services import phrases as phrases_svc
 
 STATUS_PREPARED = "prepared"
@@ -179,16 +180,14 @@ def commit_sent(
         except (TypeError, ValueError):
             sent_dt = _now()
             sent = sent_dt.isoformat()
-        telegram_delete_at = (
-            sent_dt + dt.timedelta(days=TELEGRAM_DIALOG_DELETE_DAYS)
-        ).isoformat()
+        telegram_delete_at = dialog_retention_policy.due_at(sent_dt)
         history_purge_at = (
             sent_dt + dt.timedelta(days=LOCAL_DIALOG_TEXT_RETENTION_DAYS)
         ).isoformat()
         event_key = f"{target}:{account}:{row['prepared_at']}"
 
         # Bound all previous archived attempts before activating the new one.
-        # This prevents an older 30-day cleanup from deleting this new dialog.
+        # This prevents an older cleanup job from deleting this new dialog.
         from services import dialog_archive
 
         dialog_archive.bound_previous_attempts(
@@ -239,11 +238,11 @@ def commit_sent(
             INSERT INTO dialogs (
                 target_user_id, account_user_id, stage, outgoing_count,
                 link_sent, auto_link_at, history_json, updated_at,
-                first_dm_at, first_dm_message_id, telegram_delete_at,
+                first_dm_at, first_dm_message_id, last_message_at, telegram_delete_at,
                 telegram_deleted_at, telegram_delete_next_attempt_at,
                 telegram_delete_attempts, telegram_delete_last_error,
                 history_purge_at, history_purged_at
-            ) VALUES (?, ?, ?, 1, 0, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, NULL, ?, NULL)
+            ) VALUES (?, ?, ?, 1, 0, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, NULL, ?, NULL)
             ON CONFLICT(target_user_id) DO UPDATE SET
                 account_user_id=excluded.account_user_id,
                 stage=excluded.stage,
@@ -263,16 +262,24 @@ def commit_sent(
                 first_dm_message_id=COALESCE(
                     dialogs.first_dm_message_id, excluded.first_dm_message_id
                 ),
-                telegram_delete_at=COALESCE(
-                    dialogs.telegram_delete_at, excluded.telegram_delete_at
-                ),
+                last_message_at=CASE
+                    WHEN dialogs.last_message_at IS NULL
+                         OR julianday(dialogs.last_message_at) < julianday(excluded.last_message_at)
+                    THEN excluded.last_message_at ELSE dialogs.last_message_at
+                END,
+                telegram_delete_at=excluded.telegram_delete_at,
+                telegram_deleted_at=NULL,
+                telegram_delete_next_attempt_at=NULL,
+                telegram_delete_attempts=0,
+                telegram_delete_last_error=NULL,
+                telegram_delete_abandoned_at=NULL,
                 history_purge_at=excluded.history_purge_at,
                 history_purged_at=NULL,
                 updated_at=excluded.updated_at
             """,
             (
                 target, account, final_stage, final_auto_link, history, now, sent,
-                telegram_message_id, telegram_delete_at, history_purge_at,
+                telegram_message_id, sent, telegram_delete_at, history_purge_at,
             ),
         )
         conn.execute(

@@ -7,6 +7,7 @@ from typing import Any, Optional
 
 from config import LOCAL_DIALOG_TEXT_RETENTION_DAYS
 from db.schema import db_lock, get_connection
+from services import dialog_retention_policy
 
 STATUS_PENDING = "pending"
 STATUS_PROCESSING = "processing"
@@ -90,6 +91,7 @@ def enqueue(
             """,
             (purge_due, purge_due, target),
         )
+        dialog_retention_policy.touch_dialog_activity(conn, target, received_dt.isoformat())
         return int(cur.lastrowid)
 
 

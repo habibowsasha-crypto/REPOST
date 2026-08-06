@@ -20,6 +20,9 @@ from config import (
     DM_GLOBAL_SPACING_MAX,
     DM_GLOBAL_SPACING_MIN,
     DIALOG_FLOW_VARIANT,
+    DIALOG_AUTO_DELETE_AFTER_DAYS,
+    DIALOG_AUTO_DELETE_ENABLED,
+    DIALOG_AUTO_DELETE_FOR_BOTH,
     OPENAI_API_KEY,
     SPAMBOT_AUTO_RESUME,
     TELEGRAM_DIALOG_DELETE_DAYS,
@@ -844,12 +847,24 @@ async def cb_retention(event: events.CallbackQuery.Event) -> None:
     from services import retention as retention_svc
 
     stats = retention_svc.retention_stats()
+    if DIALOG_AUTO_DELETE_ENABLED:
+        delete_scope = "у обеих сторон" if DIALOG_AUTO_DELETE_FOR_BOTH else "только у аккаунта"
+        telegram_policy = join(
+            f"📱 Telegram: через **{DIALOG_AUTO_DELETE_AFTER_DAYS} дней без активности**",
+            f"└ Удаление: {delete_scope}",
+            "└ Новое сообщение запускает отсчёт заново",
+            "└ Pending inbox и crash-safe outbox защищены",
+        )
+    else:
+        telegram_policy = join(
+            f"📱 Telegram: удалить через **{TELEGRAM_DIALOG_DELETE_DAYS} дней**",
+            "└ Режим совместимости: отсчёт от First DM",
+        )
     text = screen(
         "🗑",
         "Хранение и удаление",
         join(
-            f"📱 Telegram: удалить через **{TELEGRAM_DIALOG_DELETE_DAYS} дней**",
-            "└ С First DM и до конца диалога · у обеих сторон",
+            telegram_policy,
             "",
             f"🧠 База бота: очистить тексты через **{LOCAL_DIALOG_TEXT_RETENTION_DAYS} дней**",
             "└ Статусы, статистика и «Не писать» сохраняются",

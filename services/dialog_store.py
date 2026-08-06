@@ -6,7 +6,8 @@ import datetime as dt
 import json
 from typing import Any, Optional
 
-from config import LOCAL_DIALOG_TEXT_RETENTION_DAYS, TELEGRAM_DIALOG_DELETE_DAYS
+from config import LOCAL_DIALOG_TEXT_RETENTION_DAYS
+from services import dialog_retention_policy
 from db.schema import db_lock, get_connection
 
 STAGE_FIRST_DM_SENDING = "first_dm_sending"
@@ -63,7 +64,7 @@ def get_dialog(target_user_id: int) -> Optional[dict[str, Any]]:
                telegram_deleted_at, telegram_delete_next_attempt_at,
                telegram_delete_attempts, telegram_delete_last_error,
                history_purge_at, history_purged_at, lifecycle_completed_at,
-               telegram_delete_abandoned_at
+               last_message_at, telegram_delete_abandoned_at
           FROM dialogs
          WHERE target_user_id=?
         """,
@@ -84,9 +85,7 @@ def create_after_first_dm(target_user_id: int, account_user_id: int, first_text:
     # Reuse auto_link_at while stage=waiting_reply as "follow-up due at"
     first_dm_at = now
     follow_at = (_now() + dt.timedelta(hours=FOLLOWUP_DELAY_HOURS)).isoformat()
-    telegram_delete_at = (
-        _now() + dt.timedelta(days=TELEGRAM_DIALOG_DELETE_DAYS)
-    ).isoformat()
+    telegram_delete_at = dialog_retention_policy.due_at(first_dm_at)
     history_purge_at = (
         _now() + dt.timedelta(days=LOCAL_DIALOG_TEXT_RETENTION_DAYS)
     ).isoformat()
@@ -98,8 +97,8 @@ def create_after_first_dm(target_user_id: int, account_user_id: int, first_text:
             INSERT INTO dialogs (
                 target_user_id, account_user_id, stage, outgoing_count,
                 link_sent, auto_link_at, history_json, updated_at,
-                first_dm_at, telegram_delete_at, history_purge_at
-            ) VALUES (?, ?, ?, 1, 0, ?, ?, ?, ?, ?, ?)
+                first_dm_at, last_message_at, telegram_delete_at, history_purge_at
+            ) VALUES (?, ?, ?, 1, 0, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(target_user_id) DO UPDATE SET
                 account_user_id=excluded.account_user_id,
                 stage=excluded.stage,
@@ -108,9 +107,14 @@ def create_after_first_dm(target_user_id: int, account_user_id: int, first_text:
                 auto_link_at=excluded.auto_link_at,
                 history_json=excluded.history_json,
                 first_dm_at=COALESCE(dialogs.first_dm_at, excluded.first_dm_at),
-                telegram_delete_at=COALESCE(
-                    dialogs.telegram_delete_at, excluded.telegram_delete_at
-                ),
+                last_message_at=CASE
+                    WHEN dialogs.last_message_at IS NULL
+                    THEN excluded.last_message_at ELSE dialogs.last_message_at
+                END,
+                telegram_delete_at=CASE
+                    WHEN dialogs.telegram_delete_at IS NULL
+                    THEN excluded.telegram_delete_at ELSE dialogs.telegram_delete_at
+                END,
                 history_purge_at=COALESCE(
                     dialogs.history_purge_at, excluded.history_purge_at
                 ),
@@ -126,9 +130,13 @@ def create_after_first_dm(target_user_id: int, account_user_id: int, first_text:
                 json.dumps(history, ensure_ascii=False),
                 now,
                 first_dm_at,
+                first_dm_at,
                 telegram_delete_at,
                 history_purge_at,
             ),
+        )
+        dialog_retention_policy.touch_dialog_activity(
+            conn, int(target_user_id), first_dm_at
         )
 
 
@@ -305,7 +313,7 @@ def list_due_auto_links(limit: int = 50) -> list[dict[str, Any]]:
                first_dm_at, first_dm_message_id, telegram_delete_at,
                telegram_deleted_at, telegram_delete_next_attempt_at,
                telegram_delete_attempts, telegram_delete_last_error,
-               history_purge_at, history_purged_at
+               history_purge_at, history_purged_at, last_message_at
           FROM dialogs
          WHERE auto_link_at IS NOT NULL
            AND auto_link_at <= ?
@@ -349,7 +357,7 @@ def list_due_followups(limit: int = 50) -> list[dict[str, Any]]:
                first_dm_at, first_dm_message_id, telegram_delete_at,
                telegram_deleted_at, telegram_delete_next_attempt_at,
                telegram_delete_attempts, telegram_delete_last_error,
-               history_purge_at, history_purged_at
+               history_purge_at, history_purged_at, last_message_at
           FROM dialogs
          WHERE stage=?
            AND auto_link_at IS NOT NULL
@@ -408,7 +416,7 @@ def has_open_for_account(account_user_id: int) -> bool:
 
 
 def count_retention_waiting_for_account(account_user_id: int) -> int:
-    """Completed attempts that only wait for 30-day Telegram cleanup."""
+    """Completed attempts that still wait for Telegram cleanup."""
     conn = get_connection()
     placeholders = ",".join("?" for _ in TERMINAL_STAGES)
     row = conn.execute(

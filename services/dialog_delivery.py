@@ -8,6 +8,7 @@ from typing import Any
 
 from config import LOCAL_DIALOG_TEXT_RETENTION_DAYS
 from db.schema import db_lock, get_connection
+from services import dialog_retention_policy
 from services import phrases as phrases_svc
 
 KIND_AUTO_LINK = "auto_link"
@@ -397,6 +398,7 @@ def commit_sent(
                 target,
             ),
         )
+        dialog_retention_policy.touch_dialog_activity(conn, target, str(sent))
         if bool(transition.get("mark_contact_completed", False)):
             conn.execute(
                 """

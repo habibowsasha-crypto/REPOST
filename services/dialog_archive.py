@@ -92,12 +92,12 @@ def archive_current_attempt(
                 telegram_delete_next_attempt_at, telegram_delete_attempts,
                 telegram_delete_last_error, telegram_delete_until_message_id,
                 next_attempt_first_dm_at, history_purge_at, history_purged_at,
-                lifecycle_completed_at, telegram_delete_abandoned_at,
+                lifecycle_completed_at, last_message_at, telegram_delete_abandoned_at,
                 first_dm_text, first_dm_prepared_at, first_dm_sent_at,
                 first_dm_outbox_status, dialog_outbox_json, dialog_inbox_json,
                 archived_reason, archived_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL,
-                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 target,
@@ -118,6 +118,7 @@ def archive_current_attempt(
                 history_purge_at,
                 d.get("history_purged_at"),
                 d.get("lifecycle_completed_at"),
+                d.get("last_message_at"),
                 d.get("telegram_delete_abandoned_at"),
                 str(f.get("text") or ""),
                 f.get("prepared_at"),
