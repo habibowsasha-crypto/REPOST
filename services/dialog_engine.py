@@ -1341,6 +1341,36 @@ def _defer_or_abandon_dialog_recovery(
     return True
 
 
+def _defer_peerflood_recovery_unlimited(
+    row: dict,
+    *,
+    delay_seconds: int,
+) -> bool:
+    """Defer ambiguous PeerFlood recovery without any attempt cap.
+
+    The established-dialog PeerFlood guard promises unlimited retries. Ambiguous
+    delivery reconciliation is part of the same dialog delivery path, so it must
+    never close a dialog merely because several history checks hit PeerFlood.
+    """
+    target = int(row["target_user_id"])
+    action_key = str(row["action_kind"])
+    account = int(row["account_user_id"])
+    kind = str(row.get("message_kind") or action_key.split(":", 1)[0])
+    attempts = dialog_delivery.defer_recovery(
+        target, action_key, "PeerFlood", delay_seconds=delay_seconds
+    )
+    logger.warning(
+        "Dialog PeerFlood recovery deferred without limit kind={} account={} "
+        "target={} attempt={} retry_sec={}",
+        kind,
+        account,
+        target,
+        attempts,
+        delay_seconds,
+    )
+    return False
+
+
 async def _reconcile_prepared_action(row: dict) -> bool:
     target = int(row["target_user_id"])
     account = int(row["account_user_id"])
@@ -1382,6 +1412,16 @@ async def _reconcile_prepared_action(row: dict) -> bool:
                 delay_seconds=max(900, seconds),
             )
         if isinstance(exc, PeerFloodError):
+            gate_until = dialog_peerflood_gate.activate(account)
+            if gate_until:
+                logger.warning(
+                    "Dialog PeerFlood account gate closed by recovery account={} "
+                    "target={} kind={} retry_at={}",
+                    account,
+                    target,
+                    kind,
+                    gate_until,
+                )
             try:
                 from services import spambot as spambot_svc
 
@@ -1395,16 +1435,34 @@ async def _reconcile_prepared_action(row: dict) -> bool:
                     type(sp_exc).__name__,
                 )
                 pacing.set_paused(account, "PeerFlood", paused=True)
+            if _dialog_peerflood_guard_enabled():
+                return _defer_peerflood_recovery_unlimited(
+                    row,
+                    delay_seconds=_peerflood_guard_retry_seconds(account),
+                )
             return _defer_or_abandon_dialog_recovery(
                 row,
                 reason="PeerFlood",
                 max_attempts=_DIALOG_RECOVERY_GENERIC_MAX_ATTEMPTS,
-                delay_seconds=(
-                    _peerflood_guard_retry_seconds(account)
-                    if _dialog_peerflood_guard_enabled()
-                    else _DIALOG_PEERFLOOD_RETRY_SECONDS
-                ),
+                delay_seconds=_DIALOG_PEERFLOOD_RETRY_SECONDS,
             )
+        if isinstance(exc, InputUserDeactivatedError):
+            dialog_delivery.abandon_recovery(target, action_key, "user_deleted")
+            source_inbox_id = row.get("source_inbox_id")
+            if source_inbox_id is not None:
+                dialog_inbox.mark_ignored(int(source_inbox_id), "user_deleted")
+            dialog_inbox.ignore_pending_for_target(
+                target, "user_deleted", include_hard_stop=True
+            )
+            logger.warning(
+                "Dialog recovery closed because Telegram user is deleted "
+                "kind={} account={} target={}",
+                kind,
+                account,
+                target,
+            )
+            await _cleanup_disabled_account(account)
+            return True
         if account_auth.is_auth_loss_error(exc):
             await account_auth.register_auth_loss(account, exc, notify=True)
             await monitor_svc.disconnect_account(account, cancel_tasks=True)
