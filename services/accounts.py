@@ -472,7 +472,7 @@ def _format_dashboard_wait(seconds: float) -> str:
 
 
 def dashboard_account_line(acc: dict[str, Any]) -> str:
-    """Compact entity-aware account status block for the main dashboard."""
+    """Detailed entity-aware account status block."""
     from services import dialog_store as dialog_store_svc
     from services import pacing as pacing_svc
     from services import queue as queue_svc
@@ -545,7 +545,7 @@ def dashboard_account_line(acc: dict[str, Any]) -> str:
 
 
 def dashboard_accounts_block(*, limit: int = 8) -> str:
-    """Multi-line account list for the main menu."""
+    """Multi-line account list for the detailed account-style dashboard."""
     rows = list_accounts()
     if not rows:
         return "└ Аккаунты ещё не добавлены"
@@ -554,6 +554,79 @@ def dashboard_accounts_block(*, limit: int = 8) -> str:
     if extra > 0:
         blocks.append(f"… ещё {extra} в разделе «Аккаунты»")
     return "\n\n".join(blocks)
+
+
+def dashboard_compact_account_line(acc: dict[str, Any]) -> str:
+    """One-line account summary for the main dashboard.
+
+    Keep timers visible while making ten accounts fit comfortably in the
+    Telegram message. Detailed account screens continue to use
+    ``dashboard_account_line`` unchanged.
+    """
+    from services import dialog_store as dialog_store_svc
+    from services import pacing as pacing_svc
+    from services import queue as queue_svc
+
+    account_id = int(acc["user_id"])
+    label = format_account_label(acc, include_id=False)
+    if len(label) > 28:
+        label = label[:27] + "…"
+
+    dialogs = dialog_store_svc.count_open_for_account(account_id)
+    available = queue_svc.count_available_for_account(account_id)
+    participates = bool(acc.get("participates"))
+    paused = bool(acc.get("is_paused"))
+
+    if is_reauth_required(acc):
+        status = "🔴", "REAUTH"
+    elif paused:
+        reason = str(acc.get("pause_reason") or "пауза").strip().lower()
+        if "peerflood" in reason:
+            code = "PF"
+        elif "flood" in reason:
+            code = "FW"
+        else:
+            code = "ПАУЗА"
+        left = format_cooldown_left(acc)
+        if left:
+            status = "🔴", f"⏱ {code} {left.lstrip('~')}"
+        else:
+            status = "🔴", code
+    elif not participates:
+        status = "🟡", "OFF"
+    else:
+        ready, reason = pacing_svc.account_is_send_ready(acc)
+        account_wait = pacing_svc.seconds_until_account_ready(acc)
+        if reason == "daily_limit":
+            status = "🟠", "ЛИМИТ"
+        elif account_wait > 0:
+            status = "🟢", f"⏱ {_format_dashboard_wait(account_wait)}"
+        else:
+            global_wait = pacing_svc.seconds_until_global_ready()
+            if global_wait > 0:
+                status = "🟢", f"⏱ общ. {_format_dashboard_wait(global_wait)}"
+            elif ready:
+                status = "🟢", "ГОТОВ"
+            else:
+                status = "🟢", "ЖДЁТ"
+
+    icon, detail = status
+    return (
+        f"{icon} **{label}** · {detail} · "
+        f"лиды **{available}** · 💬 **{dialogs}**"
+    )
+
+
+def dashboard_compact_accounts_block(*, limit: int = 10) -> str:
+    """Compact one-line account list used only on the main dashboard."""
+    rows = list_accounts()
+    if not rows:
+        return "└ Аккаунты ещё не добавлены"
+    lines = [dashboard_compact_account_line(a) for a in rows[:limit]]
+    extra = len(rows) - limit
+    if extra > 0:
+        lines.append(f"… ещё {extra} в разделе «Аккаунты»")
+    return "\n".join(lines)
 
 
 def set_dm_interval(

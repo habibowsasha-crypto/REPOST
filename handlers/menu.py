@@ -116,7 +116,7 @@ def _dashboard_text() -> str:
     )
     closed_today = dialog_store_svc.count_closed_today()
     account_count = accounts_svc.count_accounts()
-    acc_block = accounts_svc.dashboard_accounts_block(limit=8)
+    acc_block = accounts_svc.dashboard_compact_accounts_block(limit=10)
     reauth_count = accounts_svc.count_reauth_required()
     auth_warning = (
         f"⚠️ **{reauth_count} аккаунт требует повторного входа**"
@@ -144,9 +144,9 @@ def _dashboard_text() -> str:
         ai_line = "🤖 AI: 🔴 выключен"
     mon = monitor_svc.monitor_status()
     monitor_line = (
-        f"📡 Мониторинг: ✅ активен · {mon['connected_count']} акк."
+        f"📡 Мониторинг: ✅ **{mon['connected_count']}/{account_count}**"
         if mon.get("running")
-        else "📡 Мониторинг: ❌ остановлен"
+        else f"📡 Мониторинг: ❌ **0/{account_count}**"
     )
 
     return join(
@@ -156,13 +156,9 @@ def _dashboard_text() -> str:
         status_hint,
         "",
         "📬 **FIRST DM**",
-        f"├ Уникальных пользователей в очереди: **{pending}**",
-        f"├ Доступны включённым аккаунтам: **{available_enabled}**",
-        f"├ Ждут включения аккаунта: **{waiting_account_enable}**",
-        f"├ Нет доступного аккаунта: **{no_available_account}**",
-        f"├ Сейчас отправляется: **{claimed}**",
-        f"├ Отправлено сегодня: **{first_today}**",
-        f"└ Отправлено всего: **{first_total}**",
+        f"├ Очередь: **{pending}** · доступно: **{available_enabled}**",
+        f"├ Ждут включения: **{waiting_account_enable}** · недоступны: **{no_available_account}**",
+        f"└ Сейчас: **{claimed}** · сегодня: **{first_today}** · всего: **{first_total}**",
         DIV,
         f"👤 **АККАУНТЫ · {account_count}**",
         acc_block,
@@ -174,10 +170,8 @@ def _dashboard_text() -> str:
         f"├ Ждут ответа: **{waiting_reply}**",
         f"└ Завершено сегодня: **{closed_today}**",
         DIV,
-        link_line,
-        ai_line,
-        f"🧲 First DM: `{FIRST_DM_STYLE}`",
-        f"💬 Вариант диалога: `{DIALOG_FLOW_VARIANT}`",
+        f"{link_line} · {ai_line}",
+        f"🧲 First DM: `{FIRST_DM_STYLE}` · 💬 Вариант: `{DIALOG_FLOW_VARIANT}`",
         monitor_line,
     )
 
