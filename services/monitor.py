@@ -8,7 +8,7 @@ from typing import Any, Optional
 
 from loguru import logger
 from telethon import TelegramClient, events
-from telethon.errors import FloodWaitError
+from telethon.errors import ChannelPrivateError, FloodWaitError
 from telethon.sessions import StringSession
 from telethon.tl.types import User
 
@@ -391,7 +391,15 @@ async def _handle_group(
         )
         return
 
-    sender = await event.get_sender()
+    try:
+        sender = await event.get_sender()
+    except ChannelPrivateError:
+        logger.info(
+            "Monitor skipped inaccessible channel sender account={} chat_id={}",
+            account_user_id,
+            chat_id,
+        )
+        return
     if sender is None or not isinstance(sender, User):
         logger.debug(
             "Skip non-user sender in chat {} account={}", chat_id, account_user_id

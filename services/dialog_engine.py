@@ -22,6 +22,7 @@ from telethon.errors import (
     UserPrivacyRestrictedError,
     ChatWriteForbiddenError,
     PeerIdInvalidError,
+    InputUserDeactivatedError,
 )
 from telethon.tl.types import InputPeerUser
 
@@ -1230,6 +1231,29 @@ async def _send_prepared_action(
             )
             return "peerflood"
         return "retry"
+    except InputUserDeactivatedError:
+        # Telegram explicitly confirmed that the target account was deleted.
+        # This is a terminal recipient condition, not an ambiguous delivery.
+        if gate_probe:
+            dialog_peerflood_gate.mark_probe_success(account_user_id)
+        dialog_delivery.mark_failed(target_user_id, action_kind, "user_deleted")
+        source_inbox_id = prepared_row.get("source_inbox_id")
+        if source_inbox_id is not None:
+            dialog_inbox.mark_ignored(int(source_inbox_id), "user_deleted")
+        dialog_inbox.ignore_pending_for_target(
+            target_user_id, "user_deleted", include_hard_stop=True
+        )
+        store.set_stage(target_user_id, store.STAGE_CLOSED, clear_auto_link=True)
+        store.mark_contact_completed(target_user_id)
+        logger.warning(
+            "Dialog closed because Telegram user is deleted "
+            "kind={} account={} target={}",
+            action_kind,
+            account_user_id,
+            target_user_id,
+        )
+        await _cleanup_disabled_account(account_user_id)
+        return "failed"
     except (UserPrivacyRestrictedError, UserIsBlockedError, ChatWriteForbiddenError):
         if gate_probe:
             dialog_peerflood_gate.mark_probe_success(account_user_id)
