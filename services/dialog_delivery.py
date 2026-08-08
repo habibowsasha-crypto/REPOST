@@ -524,6 +524,35 @@ def retry_not_before(target_user_id: int, action_kind: str) -> str | None:
     return value or None
 
 
+def has_priority_unsent_for_account(account_user_id: int) -> bool:
+    """Return True when non-follow-up dialog delivery still needs attention.
+
+    Prepared sends and retryable failed sends are higher priority than autonomous
+    silence follow-ups. Terminal failed rows without a retry timestamp are ignored.
+    """
+    conn = get_connection()
+    row = conn.execute(
+        """
+        SELECT 1
+          FROM dialog_outbox
+         WHERE account_user_id=?
+           AND COALESCE(message_kind, action_kind) != ?
+           AND (
+                status=?
+                OR (status=? AND recovery_next_at IS NOT NULL)
+           )
+         LIMIT 1
+        """,
+        (
+            int(account_user_id),
+            KIND_FOLLOWUP,
+            STATUS_PREPARED,
+            STATUS_FAILED,
+        ),
+    ).fetchone()
+    return row is not None
+
+
 def get(target_user_id: int, action_kind: str) -> dict[str, Any] | None:
     conn = get_connection()
     row = conn.execute(

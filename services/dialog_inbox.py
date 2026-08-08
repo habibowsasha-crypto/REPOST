@@ -203,6 +203,24 @@ def ignore_pending_for_target(
         return int(cur.rowcount or 0)
 
 
+def has_unfinished_for_account(account_user_id: int) -> bool:
+    """Return True while a real incoming message still needs processing.
+
+    Real user replies have higher delivery priority than autonomous silence
+    follow-ups, including rows already claimed by the recovery worker.
+    """
+    conn = get_connection()
+    row = conn.execute(
+        """
+        SELECT 1 FROM dialog_inbox
+         WHERE account_user_id=? AND status IN (?, ?)
+         LIMIT 1
+        """,
+        (int(account_user_id), STATUS_PENDING, STATUS_PROCESSING),
+    ).fetchone()
+    return row is not None
+
+
 def has_pending(account_user_id: int, target_user_id: int) -> bool:
     conn = get_connection()
     row = conn.execute(

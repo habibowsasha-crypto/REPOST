@@ -346,6 +346,39 @@ def list_due_auto_links(limit: int = 50) -> list[dict[str, Any]]:
     return result
 
 
+def next_priority_scheduled_action_at(account_user_id: int) -> str | None:
+    """Return the earliest scheduled post-reply action for one account.
+
+    Silence follow-ups are deliberately lower priority than promo/apology/link-help
+    work.  Future apology deadlines count here too, so a low-value follow-up cannot
+    trigger PeerFlood seconds before a mandatory apology becomes due.
+    """
+    conn = get_connection()
+    row = conn.execute(
+        """
+        SELECT MIN(auto_link_at) AS next_at
+          FROM dialogs
+         WHERE account_user_id=?
+           AND auto_link_at IS NOT NULL
+           AND (
+                (stage=? AND link_sent=0)
+                OR
+                (stage=? AND link_sent=1)
+                OR
+                (stage=? AND link_sent=1)
+           )
+        """,
+        (
+            int(account_user_id),
+            STAGE_EXPLAINED,
+            STAGE_PROMO_SENT,
+            STAGE_APOLOGY_SENT,
+        ),
+    ).fetchone()
+    value = str(row["next_at"] or "") if row else ""
+    return value or None
+
+
 def list_due_followups(limit: int = 50) -> list[dict[str, Any]]:
     """waiting_reply dialogs past follow-up deadline (stored in auto_link_at)."""
     now = _now_iso()

@@ -1990,6 +1990,43 @@ async def process_due_followups(limit: int = 50) -> int:
             store.mark_contact_completed(target)
             await _cleanup_disabled_account(account)
             continue
+
+        # v1.0.98 priority rule: autonomous silence follow-ups are always last.
+        # A real incoming reply, an unsent reply/recovery row, or even a future
+        # promo/apology/link-help deadline for this account gets first access to
+        # Telegram. This prevents a low-value follow-up from causing PeerFlood
+        # immediately before a mandatory smoothing apology becomes due.
+        if dialog_inbox.has_unfinished_for_account(account):
+            store.set_stage(
+                target,
+                store.STAGE_WAITING_REPLY,
+                auto_link_at=(_now() + dt.timedelta(seconds=60)).isoformat(),
+            )
+            continue
+        if dialog_delivery.has_priority_unsent_for_account(account):
+            store.set_stage(
+                target,
+                store.STAGE_WAITING_REPLY,
+                auto_link_at=(_now() + dt.timedelta(seconds=60)).isoformat(),
+            )
+            continue
+        priority_at = store.next_priority_scheduled_action_at(account)
+        if priority_at:
+            priority_dt = pacing._parse_iso(priority_at)
+            if priority_dt is not None:
+                defer_until = max(
+                    _now() + dt.timedelta(seconds=30),
+                    priority_dt + dt.timedelta(seconds=5),
+                ).isoformat()
+            else:
+                defer_until = (_now() + dt.timedelta(seconds=60)).isoformat()
+            store.set_stage(
+                target,
+                store.STAGE_WAITING_REPLY,
+                auto_link_at=defer_until,
+            )
+            continue
+
         cooldown = _account_cooldown_seconds(account)
         if cooldown > 0:
             store.set_stage(
