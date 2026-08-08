@@ -1998,6 +1998,16 @@ async def process_due_followups(limit: int = 50) -> int:
                 auto_link_at=_retry_at_for_account(account, 120),
             )
             continue
+        followup_wait = runtime_svc.followup_wait_seconds(account)
+        if followup_wait > 0:
+            next_at = runtime_svc.followup_next_at(account)
+            if next_at:
+                store.set_stage(
+                    target,
+                    store.STAGE_WAITING_REPLY,
+                    auto_link_at=next_at,
+                )
+            continue
         key = (account, target)
         lock = _dialog_locks.setdefault(key, asyncio.Lock())
         if lock.locked():
@@ -2026,8 +2036,14 @@ async def process_due_followups(limit: int = 50) -> int:
                 )
                 if result == "sent":
                     n += 1
+                    next_at, delay_seconds = runtime_svc.mark_followup_sent(account)
                     logger.info(
-                        "Silence follow-up sent target={} account={}", target, account
+                        "Silence follow-up sent target={} account={} next_followup_at={} "
+                        "spacing_minutes={}",
+                        target,
+                        account,
+                        next_at,
+                        max(1, (int(delay_seconds) + 59) // 60),
                     )
                 elif result == "peerflood":
                     retry_at = dialog_delivery.retry_not_before(

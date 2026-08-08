@@ -224,6 +224,52 @@ def format_peer_flood_pause(seconds: int | None = None) -> str:
     return format_duration(int(seconds))
 
 
+# Silence follow-up pacing is intentionally much slower than normal dialog work.
+# A follow-up itself is still due 24h after the First DM; these values only
+# control spacing between different due follow-ups sent by the same account.
+FOLLOWUP_SPACING_MIN_SECONDS = 10 * 60
+FOLLOWUP_SPACING_MAX_SECONDS = 120 * 60
+KEY_FOLLOWUP_NEXT_PREFIX = "followup_next_at:"
+
+def _parse_runtime_iso(value: str | None) -> dt.datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed
+    except (TypeError, ValueError):
+        return None
+
+
+def followup_next_at(account_user_id: int) -> str | None:
+    """Return the durable next allowed silence-follow-up time for one account."""
+    raw = _get(f"{KEY_FOLLOWUP_NEXT_PREFIX}{int(account_user_id)}")
+    parsed = _parse_runtime_iso(raw)
+    if parsed is None:
+        return None
+    return parsed.isoformat()
+
+
+def followup_wait_seconds(account_user_id: int) -> float:
+    """Seconds until the account may send another silence follow-up."""
+    raw = followup_next_at(int(account_user_id))
+    parsed = _parse_runtime_iso(raw)
+    if parsed is None:
+        return 0.0
+    now = dt.datetime.now(dt.timezone.utc)
+    return max(0.0, (parsed - now).total_seconds())
+
+
+def mark_followup_sent(account_user_id: int) -> tuple[str, int]:
+    """Persist a random 10-120 minute gap after a successful silence follow-up."""
+    delay = random.randint(FOLLOWUP_SPACING_MIN_SECONDS, FOLLOWUP_SPACING_MAX_SECONDS)
+    next_at = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=delay)).isoformat()
+    _set(f"{KEY_FOLLOWUP_NEXT_PREFIX}{int(account_user_id)}", next_at)
+    return next_at, delay
+
+
 # --- Pacing (admin-editable; defaults from env/config) ---
 
 KEY_PACE_ACC_LO = "pace_account_lo_sec"
