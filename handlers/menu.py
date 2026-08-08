@@ -110,6 +110,7 @@ def _dashboard_text() -> str:
     claimed = queue_svc.count_by_status(queue_svc.STATUS_CLAIMED)
     first_today = queue_svc.count_first_dm_today()
     first_total = queue_svc.count_first_dm_total()
+    first_dm_source = queue_svc.source_chat_label(queue_svc.get_active_source_chat_id())
     dialogs = dialog_store_svc.count_active()
     waiting_reply = dialog_store_svc.count_by_stage(
         dialog_store_svc.STAGE_WAITING_REPLY,
@@ -156,6 +157,7 @@ def _dashboard_text() -> str:
         status_hint,
         "",
         "📬 **FIRST DM**",
+        f"├ Источник: **{first_dm_source}**",
         f"├ Очередь: **{pending}** · доступно: **{available_enabled}**",
         f"├ Ждут включения: **{waiting_account_enable}** · недоступны: **{no_available_account}**",
         f"└ Сейчас: **{claimed}** · сегодня: **{first_today}** · всего: **{first_total}**",

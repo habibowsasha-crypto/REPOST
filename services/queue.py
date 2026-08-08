@@ -15,6 +15,82 @@ STATUS_CANCELLED = "cancelled"
 
 _claim_cursor = 0
 
+FIRST_DM_SOURCE_KEY = "first_dm_source_chat_id"
+FIRST_DM_SOURCE_ALL = "all"
+
+
+def _active_source_chat_id_conn(conn) -> int | None:
+    row = conn.execute(
+        "SELECT value FROM runtime_meta WHERE key=?",
+        (FIRST_DM_SOURCE_KEY,),
+    ).fetchone()
+    if row is None:
+        return None
+    raw = str(row["value"] or "").strip().lower()
+    if not raw or raw == FIRST_DM_SOURCE_ALL:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def get_active_source_chat_id() -> int | None:
+    return _active_source_chat_id_conn(get_connection())
+
+
+def set_active_source_chat_id(source_chat_id: int | None) -> None:
+    value = FIRST_DM_SOURCE_ALL if source_chat_id is None else str(int(source_chat_id))
+    conn = get_connection()
+    now = _now_iso()
+    with db_lock(), conn:
+        conn.execute(
+            """
+            INSERT INTO runtime_meta(key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value=excluded.value, updated_at=excluded.updated_at
+            """,
+            (FIRST_DM_SOURCE_KEY, value, now),
+        )
+
+
+def _record_lead_source_conn(
+    conn,
+    *,
+    target_user_id: int,
+    source_chat_id: int | None,
+    seen_at: str | None = None,
+) -> None:
+    if source_chat_id is None:
+        return
+    now = seen_at or _now_iso()
+    conn.execute(
+        """
+        INSERT INTO lead_sources (
+            target_user_id, source_chat_id, first_seen_at, last_seen_at
+        ) VALUES (?, ?, ?, ?)
+        ON CONFLICT(target_user_id, source_chat_id) DO UPDATE SET
+            last_seen_at=excluded.last_seen_at
+        """,
+        (int(target_user_id), int(source_chat_id), now, now),
+    )
+
+
+def lead_matches_active_source(target_user_id: int) -> bool:
+    conn = get_connection()
+    active = _active_source_chat_id_conn(conn)
+    if active is None:
+        return True
+    row = conn.execute(
+        """
+        SELECT 1 FROM lead_sources
+         WHERE target_user_id=? AND source_chat_id=?
+        """,
+        (int(target_user_id), int(active)),
+    ).fetchone()
+    return row is not None
+
 
 def _now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
@@ -170,6 +246,12 @@ def record_account_entity(
             account_user_id=account_id,
             access_hash=access_hash,
             username=username,
+            source_chat_id=source_chat_id,
+            seen_at=now,
+        )
+        _record_lead_source_conn(
+            conn,
+            target_user_id=target_id,
             source_chat_id=source_chat_id,
             seen_at=now,
         )
@@ -346,6 +428,12 @@ def upsert_from_activity(
             account_user_id=source_account_user_id,
             access_hash=access_hash,
             username=username,
+            source_chat_id=source_chat_id,
+            seen_at=now,
+        )
+        _record_lead_source_conn(
+            conn,
+            target_user_id=target_user_id,
             source_chat_id=source_chat_id,
             seen_at=now,
         )
@@ -552,15 +640,22 @@ def count_by_status(status: str | None = None) -> int:
 
 
 def count_available_for_account(account_user_id: int) -> int:
-    """Pending unique targets this exact account may still try for First DM.
-
-    The same target may be counted for more than one account when each account
-    owns its own Telegram entity evidence. The shared lead row still guarantees
-    that only one First DM can be claimed and sent.
-    """
+    """Pending targets this account may try inside the active source filter."""
     conn = get_connection()
-    row = conn.execute(
+    active = _active_source_chat_id_conn(conn)
+    source_sql = ""
+    params: list[Any] = [STATUS_PENDING, int(account_user_id), int(account_user_id)]
+    if active is not None:
+        source_sql = """
+           AND EXISTS (
+                SELECT 1 FROM lead_sources ls
+                 WHERE ls.target_user_id=l.target_user_id
+                   AND ls.source_chat_id=?
+           )
         """
+        params.append(int(active))
+    row = conn.execute(
+        f"""
         SELECT COUNT(*) AS c
           FROM leads l
          WHERE l.status=?
@@ -577,27 +672,30 @@ def count_available_for_account(account_user_id: int) -> int:
                    AND f.account_user_id=?
                    AND f.failure_kind='no_entity'
            )
+           {source_sql}
         """,
-        (STATUS_PENDING, int(account_user_id), int(account_user_id)),
+        tuple(params),
     ).fetchone()
     return int(row["c"] if row else 0)
 
 
 def dashboard_availability_counts() -> dict[str, int]:
-    """Partition the unique pending queue by currently known account access.
-
-    - available_enabled: at least one enabled authorized account owns usable
-      entity evidence for the target.
-    - waiting_account_enable: no enabled owner exists, but a disabled authorized
-      account owns usable entity evidence and can participate after it is enabled.
-    - no_available_account: no currently usable account owns entity evidence.
-
-    These are read-only dashboard diagnostics. They do not probe Telegram, alter
-    queue ownership or change dispatch behavior.
-    """
+    """Partition pending queue inside the currently selected First-DM source."""
     conn = get_connection()
-    row = conn.execute(
+    active = _active_source_chat_id_conn(conn)
+    source_sql = ""
+    params: list[Any] = [STATUS_PENDING]
+    if active is not None:
+        source_sql = """
+               AND EXISTS (
+                    SELECT 1 FROM lead_sources ls
+                     WHERE ls.target_user_id=l.target_user_id
+                       AND ls.source_chat_id=?
+               )
         """
+        params.append(int(active))
+    row = conn.execute(
+        f"""
         WITH pending_access AS (
             SELECT
                 l.target_user_id,
@@ -634,6 +732,7 @@ def dashboard_availability_counts() -> dict[str, int]:
                 ) AS usable_owner
               FROM leads l
              WHERE l.status=?
+               {source_sql}
         )
         SELECT
             COUNT(*) AS total_pending,
@@ -646,7 +745,7 @@ def dashboard_availability_counts() -> dict[str, int]:
                 AS no_available_account
           FROM pending_access
         """,
-        (STATUS_PENDING,),
+        tuple(params),
     ).fetchone()
     if row is None:
         return {
@@ -658,36 +757,126 @@ def dashboard_availability_counts() -> dict[str, int]:
     return {key: int(row[key] or 0) for key in row.keys()}
 
 
-def list_recent(limit: int = 15, status: str | None = STATUS_PENDING) -> list[dict[str, Any]]:
+def count_pending_outside_active_source() -> int:
     conn = get_connection()
+    active = _active_source_chat_id_conn(conn)
+    if active is None:
+        return 0
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS c
+          FROM leads l
+         WHERE l.status=?
+           AND NOT EXISTS (
+                SELECT 1 FROM lead_sources ls
+                 WHERE ls.target_user_id=l.target_user_id
+                   AND ls.source_chat_id=?
+           )
+        """,
+        (STATUS_PENDING, int(active)),
+    ).fetchone()
+    return int(row["c"] if row else 0)
+
+
+def list_first_dm_source_groups() -> list[dict[str, Any]]:
+    """Known source groups with durable per-lead membership and pending counts."""
+    conn = get_connection()
+    rows = conn.execute(
+        """
+        SELECT
+            ls.source_chat_id,
+            COUNT(DISTINCT ls.target_user_id) AS known_count,
+            COUNT(DISTINCT CASE WHEN l.status=? THEN ls.target_user_id END) AS pending_count,
+            (
+                SELECT d.title FROM account_discovered_chats d
+                 WHERE d.chat_id=ls.source_chat_id
+                   AND TRIM(COALESCE(d.title, ''))<>''
+                 ORDER BY d.updated_at DESC
+                 LIMIT 1
+            ) AS title,
+            (
+                SELECT d.username FROM account_discovered_chats d
+                 WHERE d.chat_id=ls.source_chat_id
+                   AND TRIM(COALESCE(d.username, ''))<>''
+                 ORDER BY d.updated_at DESC
+                 LIMIT 1
+            ) AS username
+          FROM lead_sources ls
+          LEFT JOIN leads l ON l.target_user_id=ls.target_user_id
+         GROUP BY ls.source_chat_id
+         ORDER BY pending_count DESC, lower(COALESCE(title, username, CAST(ls.source_chat_id AS TEXT)))
+        """,
+        (STATUS_PENDING,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def source_chat_label(source_chat_id: int | None) -> str:
+    if source_chat_id is None:
+        return "Все группы"
+    chat_id = int(source_chat_id)
+    conn = get_connection()
+    row = conn.execute(
+        """
+        SELECT title, username
+          FROM account_discovered_chats
+         WHERE chat_id=?
+         ORDER BY
+            CASE WHEN TRIM(COALESCE(title, ''))<>'' THEN 0 ELSE 1 END,
+            updated_at DESC
+         LIMIT 1
+        """,
+        (chat_id,),
+    ).fetchone()
+    if row:
+        title = str(row["title"] or "").strip()
+        username = str(row["username"] or "").strip().lstrip("@")
+        if title:
+            return title
+        if username:
+            return f"@{username}"
+    return f"чат {chat_id}"
+
+
+def list_recent(
+    limit: int = 15,
+    status: str | None = STATUS_PENDING,
+    *,
+    respect_source_filter: bool = False,
+) -> list[dict[str, Any]]:
+    conn = get_connection()
+    active = _active_source_chat_id_conn(conn) if respect_source_filter else None
+    where: list[str] = []
+    params: list[Any] = []
     if status:
-        rows = conn.execute(
-            """
-            SELECT target_user_id, username, first_name, last_name, access_hash,
-                   source_chat_id, source_account_user_id, status,
-                   eligible_at, last_seen_at, created_at, last_error,
-                   failure_reason, failure_at
-              FROM leads
-             WHERE status=?
-             ORDER BY COALESCE(last_seen_at, created_at) DESC
-             LIMIT ?
-            """,
-            (status, int(limit)),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            """
-            SELECT target_user_id, username, first_name, last_name, access_hash,
-                   source_chat_id, source_account_user_id, status,
-                   eligible_at, last_seen_at, created_at, last_error,
-                   failure_reason, failure_at
-              FROM leads
-             ORDER BY COALESCE(last_seen_at, created_at) DESC
-             LIMIT ?
-            """,
-            (int(limit),),
-        ).fetchall()
-    return [dict(r) for r in rows]
+        where.append("l.status=?")
+        params.append(status)
+    if active is not None:
+        where.append(
+            "EXISTS (SELECT 1 FROM lead_sources ls "
+            "WHERE ls.target_user_id=l.target_user_id AND ls.source_chat_id=?)"
+        )
+        params.append(int(active))
+    where_sql = " WHERE " + " AND ".join(where) if where else ""
+    params.append(int(limit))
+    rows = conn.execute(
+        f"""
+        SELECT l.target_user_id, l.username, l.first_name, l.last_name, l.access_hash,
+               l.source_chat_id, l.source_account_user_id, l.status,
+               l.eligible_at, l.last_seen_at, l.created_at, l.last_error,
+               l.failure_reason, l.failure_at
+          FROM leads l
+          {where_sql}
+         ORDER BY COALESCE(l.last_seen_at, l.created_at) DESC
+         LIMIT ?
+        """,
+        tuple(params),
+    ).fetchall()
+    result = [dict(r) for r in rows]
+    if active is not None:
+        for lead in result:
+            lead["source_chat_id"] = int(active)
+    return result
 
 
 def clear_pending() -> int:
@@ -703,6 +892,13 @@ def clear_pending() -> int:
         conn.execute(
             """
             DELETE FROM lead_account_entities
+             WHERE target_user_id IN (SELECT target_user_id FROM leads WHERE status=?)
+            """,
+            (STATUS_PENDING,),
+        )
+        conn.execute(
+            """
+            DELETE FROM lead_sources
              WHERE target_user_id IN (SELECT target_user_id FROM leads WHERE status=?)
             """,
             (STATUS_PENDING,),
@@ -746,7 +942,20 @@ def _eligible_pending_where() -> str:
 
 def _select_pending_after_cursor(conn, now: str, cursor: int, *, wrap: bool):
     comparison = "<=" if wrap else ">"
-    return conn.execute(
+    active = _active_source_chat_id_conn(conn)
+    source_sql = ""
+    params: list[Any] = [STATUS_PENDING, now]
+    if active is not None:
+        source_sql = """
+           AND EXISTS (
+                SELECT 1 FROM lead_sources ls
+                 WHERE ls.target_user_id=l.target_user_id
+                   AND ls.source_chat_id=?
+           )
+        """
+        params.append(int(active))
+    params.append(int(cursor))
+    row = conn.execute(
         f"""
         SELECT l.target_user_id, l.username, l.first_name, l.last_name, l.access_hash,
                l.source_chat_id, l.source_account_user_id, l.status,
@@ -754,12 +963,14 @@ def _select_pending_after_cursor(conn, now: str, cursor: int, *, wrap: bool):
                l.failure_reason, l.failure_at
           FROM leads l
          WHERE {_eligible_pending_where()}
+           {source_sql}
            AND l.target_user_id {comparison} ?
          ORDER BY l.target_user_id ASC
          LIMIT 1
         """,
-        (STATUS_PENDING, now, int(cursor)),
+        tuple(params),
     ).fetchone()
+    return row, active
 
 
 def claim_random_pending(account_user_id: int) -> dict[str, Any] | None:
@@ -773,9 +984,13 @@ def claim_random_pending(account_user_id: int) -> dict[str, Any] | None:
     now = _now_iso()
     conn = get_connection()
     with db_lock(), conn:
-        row = _select_pending_after_cursor(conn, now, _claim_cursor, wrap=False)
+        row, active_source = _select_pending_after_cursor(
+            conn, now, _claim_cursor, wrap=False
+        )
         if row is None:
-            row = _select_pending_after_cursor(conn, now, _claim_cursor, wrap=True)
+            row, active_source = _select_pending_after_cursor(
+                conn, now, _claim_cursor, wrap=True
+            )
         if row is None:
             return None
         target = int(row["target_user_id"])
@@ -793,6 +1008,8 @@ def claim_random_pending(account_user_id: int) -> dict[str, Any] | None:
         data = dict(row)
         data["status"] = STATUS_CLAIMED
         data["claimed_by_account"] = int(account_user_id)
+        if active_source is not None:
+            data["source_chat_id"] = int(active_source)
         return data
 
 

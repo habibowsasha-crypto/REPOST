@@ -733,6 +733,19 @@ async def _tick() -> bool:
         )
         return False
 
+    if not queue_svc.lead_matches_active_source(target_id):
+        queue_svc.release_claim(target_id, as_pending=True)
+        logger.info(
+            "First DM claim released because source filter changed target={} active_source={}",
+            target_id,
+            queue_svc.get_active_source_chat_id(),
+        )
+        return False
+
+    active_source = queue_svc.get_active_source_chat_id()
+    if active_source is not None:
+        lead["source_chat_id"] = int(active_source)
+
     if opt_out_svc.is_opted_out(target_id):
         queue_svc.cancel_lead(target_id, "opt_out")
         return True

@@ -388,6 +388,23 @@ def init_db() -> None:
             ON leads(status, target_user_id)
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS lead_sources (
+                target_user_id INTEGER NOT NULL,
+                source_chat_id INTEGER NOT NULL,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                PRIMARY KEY (target_user_id, source_chat_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_lead_sources_chat_target
+            ON lead_sources(source_chat_id, target_user_id)
+            """
+        )
         _ensure_column(
             conn, "leads", "send_attempts", "send_attempts INTEGER NOT NULL DEFAULT 0"
         )
@@ -438,6 +455,42 @@ def init_db() -> None:
             ON lead_account_entities(account_user_id, last_seen_at)
             """
         )
+
+        migration_name = "v1_0_102_lead_sources"
+        applied = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE name=?",
+            (migration_name,),
+        ).fetchone()
+        if not applied:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO lead_sources (
+                    target_user_id, source_chat_id, first_seen_at, last_seen_at
+                )
+                SELECT target_user_id, source_chat_id,
+                       COALESCE(created_at, updated_at, last_seen_at),
+                       COALESCE(last_seen_at, updated_at, created_at)
+                  FROM leads
+                 WHERE source_chat_id IS NOT NULL
+                """
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO lead_sources (
+                    target_user_id, source_chat_id, first_seen_at, last_seen_at
+                )
+                SELECT target_user_id, source_chat_id, last_seen_at, last_seen_at
+                  FROM lead_account_entities
+                 WHERE source_chat_id IS NOT NULL
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO schema_migrations(name, applied_at)
+                VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                """,
+                (migration_name,),
+            )
 
         migration_name = "v1_0_77_account_owned_entity_evidence"
         applied = conn.execute(
