@@ -8,7 +8,7 @@ from typing import Any, Optional
 
 from loguru import logger
 from telethon import TelegramClient, events
-from telethon.errors import ChannelPrivateError, FloodWaitError
+from telethon.errors import ChannelPrivateError, ChatAdminRequiredError, FloodWaitError
 from telethon.sessions import StringSession
 from telethon.tl.types import User
 
@@ -420,8 +420,16 @@ async def _handle_group(
     is_group_admin = False
     client = getattr(event, "client", None) or get_client(account_user_id)
     if client is None or not client.is_connected():
-        logger.info(
+        logger.debug(
             "Group admin role check unavailable; First DM remains eligible "
+            "account={} chat_id={} target={}",
+            account_user_id,
+            chat_id,
+            target_id,
+        )
+    elif group_admin_guard.is_chat_check_suppressed(account_user_id, chat_id):
+        logger.debug(
+            "Group admin role check skipped during capability cooldown "
             "account={} chat_id={} target={}",
             account_user_id,
             chat_id,
@@ -435,28 +443,62 @@ async def _handle_group(
                 target_user_id=target_id,
                 user_entity=sender,
             )
+            group_admin_guard.clear_chat_check_unavailable(account_user_id, chat_id)
         except FloodWaitError as exc:
             seconds = int(getattr(exc, "seconds", 60) or 60)
-            logger.warning(
-                "Group admin role check FloodWait; First DM remains eligible "
-                "account={} chat_id={} target={} seconds={}",
+            first = group_admin_guard.mark_chat_check_unavailable(
                 account_user_id,
                 chat_id,
-                target_id,
-                seconds,
+                ttl_seconds=min(max(seconds, 60), 15 * 60),
             )
+            if first:
+                logger.warning(
+                    "Group admin role check FloodWait; cooling down check only "
+                    "account={} chat_id={} seconds={} First DM remains eligible",
+                    account_user_id,
+                    chat_id,
+                    seconds,
+                )
+        except ChatAdminRequiredError:
+            first = group_admin_guard.mark_chat_check_unavailable(
+                account_user_id, chat_id
+            )
+            if first:
+                logger.warning(
+                    "Group admin role check unavailable for this account/chat; "
+                    "cooling down check only account={} chat_id={} "
+                    "First DM remains eligible",
+                    account_user_id,
+                    chat_id,
+                )
+        except ValueError:
+            # Here sender is a concrete User from the live event. A ValueError
+            # therefore normally means this account/chat cannot resolve the
+            # participant permissions reliably, not that First DM must stop.
+            first = group_admin_guard.mark_chat_check_unavailable(
+                account_user_id, chat_id
+            )
+            if first:
+                logger.warning(
+                    "Group admin role check unresolved for this account/chat; "
+                    "cooling down check only account={} chat_id={} "
+                    "First DM remains eligible",
+                    account_user_id,
+                    chat_id,
+                )
         except Exception as exc:
             if account_auth.is_auth_loss_error(exc):
                 await account_auth.register_auth_loss(account_user_id, exc, notify=True)
                 await disconnect_account(account_user_id, cancel_tasks=True)
-            logger.warning(
-                "Group admin role check failed; First DM remains eligible "
-                "account={} chat_id={} target={} error_type={}",
-                account_user_id,
-                chat_id,
-                target_id,
-                type(exc).__name__,
-            )
+            else:
+                logger.debug(
+                    "Group admin role check failed; First DM remains eligible "
+                    "account={} chat_id={} target={} error_type={}",
+                    account_user_id,
+                    chat_id,
+                    target_id,
+                    type(exc).__name__,
+                )
 
     if is_group_admin:
         queue_svc.mark_group_admin_excluded(

@@ -10,6 +10,7 @@ from typing import Any, Optional
 
 from loguru import logger
 from telethon.errors import (
+    ChatAdminRequiredError,
     ChatWriteForbiddenError,
     FloodWaitError,
     InputUserDeactivatedError,
@@ -625,14 +626,28 @@ async def _verify_not_source_group_admin(lead: dict[str, Any]) -> str:
             preferred.append(aid)
 
     for account_id in preferred:
+        if group_admin_guard.is_chat_check_suppressed(account_id, chat_id):
+            continue
+
         client = monitor_svc.get_client(account_id)
         if client is None or not client.is_connected():
             continue
 
         owned = queue_svc.get_account_entity(target_id, account_id) or {}
         access_hash = owned.get("access_hash")
-        if access_hash is None and source_account is not None and int(source_account) == account_id:
+        is_source_account = (
+            source_account is not None and int(source_account) == account_id
+        )
+        if access_hash is None and is_source_account:
             access_hash = lead.get("access_hash")
+
+        # Do not issue blind cross-account permission lookups by numeric user ID.
+        # They are the main source of ValueError noise and are not reliable entity
+        # evidence. The source account may still try its own cached numeric entity
+        # for legacy rows that predate access-hash persistence.
+        if access_hash is None and not is_source_account:
+            continue
+
         user_entity: Any = target_id
         if access_hash is not None:
             user_entity = InputPeerUser(target_id, int(access_hash))
@@ -645,23 +660,28 @@ async def _verify_not_source_group_admin(lead: dict[str, Any]) -> str:
                 user_entity=user_entity,
                 force_refresh=True,
             )
+            group_admin_guard.clear_chat_check_unavailable(account_id, chat_id)
         except FloodWaitError as exc:
             seconds = int(getattr(exc, "seconds", 60) or 60)
-            logger.warning(
-                "First DM admin-role check FloodWait; proceeding without admin "
-                "confirmation account={} chat_id={} target={} seconds={}",
+            group_admin_guard.mark_chat_check_unavailable(
                 account_id,
                 chat_id,
-                target_id,
-                seconds,
+                ttl_seconds=min(max(seconds, 60), 15 * 60),
             )
+            continue
+        except ChatAdminRequiredError:
+            group_admin_guard.mark_chat_check_unavailable(account_id, chat_id)
+            continue
+        except ValueError:
+            # Keep fail-open, but do not turn a target-specific entity failure
+            # into a chat-wide block. The next lead may have valid entity evidence.
             continue
         except Exception as exc:
             if account_auth.is_auth_loss_error(exc):
                 await account_auth.register_auth_loss(account_id, exc, notify=True)
                 await monitor_svc.disconnect_account(account_id, cancel_tasks=True)
             else:
-                logger.warning(
+                logger.debug(
                     "First DM admin-role check unavailable account={} chat_id={} "
                     "target={} error_type={}",
                     account_id,
