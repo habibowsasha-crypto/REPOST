@@ -16,6 +16,7 @@ from config import API_HASH, API_ID
 from services import account_auth
 from services import accounts as accounts_svc
 from services import chats as chats_svc
+from services import group_admin_guard
 from services import queue as queue_svc
 
 # account_user_id -> TelegramClient
@@ -410,6 +411,66 @@ async def _handle_group(
 
     target_id = int(sender.id)
     if target_id == int(account_user_id):
+        return
+
+    # Never place confirmed administrators/owners of the monitored source group
+    # into First-DM outreach. Role verification is deliberately fail-open: if
+    # Telegram cannot verify the role right now, the lead continues normally.
+    # Only a positive admin/creator result blocks First DM.
+    is_group_admin = False
+    client = getattr(event, "client", None) or get_client(account_user_id)
+    if client is None or not client.is_connected():
+        logger.info(
+            "Group admin role check unavailable; First DM remains eligible "
+            "account={} chat_id={} target={}",
+            account_user_id,
+            chat_id,
+            target_id,
+        )
+    else:
+        try:
+            is_group_admin = await group_admin_guard.is_admin_or_owner(
+                client,
+                chat_id=chat_id,
+                target_user_id=target_id,
+                user_entity=sender,
+            )
+        except FloodWaitError as exc:
+            seconds = int(getattr(exc, "seconds", 60) or 60)
+            logger.warning(
+                "Group admin role check FloodWait; First DM remains eligible "
+                "account={} chat_id={} target={} seconds={}",
+                account_user_id,
+                chat_id,
+                target_id,
+                seconds,
+            )
+        except Exception as exc:
+            if account_auth.is_auth_loss_error(exc):
+                await account_auth.register_auth_loss(account_user_id, exc, notify=True)
+                await disconnect_account(account_user_id, cancel_tasks=True)
+            logger.warning(
+                "Group admin role check failed; First DM remains eligible "
+                "account={} chat_id={} target={} error_type={}",
+                account_user_id,
+                chat_id,
+                target_id,
+                type(exc).__name__,
+            )
+
+    if is_group_admin:
+        queue_svc.mark_group_admin_excluded(
+            target_id,
+            source_chat_id=chat_id,
+            detected_by_account=account_user_id,
+        )
+        logger.info(
+            "First DM excluded for monitored-group admin account={} chat_id={} "
+            "target={}",
+            account_user_id,
+            chat_id,
+            target_id,
+        )
         return
 
     action = queue_svc.upsert_from_activity(

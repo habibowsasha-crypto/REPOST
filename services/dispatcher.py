@@ -24,6 +24,7 @@ from telethon.tl.types import InputPeerUser
 from services import account_auth
 from services import accounts as accounts_svc
 from services import first_dm_delivery
+from services import group_admin_guard
 from services import chats as chats_svc
 from services import monitor as monitor_svc
 from services import opt_out as opt_out_svc
@@ -595,6 +596,100 @@ async def _attempt_lead_across_accounts(
     )
 
 
+async def _verify_not_source_group_admin(lead: dict[str, Any]) -> str:
+    """Return member | admin | unknown for the monitored source group.
+
+    This second check protects leads that were already queued before the guard
+    existed. Only a positively confirmed administrator/creator is blocked. If
+    Telegram cannot verify the role, the caller keeps First DM eligible.
+    """
+    target_id = int(lead["target_user_id"])
+    if queue_svc.is_first_dm_excluded(target_id):
+        return "admin"
+
+    chat_raw = lead.get("source_chat_id")
+    if chat_raw is None:
+        # Imported/non-group leads have no monitored source group to check.
+        return "member"
+    chat_id = int(chat_raw)
+
+    preferred: list[int] = []
+    source_account = lead.get("source_account_user_id")
+    if source_account is not None:
+        preferred.append(int(source_account))
+    for account_id in monitor_svc.connected_account_ids():
+        aid = int(account_id)
+        if aid in preferred:
+            continue
+        if chats_svc.is_chat_watchable(aid, chat_id):
+            preferred.append(aid)
+
+    for account_id in preferred:
+        client = monitor_svc.get_client(account_id)
+        if client is None or not client.is_connected():
+            continue
+
+        owned = queue_svc.get_account_entity(target_id, account_id) or {}
+        access_hash = owned.get("access_hash")
+        if access_hash is None and source_account is not None and int(source_account) == account_id:
+            access_hash = lead.get("access_hash")
+        user_entity: Any = target_id
+        if access_hash is not None:
+            user_entity = InputPeerUser(target_id, int(access_hash))
+
+        try:
+            is_admin = await group_admin_guard.is_admin_or_owner(
+                client,
+                chat_id=chat_id,
+                target_user_id=target_id,
+                user_entity=user_entity,
+                force_refresh=True,
+            )
+        except FloodWaitError as exc:
+            seconds = int(getattr(exc, "seconds", 60) or 60)
+            logger.warning(
+                "First DM admin-role check FloodWait; proceeding without admin "
+                "confirmation account={} chat_id={} target={} seconds={}",
+                account_id,
+                chat_id,
+                target_id,
+                seconds,
+            )
+            continue
+        except Exception as exc:
+            if account_auth.is_auth_loss_error(exc):
+                await account_auth.register_auth_loss(account_id, exc, notify=True)
+                await monitor_svc.disconnect_account(account_id, cancel_tasks=True)
+            else:
+                logger.warning(
+                    "First DM admin-role check unavailable account={} chat_id={} "
+                    "target={} error_type={}",
+                    account_id,
+                    chat_id,
+                    target_id,
+                    _safe_error_name(exc),
+                )
+            continue
+
+        if is_admin:
+            queue_svc.mark_group_admin_excluded(
+                target_id,
+                source_chat_id=chat_id,
+                detected_by_account=account_id,
+            )
+            logger.info(
+                "First DM cancelled for monitored-group admin account={} "
+                "chat_id={} target={}",
+                account_id,
+                chat_id,
+                target_id,
+            )
+            return "admin"
+        return "member"
+
+    return "unknown"
+
+
 async def _tick() -> bool:
     if not runtime.is_worker_enabled():
         return False
@@ -621,6 +716,17 @@ async def _tick() -> bool:
     if opt_out_svc.is_opted_out(target_id):
         queue_svc.cancel_lead(target_id, "opt_out")
         return True
+
+    admin_role = await _verify_not_source_group_admin(lead)
+    if admin_role == "admin":
+        return True
+    if admin_role != "member":
+        logger.info(
+            "First DM proceeding because source-group admin role could not be "
+            "verified target={} chat_id={}",
+            target_id,
+            lead.get("source_chat_id"),
+        )
 
     possible_account_ids = _owned_possible_sender_ids(lead)
     if not possible_account_ids:

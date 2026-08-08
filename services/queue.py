@@ -29,6 +29,65 @@ def _contact_status(target_user_id: int) -> Optional[str]:
     return str(row["status"]) if row else None
 
 
+def is_first_dm_excluded(target_user_id: int) -> bool:
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT 1 FROM first_dm_exclusions WHERE target_user_id=?",
+        (int(target_user_id),),
+    ).fetchone()
+    return row is not None
+
+
+def mark_group_admin_excluded(
+    target_user_id: int,
+    *,
+    source_chat_id: int | None,
+    detected_by_account: int | None,
+) -> None:
+    """Permanently exclude a confirmed monitored-group admin from First DM.
+
+    This is deliberately separate from opt-out/contact completion: the person
+    did not refuse contact and no First DM was sent. Existing pending/claimed
+    queue work is cancelled atomically so old queues cannot bypass the guard.
+    """
+    now = _now_iso()
+    target_id = int(target_user_id)
+    conn = get_connection()
+    with db_lock(), conn:
+        conn.execute(
+            """
+            INSERT INTO first_dm_exclusions (
+                target_user_id, reason, source_chat_id, detected_by_account,
+                created_at, updated_at
+            ) VALUES (?, 'source_group_admin', ?, ?, ?, ?)
+            ON CONFLICT(target_user_id) DO UPDATE SET
+                reason='source_group_admin',
+                source_chat_id=COALESCE(excluded.source_chat_id, source_chat_id),
+                detected_by_account=COALESCE(
+                    excluded.detected_by_account, detected_by_account
+                ),
+                updated_at=excluded.updated_at
+            """,
+            (
+                target_id,
+                int(source_chat_id) if source_chat_id is not None else None,
+                int(detected_by_account) if detected_by_account is not None else None,
+                now,
+                now,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE leads
+               SET status=?, claimed_by_account=NULL, claimed_at=NULL,
+                   last_error='source_group_admin',
+                   failure_reason='source_group_admin', failure_at=?, updated_at=?
+             WHERE target_user_id=? AND status IN (?, ?)
+            """,
+            (STATUS_CANCELLED, now, now, target_id, STATUS_PENDING, STATUS_CLAIMED),
+        )
+
+
 def _upsert_account_entity_conn(
     conn,
     *,
@@ -271,6 +330,8 @@ def upsert_from_activity(
 
     if opt_out_svc.is_opted_out(target_user_id):
         return "skipped_opt_out"
+    if is_first_dm_excluded(target_user_id):
+        return "skipped_source_group_admin"
 
     contact = _contact_status(target_user_id)
     if contact in {"sending", "in_progress", "completed"}:

@@ -337,6 +337,18 @@ def init_db() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS first_dm_exclusions (
+                target_user_id INTEGER PRIMARY KEY,
+                reason TEXT NOT NULL,
+                source_chat_id INTEGER,
+                detected_by_account INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS contacts (
                 target_user_id INTEGER PRIMARY KEY,
                 status TEXT NOT NULL,
