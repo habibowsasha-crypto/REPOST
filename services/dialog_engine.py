@@ -87,6 +87,17 @@ async def _cleanup_disabled_account(account_user_id: int) -> None:
         logger.debug("dialog account cleanup failed account={}: {}", account_user_id, exc)
 
 
+async def _open_peerflood_gate_after_probe(account_user_id: int) -> bool:
+    """Open one real dialog gate and emit a delayed resume notice at most once."""
+    opened = dialog_peerflood_gate.mark_probe_success(account_user_id)
+    if not opened:
+        return False
+    from services import spambot as spambot_svc
+
+    await spambot_svc.notify_dialog_transport_recovered(account_user_id)
+    return True
+
+
 def _link_retry_at() -> str:
     return (_now() + dt.timedelta(minutes=15)).isoformat()
 
@@ -1154,7 +1165,7 @@ async def _send_prepared_action(
             )
             return "ambiguous"
         if gate_probe:
-            dialog_peerflood_gate.mark_probe_success(account_user_id)
+            await _open_peerflood_gate_after_probe(account_user_id)
             logger.info(
                 "Dialog PeerFlood account gate opened after successful probe "
                 "account={} target={} kind={}",
@@ -1235,7 +1246,7 @@ async def _send_prepared_action(
         # Telegram explicitly confirmed that the target account was deleted.
         # This is a terminal recipient condition, not an ambiguous delivery.
         if gate_probe:
-            dialog_peerflood_gate.mark_probe_success(account_user_id)
+            await _open_peerflood_gate_after_probe(account_user_id)
         dialog_delivery.mark_failed(target_user_id, action_kind, "user_deleted")
         source_inbox_id = prepared_row.get("source_inbox_id")
         if source_inbox_id is not None:
@@ -1256,7 +1267,7 @@ async def _send_prepared_action(
         return "failed"
     except (UserPrivacyRestrictedError, UserIsBlockedError, ChatWriteForbiddenError):
         if gate_probe:
-            dialog_peerflood_gate.mark_probe_success(account_user_id)
+            await _open_peerflood_gate_after_probe(account_user_id)
         dialog_delivery.mark_failed(target_user_id, action_kind, "privacy_or_blocked")
         store.set_stage(target_user_id, store.STAGE_CLOSED, clear_auto_link=True)
         store.mark_contact_completed(target_user_id)

@@ -16,6 +16,7 @@ from config import (
 )
 from db.schema import db_lock, get_connection
 from services import account_auth
+from services import dialog_peerflood_gate
 from services import accounts as accounts_svc
 from services import monitor as monitor_svc
 from services import pacing
@@ -27,6 +28,8 @@ STATUS_LIMITED = "limited"
 STATUS_FREE_PENDING = "free_pending_resume"
 STATUS_RESUMING = "resuming"
 STATUS_ERROR = "error"
+
+_RECOVERY_NOTICE_KEY_PREFIX = "dialog_peerflood_recovery_notice_pending:"
 
 _SPAMBOT = "SpamBot"
 
@@ -240,6 +243,104 @@ def _now() -> dt.datetime:
 def _now_iso() -> str:
     return _now().isoformat()
 
+
+def _recovery_notice_key(account_user_id: int) -> str:
+    return f"{_RECOVERY_NOTICE_KEY_PREFIX}{int(account_user_id)}"
+
+
+def _set_recovery_notice_pending(account_user_id: int) -> None:
+    """Persist that the resume notice must wait for a non-PeerFlood probe."""
+    conn = get_connection()
+    with db_lock(), conn:
+        conn.execute(
+            """
+            INSERT INTO runtime_meta(key, value, updated_at)
+            VALUES (?, '1', ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value='1',
+                updated_at=excluded.updated_at
+            """,
+            (_recovery_notice_key(account_user_id), _now_iso()),
+        )
+
+
+def _claim_recovery_notice_pending(account_user_id: int) -> bool:
+    """Atomically consume one delayed recovery notice after the dialog gate opens."""
+    conn = get_connection()
+    with db_lock(), conn:
+        cur = conn.execute(
+            "DELETE FROM runtime_meta WHERE key=? AND value='1'",
+            (_recovery_notice_key(account_user_id),),
+        )
+    return bool(int(cur.rowcount or 0))
+
+
+def recovery_notice_is_pending(account_user_id: int) -> bool:
+    """Diagnostics/test helper for a delayed real-recovery admin notice."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT value FROM runtime_meta WHERE key=?",
+        (_recovery_notice_key(account_user_id),),
+    ).fetchone()
+    return bool(row and str(row["value"] or "") == "1")
+
+
+def _notify_dialog_transport_recovered(
+    label: str,
+    *,
+    global_first_dm_paused: bool,
+    account_first_dm_enabled: bool,
+    next_first_dm_at: str | None = None,
+) -> str:
+    if not account_first_dm_enabled:
+        first_dm_line = "⏸ First DM остаются отключены вручную."
+    elif global_first_dm_paused:
+        first_dm_line = "⏸ Общая рассылка First DM остаётся на паузе."
+    elif next_first_dm_at:
+        first_dm_line = (
+            "✅ First DM снова разрешены для аккаунта."
+            f"\n⏳ Следующий First DM: **не раньше {_format_admin_time(next_first_dm_at)}**"
+        )
+    else:
+        first_dm_line = "✅ First DM снова разрешены для аккаунта."
+    return (
+        "✅ **ТРАНСПОРТ АККАУНТА ВОССТАНОВЛЕН**\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 Аккаунт: **{label}**\n"
+        "🔄 Контрольная попытка больше не получила PeerFlood.\n"
+        "✅ Диалоги аккаунта снова могут отправляться.\n"
+        f"{first_dm_line}"
+    )
+
+
+async def notify_dialog_transport_recovered(account_user_id: int) -> bool:
+    """Send exactly one delayed admin notice after the real dialog gate opens."""
+    account_user_id = int(account_user_id)
+    if not _claim_recovery_notice_pending(account_user_id):
+        return False
+    acc = accounts_svc.get_account(account_user_id)
+    if not acc:
+        logger.info(
+            "PeerFlood recovery notice consumed for missing account={}",
+            account_user_id,
+        )
+        return False
+    label = _account_label(account_user_id)
+    await notify_admins(
+        _notify_dialog_transport_recovered(
+            label,
+            global_first_dm_paused=not runtime.is_worker_enabled(),
+            account_first_dm_enabled=bool(acc.get("participates")),
+            next_first_dm_at=(
+                acc.get("next_send_at") if acc.get("participates") else None
+            ),
+        )
+    )
+    logger.info(
+        "Real PeerFlood transport recovery admin notice sent account={}",
+        account_user_id,
+    )
+    return True
 
 def _parse_iso(value: str | None) -> Optional[dt.datetime]:
     if not value:
@@ -978,8 +1079,22 @@ async def resume_account(account_user_id: int, *, source: str = "manual") -> boo
         next_first_dm_at or ("manual_override" if clear_next else "unchanged"),
     )
     label = _account_label(account_user_id)
+    gate_still_requires_probe = bool(
+        source in {"spambot_auto", "spambot_free"}
+        and dialog_peerflood_gate.get_state(account_user_id) is not None
+    )
     notify_resume = not (source == "spambot_auto" and not account_first_dm_enabled)
-    if notify_resume:
+    if gate_still_requires_probe:
+        if notify_resume:
+            _set_recovery_notice_pending(account_user_id)
+        logger.info(
+            "SpamBot resume admin notification deferred until real dialog PeerFlood recovery "
+            "account={} source={} notice_pending={}",
+            account_user_id,
+            source,
+            bool(notify_resume),
+        )
+    elif notify_resume:
         await notify_admins(
             _notify_resumed(
                 label,
